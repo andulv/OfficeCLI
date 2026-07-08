@@ -11,6 +11,26 @@ namespace OfficeCli.Core;
 /// </summary>
 public sealed class WatchEngine
 {
+    // Cached full document HTML the watch serves and diffs against, plus a
+    // monotonic version counter. HTML is written by the message dispatch and
+    // read at an instant by marks/serving — matching the pre-extraction model
+    // (no lock around HTML/version).
+    private string _currentHtml = "";
+    private int _version = 0;
+
+    /// <summary>The cached full document HTML (never null).</summary>
+    public string CurrentHtml
+    {
+        get => _currentHtml;
+        set => _currentHtml = value ?? "";
+    }
+
+    /// <summary>Monotonic version counter, bumped on each applied update.</summary>
+    public int Version => _version;
+
+    /// <summary>Increment the update version counter.</summary>
+    public void BumpVersion() => _version++;
+
     // Current selection — paths of elements selected in any connected browser.
     // Single shared list (last-write-wins): all browsers viewing the same file see
     // the same selection. The CLI reads it via the named-pipe "get-selection" command.

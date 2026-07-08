@@ -27,8 +27,6 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
     private readonly List<NetworkStream> _sseClients = new();
     private readonly object _sseLock = new();
     private CancellationTokenSource _cts = new();
-    private string _currentHtml = "";
-    private int _version = 0;
     private bool _disposed;
     private DateTime _lastActivityTime = DateTime.UtcNow;
     private readonly TimeSpan _idleTimeout;
@@ -121,7 +119,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
         _idleTimeout = idleTimeout ?? ResolveIdleTimeout();
         _tcpListener = new TcpListener(IPAddress.Loopback, _port);
         if (!string.IsNullOrEmpty(initialHtml))
-            _currentHtml = initialHtml;
+            _engine.CurrentHtml = initialHtml;
     }
 
     public static string GetWatchPipeName(string filePath)
@@ -566,7 +564,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                     // CONSISTENCY(watch-isolation): no file open — only the
                     // already-cached HTML string is inspected.
                     var selector = message.Substring(7);
-                    var found = SelectorExistsInHtml(_currentHtml, selector);
+                    var found = SelectorExistsInHtml(_engine.CurrentHtml, selector);
                     if (!found)
                     {
                         await writer.WriteLineAsync(("err:selector not found in current HTML: " + selector).AsMemory(), token);
@@ -574,7 +572,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                     else
                     {
                         await writer.WriteLineAsync("ok".AsMemory(), token);
-                        SendSseEvent("scroll", 0, null, selector, _version);
+                        SendSseEvent("scroll", 0, null, selector, _engine.Version);
                     }
                 }
                 else if (message != null)
@@ -600,31 +598,31 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             // `goto` command to navigate already-running watch viewers.
             if (msg.Action == "scroll" && !string.IsNullOrEmpty(msg.ScrollTo))
             {
-                SendSseEvent("scroll", 0, null, msg.ScrollTo, _version);
+                SendSseEvent("scroll", 0, null, msg.ScrollTo, _engine.Version);
                 return;
             }
 
-            var oldHtml = _currentHtml;
-            var baseVersion = _version;
+            var oldHtml = _engine.CurrentHtml;
+            var baseVersion = _engine.Version;
 
             // Always update cached full HTML when provided (authoritative snapshot)
             if (!string.IsNullOrEmpty(msg.FullHtml))
             {
-                _currentHtml = msg.FullHtml;
+                _engine.CurrentHtml = msg.FullHtml;
             }
 
             // Apply incremental patch when no full HTML was provided
             if (string.IsNullOrEmpty(msg.FullHtml))
             {
                 if (msg.Action == "replace" && msg.Slide > 0 && msg.Html != null)
-                    _currentHtml = PatchSlideInHtml(_currentHtml, msg.Slide, msg.Html);
+                    _engine.CurrentHtml = PatchSlideInHtml(_engine.CurrentHtml, msg.Slide, msg.Html);
                 else if (msg.Action == "add" && msg.Html != null)
-                    _currentHtml = AppendSlideToHtml(_currentHtml, msg.Html);
+                    _engine.CurrentHtml = AppendSlideToHtml(_engine.CurrentHtml, msg.Html);
                 else if (msg.Action == "remove" && msg.Slide > 0)
-                    _currentHtml = RemoveSlideFromHtml(_currentHtml, msg.Slide);
+                    _engine.CurrentHtml = RemoveSlideFromHtml(_engine.CurrentHtml, msg.Slide);
             }
 
-            _version++;
+            _engine.BumpVersion();
 
             // Reconcile all marks against the freshly updated snapshot. Flips
             // stale flags and refreshes matched_text when the underlying text
@@ -647,7 +645,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                     patches ??= new List<WordPatch>();
                     if (styleChanged)
                         patches.Insert(0, new WordPatch { Op = "style", Block = 0, Html = newStyle });
-                    SendSseWordPatch(patches, _version, baseVersion, msg.ScrollTo);
+                    SendSseWordPatch(patches, _engine.Version, baseVersion, msg.ScrollTo);
                     return;
                 }
             }
@@ -670,19 +668,19 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                     excelPatches ??= new List<(string Op, string Row, string? Html)>();
                     if (styleChanged)
                         excelPatches.Insert(0, ("style", "", newStyle));
-                    SendSseExcelPatch(excelPatches, _version, baseVersion, msg.ScrollTo);
+                    SendSseExcelPatch(excelPatches, _engine.Version, baseVersion, msg.ScrollTo);
                     return;
                 }
             }
 
             // Forward to SSE clients (full or PPT incremental)
-            SendSseEvent(msg.Action, msg.Slide, msg.Html, msg.ScrollTo, _version);
+            SendSseEvent(msg.Action, msg.Slide, msg.Html, msg.ScrollTo, _engine.Version);
         }
         catch
         {
             // Legacy format or parse error — treat as full refresh signal
-            _version++;
-            SendSseEvent("full", 0, null, null, _version);
+            _engine.BumpVersion();
+            SendSseEvent("full", 0, null, null, _engine.Version);
         }
     }
 
@@ -764,7 +762,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                 mark.Id = assignedId;
                 // Snapshot _currentHtml under the lock so a concurrent
                 // full-refresh can't race the resolve step.
-                htmlSnapshot = _currentHtml;
+                htmlSnapshot = _engine.CurrentHtml;
                 var resolved = ResolveMark(mark, htmlSnapshot);
                 _currentMarks.Add(resolved);
                 _marksVersion++;
@@ -850,8 +848,8 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
     /// </summary>
     internal void ApplyFullHtmlForTests(string html)
     {
-        _currentHtml = html ?? "";
-        _version++;
+        _engine.CurrentHtml = html;
+        _engine.BumpVersion();
         ReconcileAllMarks();
     }
 
@@ -1251,7 +1249,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             if (_currentMarks.Count == 0) return;
             for (int i = 0; i < _currentMarks.Count; i++)
             {
-                _currentMarks[i] = ResolveMark(_currentMarks[i], _currentHtml);
+                _currentMarks[i] = ResolveMark(_currentMarks[i], _engine.CurrentHtml);
             }
             _marksVersion++;
             snapshot = _currentMarks.ToArray();
@@ -1917,9 +1915,9 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             }
 
             // Default: serve current HTML (GET / and everything else)
-            var html = string.IsNullOrEmpty(_currentHtml)
+            var html = string.IsNullOrEmpty(_engine.CurrentHtml)
                 ? InjectSseScript(WaitingHtml)
-                : InjectSseScript(_currentHtml);
+                : InjectSseScript(_engine.CurrentHtml);
             var bodyBytes = Encoding.UTF8.GetBytes(html);
             var header = Encoding.UTF8.GetBytes(
                 $"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {bodyBytes.Length}\r\nConnection: close\r\n\r\n");
