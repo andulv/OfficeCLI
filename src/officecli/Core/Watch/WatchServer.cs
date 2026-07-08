@@ -997,144 +997,14 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             // {"command": "set"|"add"|"remove", ...}.
             // Bare {"path", "props"} or legacy {"path", "prop", "value"} with
             // no "command" field default to "set" for pre-existing callers.
+            // The item → CLI-argument mapping + child-process spawn live in
+            // WatchCommandRunner so an embedder reuses the exact same behavior.
             using var doc = System.Text.Json.JsonDocument.Parse(body);
-            var root = doc.RootElement;
-            var command = root.TryGetProperty("command", out var cmdEl) ? cmdEl.GetString() ?? "set" : "set";
-
-            var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
-                ?? (OperatingSystem.IsWindows() ? "officecli.exe" : "officecli");
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = exe,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            switch (command.ToLowerInvariant())
-            {
-                case "add":
-                {
-                    // Accept the canonical batch-item key "path" (used by /api/batch,
-                    // the SDKs) as well
-                    // as the legacy "parent". /api/send must accept the same item shape
-                    // as /api/batch (see HandlePostBatchAsync doc) — otherwise `add`
-                    // diverges per backend and a `path`-shaped item throws a raw
-                    // KeyNotFoundException instead of running.
-                    var parent = (root.TryGetProperty("path", out var addPathEl) ? addPathEl.GetString() : null)
-                        ?? (root.TryGetProperty("parent", out var addParentEl) ? addParentEl.GetString() : null)
-                        ?? "";
-                    psi.ArgumentList.Add("add");
-                    psi.ArgumentList.Add(_filePath);
-                    psi.ArgumentList.Add(parent);
-                    // --from clones an existing element (shape/slide); it is
-                    // mutually exclusive with --type/--prop (see `add`), so when
-                    // present it is the whole command.
-                    if (root.TryGetProperty("from", out var fromEl) && fromEl.GetString() is { } from)
-                    {
-                        psi.ArgumentList.Add("--from");
-                        psi.ArgumentList.Add(from);
-                    }
-                    else
-                    {
-                        if (root.TryGetProperty("type", out var typeEl) && typeEl.GetString() is { } type)
-                        {
-                            psi.ArgumentList.Add("--type");
-                            psi.ArgumentList.Add(type);
-                        }
-                        AppendProps(psi, root);
-                    }
-                    // Position hints apply to both clone and typed add.
-                    AppendPositionArgs(psi, root);
-                    break;
-                }
-                case "remove":
-                {
-                    var path = root.GetProperty("path").GetString() ?? "";
-                    psi.ArgumentList.Add("remove");
-                    psi.ArgumentList.Add(_filePath);
-                    psi.ArgumentList.Add(path);
-                    break;
-                }
-                case "get":
-                {
-                    // Read-only: spawn `officecli get <path>` (served from the
-                    // resident's current in-memory state). Used by the editor to
-                    // read a property's prior value / capture an element before
-                    // deletion for undo. Still a child process — no in-process
-                    // document access, so the watch red line holds.
-                    var path = root.GetProperty("path").GetString() ?? "";
-                    psi.ArgumentList.Add("get");
-                    psi.ArgumentList.Add(_filePath);
-                    psi.ArgumentList.Add(path);
-                    break;
-                }
-                case "move":
-                {
-                    var path = root.GetProperty("path").GetString() ?? "";
-                    psi.ArgumentList.Add("move");
-                    psi.ArgumentList.Add(_filePath);
-                    psi.ArgumentList.Add(path);
-                    if (root.TryGetProperty("to", out var toEl) && toEl.GetString() is { } to)
-                    { psi.ArgumentList.Add("--to"); psi.ArgumentList.Add(to); }
-                    AppendPositionArgs(psi, root);
-                    break;
-                }
-                case "swap":
-                {
-                    var path1 = root.GetProperty("path").GetString() ?? "";
-                    // Canonical second path is "path2"; accept legacy "to".
-                    var path2 = root.TryGetProperty("path2", out var p2El) ? p2El.GetString() ?? ""
-                        : root.TryGetProperty("to", out var toEl2) ? toEl2.GetString() ?? "" : "";
-                    psi.ArgumentList.Add("swap");
-                    psi.ArgumentList.Add(_filePath);
-                    psi.ArgumentList.Add(path1);
-                    psi.ArgumentList.Add(path2);
-                    break;
-                }
-                case "set":
-                default:
-                {
-                    var path = root.GetProperty("path").GetString() ?? "";
-                    psi.ArgumentList.Add("set");
-                    psi.ArgumentList.Add(_filePath);
-                    psi.ArgumentList.Add(path);
-                    if (root.TryGetProperty("props", out var propsEl) && propsEl.ValueKind == System.Text.Json.JsonValueKind.Object)
-                    {
-                        AppendProps(psi, root);
-                    }
-                    else
-                    {
-                        // Legacy shape: {"path", "prop", "value"} (single property, no "props" object).
-                        var prop = root.GetProperty("prop").GetString() ?? "text";
-                        var value = root.GetProperty("value").GetString() ?? "";
-                        psi.ArgumentList.Add("--prop");
-                        psi.ArgumentList.Add($"{prop}={value}");
-                    }
-                    break;
-                }
-            }
-
-            // --json is the CLI's opt-in for the structured envelope; omit it
-            // for plain text. The flag only changes what officecli prints, i.e.
-            // what ends up inside the comm envelope's `message`.
-            if (json) psi.ArgumentList.Add("--json");
-
-            string output = "";
-            using var proc = System.Diagnostics.Process.Start(psi);
-            if (proc != null)
-            {
-                // Drain stderr concurrently: it is redirected (so it MUST be
-                // read) but never surfaced — a child that fills the ~64KB pipe
-                // buffer with warnings would otherwise deadlock this request.
-                var drainErr = proc.StandardError.ReadToEndAsync(token);
-                output = await proc.StandardOutput.ReadToEndAsync(token);
-                await proc.WaitForExitAsync(token);
-                _ = await drainErr;
-                // command auto-notifies watch via named pipe → SSE refresh
-            }
-            await WriteCommEnvelopeAsync(stream, true, output.TrimEnd('\n', '\r'), token);
+            var args = WatchCommandRunner.BuildSendArguments(_filePath, doc.RootElement);
+            var output = await WatchCommandRunner.RunAsync(
+                WatchCommandRunner.ResolveOfficeCliPath(), args, json, token);
+            // command auto-notifies watch via named pipe → SSE refresh
+            await WriteCommEnvelopeAsync(stream, true, output, token);
         }
         catch (System.Exception ex)
         {
@@ -1178,37 +1048,14 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                 body = sb.ToString();
             }
 
-            var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
-                ?? (OperatingSystem.IsWindows() ? "officecli.exe" : "officecli");
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = exe,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            psi.ArgumentList.Add("batch");
-            psi.ArgumentList.Add(_filePath);
-            psi.ArgumentList.Add("--commands");
-            psi.ArgumentList.Add(body);
-            // --json opts into the structured envelope; omit for plain text.
-            if (json) psi.ArgumentList.Add("--json");
-
-            string output = "";
-            using var proc = System.Diagnostics.Process.Start(psi);
-            if (proc != null)
-            {
-                // Drain stderr concurrently: it is redirected (so it MUST be
-                // read) but never surfaced — a child that fills the ~64KB pipe
-                // buffer with warnings would otherwise deadlock this request.
-                var drainErr = proc.StandardError.ReadToEndAsync(token);
-                output = await proc.StandardOutput.ReadToEndAsync(token);
-                await proc.WaitForExitAsync(token);
-                _ = await drainErr;
-                // batch auto-notifies watch via named pipe → SSE refresh
-            }
-            await WriteCommEnvelopeAsync(stream, true, output.TrimEnd('\n', '\r'), token);
+            // The whole body is a JSON array of batch-items that `officecli batch
+            // --commands` takes verbatim; WatchCommandRunner builds the args and
+            // spawns officecli (same child-process trust boundary as /api/send).
+            var args = WatchCommandRunner.BuildBatchArguments(_filePath, body);
+            var output = await WatchCommandRunner.RunAsync(
+                WatchCommandRunner.ResolveOfficeCliPath(), args, json, token);
+            // batch auto-notifies watch via named pipe → SSE refresh
+            await WriteCommEnvelopeAsync(stream, true, output, token);
         }
         catch (System.Exception ex)
         {
@@ -1271,31 +1118,6 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {bodyBytes.Length}\r\nConnection: close\r\n\r\n");
         await stream.WriteAsync(header, token);
         await stream.WriteAsync(bodyBytes, token);
-    }
-
-    private static void AppendProps(System.Diagnostics.ProcessStartInfo psi, System.Text.Json.JsonElement root)
-    {
-        if (!root.TryGetProperty("props", out var propsEl) || propsEl.ValueKind != System.Text.Json.JsonValueKind.Object)
-            return;
-        foreach (var kv in propsEl.EnumerateObject())
-        {
-            psi.ArgumentList.Add("--prop");
-            psi.ArgumentList.Add($"{kv.Name}={kv.Value.GetString() ?? ""}");
-        }
-    }
-
-    /// <summary>
-    /// Append the shared insert-position hints (--index / --after / --before)
-    /// that add and move accept. Order-neutral; officecli resolves precedence.
-    /// </summary>
-    private static void AppendPositionArgs(System.Diagnostics.ProcessStartInfo psi, System.Text.Json.JsonElement root)
-    {
-        if (root.TryGetProperty("index", out var idxEl) && idxEl.ValueKind == System.Text.Json.JsonValueKind.Number)
-        { psi.ArgumentList.Add("--index"); psi.ArgumentList.Add(idxEl.GetInt32().ToString(System.Globalization.CultureInfo.InvariantCulture)); }
-        if (root.TryGetProperty("after", out var afEl) && afEl.GetString() is { } af)
-        { psi.ArgumentList.Add("--after"); psi.ArgumentList.Add(af); }
-        if (root.TryGetProperty("before", out var beEl) && beEl.GetString() is { } be)
-        { psi.ArgumentList.Add("--before"); psi.ArgumentList.Add(be); }
     }
 
     private void BroadcastSelectionUpdate(List<string> paths)
