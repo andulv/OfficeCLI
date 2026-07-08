@@ -18,7 +18,7 @@ namespace OfficeCli.Core;
 /// Receives pre-rendered HTML from command processes via named pipe,
 /// forwards to browsers via SSE.
 /// </summary>
-internal class WatchServer : IDisposable
+internal class WatchServer : IDisposable, IWatchBroadcaster
 {
     private readonly string _filePath;
     private readonly string _pipeName;
@@ -1768,6 +1768,13 @@ internal class WatchServer : IDisposable
     }
 
     private void BroadcastSse(string sseJson)
+        => Broadcast(new WatchSseEvent(sseJson));
+
+    /// <summary>
+    /// <see cref="IWatchBroadcaster"/> delivery point: frame the event and write it
+    /// to every connected SSE client, dropping any that fault.
+    /// </summary>
+    public void Broadcast(WatchSseEvent watchEvent)
     {
         lock (_sseLock)
         {
@@ -1776,7 +1783,7 @@ internal class WatchServer : IDisposable
             {
                 try
                 {
-                    var data = Encoding.UTF8.GetBytes($"event: update\ndata: {sseJson}\n\n");
+                    var data = Encoding.UTF8.GetBytes($"event: {watchEvent.EventName}\ndata: {watchEvent.Data}\n\n");
                     client.Write(data);
                     client.Flush();
                 }
