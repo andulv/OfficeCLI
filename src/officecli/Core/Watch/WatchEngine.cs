@@ -684,4 +684,425 @@ public sealed class WatchEngine
         }
     }
 
+
+    // -------- HTML patch/diff helpers (pure string transforms) --------
+
+    /// <summary>Replace a single slide fragment in the full HTML by data-slide number.</summary>
+    internal static string PatchSlideInHtml(string html, int slideNum, string newFragment)
+    {
+        var (start, end) = FindSlideFragmentRange(html, slideNum);
+        if (start < 0) return html;
+        return string.Concat(html.AsSpan(0, start), newFragment, html.AsSpan(end));
+    }
+
+    /// <summary>Append a slide fragment before the last closing tag of the main container.</summary>
+    internal static string AppendSlideToHtml(string html, string fragment)
+    {
+        // Find the last </div> before </body> — that's the .main container's closing tag
+        var bodyClose = html.LastIndexOf("</body>", StringComparison.OrdinalIgnoreCase);
+        if (bodyClose < 0) return html + fragment;
+        // Find the </div> just before </body>
+        var mainClose = html.LastIndexOf("</div>", bodyClose, StringComparison.OrdinalIgnoreCase);
+        if (mainClose < 0) return html;
+        return string.Concat(html.AsSpan(0, mainClose), fragment, "\n", html.AsSpan(mainClose));
+    }
+
+    /// <summary>Remove a slide fragment from the full HTML.</summary>
+    internal static string RemoveSlideFromHtml(string html, int slideNum)
+    {
+        var (start, end) = FindSlideFragmentRange(html, slideNum);
+        if (start < 0) return html;
+        return string.Concat(html.AsSpan(0, start), html.AsSpan(end));
+    }
+
+    /// <summary>Find the start/end character positions of a slide-container div in the HTML.</summary>
+    private static (int Start, int End) FindSlideFragmentRange(string html, int slideNum)
+    {
+        // The sidebar also emits `<div class="thumb" data-slide="N">`, so matching
+        // on `data-slide="N"` alone hits the thumb first and leaves the main
+        // slide-container stale — user-visible as a white main view on every
+        // incremental update. Pin to the slide-container class.
+        var marker = $"class=\"slide-container\" data-slide=\"{slideNum}\"";
+        var idx = html.IndexOf(marker, StringComparison.Ordinal);
+        if (idx < 0) return (-1, -1);
+
+        var start = html.LastIndexOf("<div ", idx, StringComparison.Ordinal);
+        if (start < 0) return (-1, -1);
+
+        // Find matching closing </div> by counting nesting
+        var depth = 0;
+        var pos = start;
+        while (pos < html.Length)
+        {
+            var nextOpen = html.IndexOf("<div", pos, StringComparison.OrdinalIgnoreCase);
+            var nextClose = html.IndexOf("</div>", pos, StringComparison.OrdinalIgnoreCase);
+
+            if (nextClose < 0) break;
+
+            if (nextOpen >= 0 && nextOpen < nextClose)
+            {
+                depth++;
+                pos = nextOpen + 4;
+            }
+            else
+            {
+                depth--;
+                if (depth == 0)
+                    return (start, nextClose + 6);
+                pos = nextClose + 6;
+            }
+        }
+
+        return (-1, -1);
+    }
+
+    /// <summary>Extract all &lt;style&gt; blocks from HTML head, concatenated.</summary>
+    internal static string? ExtractStyleBlock(string html)
+    {
+        var sb = new StringBuilder();
+        var idx = 0;
+        while (true)
+        {
+            var start = html.IndexOf("<style>", idx, StringComparison.OrdinalIgnoreCase);
+            if (start < 0) start = html.IndexOf("<style ", idx, StringComparison.OrdinalIgnoreCase);
+            if (start < 0) break;
+            var end = html.IndexOf("</style>", start, StringComparison.OrdinalIgnoreCase);
+            if (end < 0) break;
+            end += 8; // include </style>
+            sb.Append(html, start, end - start);
+            idx = end;
+        }
+        return sb.Length > 0 ? sb.ToString() : null;
+    }
+
+    /// <summary>Split Word HTML into blocks keyed by block number. Returns dict of blockNum → content.</summary>
+    private static Dictionary<int, string> SplitWordBlocks(string html)
+    {
+        var blocks = new Dictionary<int, string>();
+        var beginRx = new System.Text.RegularExpressions.Regex(@"<span class=""wb"" data-block=""(\d+)"" style=""display:none""></span>");
+        var matches = beginRx.Matches(html);
+        for (int i = 0; i < matches.Count; i++)
+        {
+            var m = matches[i];
+            var blockNum = int.Parse(m.Groups[1].Value);
+            var contentStart = m.Index + m.Length;
+            var endMarker = $"<span class=\"we\" data-block=\"{blockNum}\" style=\"display:none\"></span>";
+            var endIdx = html.IndexOf(endMarker, contentStart, StringComparison.Ordinal);
+            if (endIdx >= 0)
+                blocks[blockNum] = html[contentStart..endIdx];
+        }
+        return blocks;
+    }
+
+    /// <summary>Compute block-level patches between old and new Word HTML. Returns null if diff is too large (fallback to full).</summary>
+    internal static List<WordPatch>? ComputeWordPatches(string oldHtml, string newHtml)
+    {
+        // Only diff if both are Word documents with block markers
+        if (string.IsNullOrEmpty(oldHtml) || string.IsNullOrEmpty(newHtml))
+            return null;
+        if (!oldHtml.Contains("data-block=\"1\"") || !newHtml.Contains("data-block=\"1\""))
+            return null;
+
+        // Section count change → fall back to full diff. Block <wb>/<we>
+        // markers can straddle a section boundary (e.g. when a new section
+        // is appended, the trailing block's <wb> sits in the prior section's
+        // page-body and its <we> in the new section's page-body). Treating
+        // that span as block content would inject structural markup
+        // (</page-body></page></page-wrapper><page-wrapper data-section="N">…)
+        // into the previous section's page-body, producing nested pages.
+        var oldSecCount = System.Text.RegularExpressions.Regex.Matches(oldHtml, @"data-section=""\d+""").Count;
+        var newSecCount = System.Text.RegularExpressions.Regex.Matches(newHtml, @"data-section=""\d+""").Count;
+        if (oldSecCount != newSecCount) return null;
+
+        var oldBlocks = SplitWordBlocks(oldHtml);
+        var newBlocks = SplitWordBlocks(newHtml);
+
+        if (oldBlocks.Count == 0 && newBlocks.Count == 0) return null;
+
+        var patches = new List<WordPatch>();
+
+        // Find max block number across both
+        var maxBlock = 0;
+        foreach (var k in oldBlocks.Keys) if (k > maxBlock) maxBlock = k;
+        foreach (var k in newBlocks.Keys) if (k > maxBlock) maxBlock = k;
+
+        for (int b = 1; b <= maxBlock; b++)
+        {
+            var inOld = oldBlocks.TryGetValue(b, out var oldContent);
+            var inNew = newBlocks.TryGetValue(b, out var newContent);
+
+            if (inOld && inNew)
+            {
+                if (oldContent != newContent)
+                    patches.Add(new WordPatch { Op = "replace", Block = b, Html = newContent });
+                // else: unchanged, skip
+            }
+            else if (!inOld && inNew)
+            {
+                patches.Add(new WordPatch { Op = "add", Block = b, Html = newContent });
+            }
+            else if (inOld && !inNew)
+            {
+                patches.Add(new WordPatch { Op = "remove", Block = b });
+            }
+        }
+
+        if (patches.Count == 0) return null; // no changes
+
+        // A block's <wb>…<we> markers can straddle a structural container, so its
+        // captured content is structurally unbalanced — it opens a container it
+        // never closes, or closes one it never opened. Known cases:
+        //   • a paragraph with an inline <w:br type="page"/> — its span includes
+        //     </page-body></page></page-wrapper><div class="page-wrapper">…<page-body>
+        //     (page count is unchanged, so the section-count guard misses it);
+        //   • a list — the <ol>/<ul> opens in the list block but the matching
+        //     </ol>/</ul> closes inside the NEXT block's span;
+        //   • multi-column / drop-cap wrappers split across blocks the same way.
+        // Re-applying such a payload via innerHTML corrupts the live DOM (the
+        // sibling-walk in wordPatchUpdate can't cross the container boundary):
+        // an injected page-wrapper nests a page inside a page; an orphaned
+        // </ol> wipes the list. Detect the straddle on the patch payload and
+        // fall back to a full refresh, which rebuilds the structure correctly.
+        foreach (var p in patches)
+            if (WordPatchPayloadStraddlesStructure(p.Html))
+                return null;
+
+        // If more than 60% of blocks changed (and enough blocks to matter), fallback to full refresh
+        var totalBlocks = Math.Max(oldBlocks.Count, newBlocks.Count);
+        if (totalBlocks >= 5 && patches.Count > totalBlocks * 0.6)
+            return null;
+
+        return patches;
+    }
+
+    // Matches any HTML start/end tag: group1 = "/" for an end tag, group2 = tag
+    // name, group3 = "/" for an explicit self-close (<x/>). Comments (<!-- -->)
+    // and the XML/doctype declarations don't match — group2 requires a leading
+    // ASCII letter. Attribute values never contain a raw '>' (the renderer
+    // HTML-encodes them), so a greedy `[^>]*?` to the tag's own '>' is safe.
+    private static readonly System.Text.RegularExpressions.Regex _htmlTagRx =
+        new(@"<(/?)([a-zA-Z][a-zA-Z0-9:-]*)\b[^>]*?(/?)>",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // Tags excluded from the balance count. Two groups, same reason — neither
+    // can make a block straddle a structural boundary:
+    //   • void elements — never carry children (<br>, <img>, <col> …);
+    //   • inline elements — the renderer always opens AND closes them within a
+    //     single run/paragraph render, so they are self-contained inside one
+    //     block by construction. Skipping them also hardens the balance count
+    //     against malformed inline markup buried in an attribute value (a raw
+    //     '>' the real renderer would have encoded as &gt;).
+    // Everything NOT in this set is treated as a potential block-level container
+    // and counted — so a future block container the renderer starts emitting is
+    // covered without editing this list. grep CONSISTENCY(word-patch-straddle).
+    private static readonly HashSet<string> _inlineOrVoidHtmlTags = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // void
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+        // inline / phrasing
+        "a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "dfn", "em",
+        "font", "i", "kbd", "label", "mark", "q", "rp", "rt", "ruby", "s",
+        "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var",
+    };
+
+    /// <summary>
+    /// True when a Word block-diff patch payload is unsafe to splice into the
+    /// live DOM incrementally — i.e. the source block's &lt;wb&gt;/&lt;we&gt;
+    /// markers straddle a structural element.
+    ///
+    /// Root invariant (not a list of known cases): the client splice
+    /// (wordPatchUpdate) walks DOM *siblings* between the &lt;wb&gt; and
+    /// &lt;we&gt; markers. That only works when both markers sit at the same DOM
+    /// depth, which holds **iff** the captured payload is a well-balanced HTML
+    /// fragment with no leading orphan-close. So we test exactly that, over
+    /// EVERY element tag — no enumeration of containers (page-wrapper, ol/ul,
+    /// multi-column / drop-cap div, table, …). Any present-or-future renderer
+    /// shape that straddles a container is rejected, and the caller falls back
+    /// to a full refresh. CONSISTENCY(word-patch-straddle).
+    /// </summary>
+    internal static bool WordPatchPayloadStraddlesStructure(string? html)
+    {
+        if (string.IsNullOrEmpty(html)) return false;
+
+        var depth = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (System.Text.RegularExpressions.Match m in _htmlTagRx.Matches(html))
+        {
+            var tag = m.Groups[2].Value;
+            if (m.Groups[3].Value == "/") continue;            // explicit self-close <x/>
+            if (_inlineOrVoidHtmlTags.Contains(tag)) continue; // inline / void — never straddles
+
+            if (m.Groups[1].Value == "/")
+            {
+                // A close whose matching open was never seen in this payload —
+                // it lives in a sibling block (e.g. </ol> after a list block,
+                // </page-wrapper> from a mid-paragraph page break). The markers
+                // are at different DOM depths → unsafe.
+                var d = depth.GetValueOrDefault(tag) - 1;
+                if (d < 0) return true;
+                depth[tag] = d;
+            }
+            else
+            {
+                depth[tag] = depth.GetValueOrDefault(tag) + 1;
+            }
+        }
+        // Any element left open at the end straddles into the next block.
+        foreach (var d in depth.Values) if (d != 0) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Signature of chart overlay positions — concatenation of all data-from-row/col
+    /// values in document order. Different signature → chart was moved → need full refresh.
+    /// </summary>
+    private static string ChartOverlaySignature(string html)
+    {
+        var sb = new System.Text.StringBuilder();
+        var rx = new System.Text.RegularExpressions.Regex(@"data-from-(?:row|col)=""(\d+)""");
+        foreach (System.Text.RegularExpressions.Match m in rx.Matches(html))
+            sb.Append(m.Value).Append(',');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Signature of Excel table chrome — concatenates each sheet's &lt;colgroup&gt;,
+    /// &lt;thead&gt;, and the &lt;table&gt; open tag (which carries table width style).
+    /// Row-level patches only swap &lt;tr&gt; nodes, so if this signature changes
+    /// between old and new HTML (column added/removed, column width changed,
+    /// thead style changed) the browser needs a full body refresh — otherwise
+    /// new headers/widths stay stale until a manual reload.
+    /// </summary>
+    internal static string TableChromeSignature(string html)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (System.Text.RegularExpressions.Match m in
+            System.Text.RegularExpressions.Regex.Matches(
+                html, @"<colgroup>.*?</colgroup>",
+                System.Text.RegularExpressions.RegexOptions.Singleline))
+            sb.Append(m.Value).Append('|');
+        foreach (System.Text.RegularExpressions.Match m in
+            System.Text.RegularExpressions.Regex.Matches(
+                html, @"<thead>.*?</thead>",
+                System.Text.RegularExpressions.RegexOptions.Singleline))
+            sb.Append(m.Value).Append('|');
+        foreach (System.Text.RegularExpressions.Match m in
+            System.Text.RegularExpressions.Regex.Matches(html, @"<table[^>]*>"))
+            sb.Append(m.Value).Append('|');
+        return sb.ToString();
+    }
+
+    /// <summary>Split Excel HTML into rows keyed by "sheetIdx-rowNum" from data-row attributes.</summary>
+    private static Dictionary<string, string> SplitExcelRows(string html)
+    {
+        var rows = new Dictionary<string, string>();
+
+        // Static mode: extract <tr data-row="sheetIdx-rowNum"> elements
+        var rx = new System.Text.RegularExpressions.Regex(@"<tr\s[^>]*data-row=""([^""]+)""[^>]*>");
+        var matches = rx.Matches(html);
+        for (int i = 0; i < matches.Count; i++)
+        {
+            var m = matches[i];
+            var key = m.Groups[1].Value;
+            var contentStart = m.Index;
+            var endTag = "</tr>";
+            var endIdx = html.IndexOf(endTag, contentStart + m.Length, StringComparison.Ordinal);
+            if (endIdx >= 0)
+                rows[key] = html[contentStart..(endIdx + endTag.Length)];
+        }
+
+        // Virt mode: extract rows from <script type="application/json" id="virt-data-N">
+        // Format: [{"r":R,"frozen":bool[,"h":H],"html":"<escaped inner html>"},...]
+        var scriptRx = new System.Text.RegularExpressions.Regex(
+            @"<script[^>]*id=""virt-data-(\d+)""[^>]*>([\s\S]*?)</script>");
+        var rowRx = new System.Text.RegularExpressions.Regex(
+            @"""r"":(\d+).*?""html"":""((?:[^""\\]|\\.)*)""");
+        var heightRx = new System.Text.RegularExpressions.Regex(@"""h"":(\d+(?:\.\d+)?)");
+        foreach (System.Text.RegularExpressions.Match scriptMatch in scriptRx.Matches(html))
+        {
+            var sheetIdx = scriptMatch.Groups[1].Value;
+            var json = scriptMatch.Groups[2].Value;
+            foreach (System.Text.RegularExpressions.Match rowMatch in rowRx.Matches(json))
+            {
+                var rowNum = rowMatch.Groups[1].Value;
+                var key = $"{sheetIdx}-{rowNum}";
+                if (rows.ContainsKey(key)) continue; // frozen row already captured from static <tr>
+                var innerHtml = rowMatch.Groups[2].Value
+                    .Replace("\\\"", "\"").Replace("\\\\", "\\")
+                    .Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
+                // Extract row height from metadata fields (the portion before "html":)
+                var htmlFieldOffset = rowMatch.Value.IndexOf("\"html\":", StringComparison.Ordinal);
+                var metaStr = htmlFieldOffset >= 0 ? rowMatch.Value.Substring(0, htmlFieldOffset) : "";
+                var hm = heightRx.Match(metaStr);
+                var heightStyle = hm.Success ? $" style=\"height:{hm.Groups[1].Value}pt\"" : "";
+                rows[key] = $"<tr data-row=\"{key}\"{heightStyle}>{innerHtml}</tr>";
+            }
+        }
+
+        return rows;
+    }
+
+    /// <summary>Compute row-level patches between old and new Excel HTML. Returns null if diff is too large (fallback to full).</summary>
+    internal static List<(string Op, string Row, string? Html)>? ComputeExcelPatches(string oldHtml, string newHtml)
+    {
+        if (string.IsNullOrEmpty(oldHtml) || string.IsNullOrEmpty(newHtml))
+            return null;
+        // Two valid row-data signals:
+        //  static: data-row="X..." where the value starts with an alphanumeric char (real keys
+        //          are "N-M" or "word-N-M"; JS template literals have data-row="' + ... which
+        //          starts with a single-quote, not alphanumeric).
+        //  virt:   id="virt-data-N" on <script> data elements (numeric suffix, not "{n}" template
+        //          used by the virt JS implementation script).
+        static bool HasRowData(string h) =>
+            System.Text.RegularExpressions.Regex.IsMatch(h, @"data-row=""[a-zA-Z0-9]") ||
+            System.Text.RegularExpressions.Regex.IsMatch(h, @"id=""virt-data-\d+""");
+        if (!HasRowData(oldHtml) || !HasRowData(newHtml))
+            return null;
+
+        // If chart overlay positions changed, fall back to full refresh.
+        // excel-patch only patches <tr> rows; overlay divs are outside the table
+        // and won't be updated by row-level patching.
+        if (ChartOverlaySignature(oldHtml) != ChartOverlaySignature(newHtml))
+            return null;
+
+        var oldRows = SplitExcelRows(oldHtml);
+        var newRows = SplitExcelRows(newHtml);
+
+        if (oldRows.Count == 0 && newRows.Count == 0) return null;
+
+        var patches = new List<(string Op, string Row, string? Html)>();
+
+        // Check all keys from both old and new
+        var allKeys = new HashSet<string>(oldRows.Keys);
+        allKeys.UnionWith(newRows.Keys);
+
+        foreach (var key in allKeys)
+        {
+            var inOld = oldRows.TryGetValue(key, out var oldContent);
+            var inNew = newRows.TryGetValue(key, out var newContent);
+
+            if (inOld && inNew)
+            {
+                if (oldContent != newContent)
+                    patches.Add(("replace", key, newContent));
+            }
+            else if (!inOld && inNew)
+            {
+                patches.Add(("add", key, newContent));
+            }
+            else if (inOld && !inNew)
+            {
+                patches.Add(("remove", key, null));
+            }
+        }
+
+        if (patches.Count == 0) return null;
+
+        // If more than 60% of rows changed, fallback to full refresh
+        var totalRows = Math.Max(oldRows.Count, newRows.Count);
+        if (totalRows >= 5 && patches.Count > totalRows * 0.6)
+            return null;
+
+        return patches;
+    }
 }
