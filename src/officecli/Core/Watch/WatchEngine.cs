@@ -1105,4 +1105,222 @@ public sealed class WatchEngine
 
         return patches;
     }
+
+    // -------- Message dispatch + SSE construction --------
+
+    public void HandleWatchMessage(string json)
+    {
+        try
+        {
+            var msg = JsonSerializer.Deserialize(json, WatchMessageJsonContext.Default.WatchMessage);
+            if (msg == null) return;
+
+            // Scroll-only event: broadcast a CSS selector to all SSE clients
+            // without touching the cached HTML, version, or marks. Used by the
+            // `goto` command to navigate already-running watch viewers.
+            if (msg.Action == "scroll" && !string.IsNullOrEmpty(msg.ScrollTo))
+            {
+                SendSseEvent("scroll", 0, null, msg.ScrollTo, Version);
+                return;
+            }
+
+            var oldHtml = CurrentHtml;
+            var baseVersion = Version;
+
+            // Always update cached full HTML when provided (authoritative snapshot)
+            if (!string.IsNullOrEmpty(msg.FullHtml))
+            {
+                CurrentHtml = msg.FullHtml;
+            }
+
+            // Apply incremental patch when no full HTML was provided
+            if (string.IsNullOrEmpty(msg.FullHtml))
+            {
+                if (msg.Action == "replace" && msg.Slide > 0 && msg.Html != null)
+                    CurrentHtml = PatchSlideInHtml(CurrentHtml, msg.Slide, msg.Html);
+                else if (msg.Action == "add" && msg.Html != null)
+                    CurrentHtml = AppendSlideToHtml(CurrentHtml, msg.Html);
+                else if (msg.Action == "remove" && msg.Slide > 0)
+                    CurrentHtml = RemoveSlideFromHtml(CurrentHtml, msg.Slide);
+            }
+
+            BumpVersion();
+
+            // Reconcile all marks against the freshly updated snapshot. Flips
+            // stale flags and refreshes matched_text when the underlying text
+            // changed. CONSISTENCY(path-stability): same naive resolve used on
+            // initial add, no fingerprint.
+            ReconcileAllMarks();
+
+            // Word: try block-level diff instead of full refresh
+            if (msg.Action == "full" && !string.IsNullOrEmpty(msg.FullHtml)
+                && !string.IsNullOrEmpty(oldHtml) && oldHtml.Contains("data-block=\"1\""))
+            {
+                var patches = ComputeWordPatches(oldHtml, msg.FullHtml);
+                // Check if CSS styles changed
+                var oldStyle = ExtractStyleBlock(oldHtml);
+                var newStyle = ExtractStyleBlock(msg.FullHtml);
+                var styleChanged = oldStyle != newStyle;
+
+                if (patches != null || styleChanged)
+                {
+                    patches ??= new List<WordPatch>();
+                    if (styleChanged)
+                        patches.Insert(0, new WordPatch { Op = "style", Block = 0, Html = newStyle });
+                    SendSseWordPatch(patches, Version, baseVersion, msg.ScrollTo);
+                    return;
+                }
+            }
+
+            // Excel: try row-level diff instead of full refresh.
+            // Skip when table chrome (colgroup/thead/table width) changed —
+            // row patches can't express those changes, so fall through to
+            // full-action so the browser rebuilds the whole body.
+            if (msg.Action == "full" && !string.IsNullOrEmpty(msg.FullHtml)
+                && !string.IsNullOrEmpty(oldHtml) && oldHtml.Contains("data-row=\"")
+                && TableChromeSignature(oldHtml) == TableChromeSignature(msg.FullHtml))
+            {
+                var excelPatches = ComputeExcelPatches(oldHtml, msg.FullHtml);
+                var oldStyle = ExtractStyleBlock(oldHtml);
+                var newStyle = ExtractStyleBlock(msg.FullHtml);
+                var styleChanged = oldStyle != newStyle;
+
+                if (excelPatches != null || styleChanged)
+                {
+                    excelPatches ??= new List<(string Op, string Row, string? Html)>();
+                    if (styleChanged)
+                        excelPatches.Insert(0, ("style", "", newStyle));
+                    SendSseExcelPatch(excelPatches, Version, baseVersion, msg.ScrollTo);
+                    return;
+                }
+            }
+
+            // Forward to SSE clients (full or PPT incremental)
+            SendSseEvent(msg.Action, msg.Slide, msg.Html, msg.ScrollTo, Version);
+        }
+        catch
+        {
+            // Legacy format or parse error — treat as full refresh signal
+            BumpVersion();
+            SendSseEvent("full", 0, null, null, Version);
+        }
+    }
+
+    /// <summary>
+    /// Validate a CSS selector against the cached HTML and, when it resolves,
+    /// broadcast a scroll event to viewers. Returns false when the selector is
+    /// absent so the caller (e.g. the `goto` pipe command) can report failure.
+    /// watch-isolation: no file open — only the cached HTML string is inspected.
+    /// </summary>
+    public bool TryScroll(string selector)
+    {
+        if (!SelectorExistsInHtml(CurrentHtml, selector)) return false;
+        SendSseEvent("scroll", 0, null, selector, Version);
+        return true;
+    }
+
+    private void SendSseWordPatch(List<WordPatch> patches, int version, int baseVersion, string? scrollTo)
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"action\":\"word-patch\"");
+        sb.Append(",\"version\":").Append(version);
+        sb.Append(",\"baseVersion\":").Append(baseVersion);
+        sb.Append(",\"patches\":[");
+        for (int i = 0; i < patches.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"op\":\"").Append(patches[i].Op).Append('"');
+            sb.Append(",\"block\":").Append(patches[i].Block);
+            if (patches[i].Html != null)
+            {
+                sb.Append(",\"html\":");
+                AppendJsonString(sb, patches[i].Html!);
+            }
+            sb.Append('}');
+        }
+        sb.Append(']');
+        if (scrollTo != null)
+        {
+            sb.Append(",\"scrollTo\":");
+            AppendJsonString(sb, scrollTo);
+        }
+        sb.Append('}');
+        _broadcaster.Broadcast(new WatchSseEvent(sb.ToString()));
+    }
+
+    // ==================== Excel Row-Level Diff ====================
+
+    private void SendSseExcelPatch(List<(string Op, string Row, string? Html)> patches, int version, int baseVersion, string? scrollTo)
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"action\":\"excel-patch\"");
+        sb.Append(",\"version\":").Append(version);
+        sb.Append(",\"baseVersion\":").Append(baseVersion);
+        sb.Append(",\"patches\":[");
+        for (int i = 0; i < patches.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"op\":\"").Append(patches[i].Op).Append('"');
+            sb.Append(",\"row\":\"").Append(patches[i].Row).Append('"');
+            if (patches[i].Html != null)
+            {
+                sb.Append(",\"html\":");
+                AppendJsonString(sb, patches[i].Html!);
+            }
+            sb.Append('}');
+        }
+        sb.Append(']');
+        if (scrollTo != null)
+        {
+            sb.Append(",\"scrollTo\":");
+            AppendJsonString(sb, scrollTo);
+        }
+        sb.Append('}');
+        _broadcaster.Broadcast(new WatchSseEvent(sb.ToString()));
+    }
+
+    private void SendSseEvent(string action, int slideNum, string? html, string? scrollTo = null, int version = 0)
+    {
+        // Build JSON manually to avoid dependency
+        var sb = new StringBuilder();
+        sb.Append("{\"action\":\"").Append(action).Append('"');
+        sb.Append(",\"slide\":").Append(slideNum);
+        sb.Append(",\"version\":").Append(version);
+        if (html != null)
+        {
+            sb.Append(",\"html\":");
+            AppendJsonString(sb, html);
+        }
+        if (scrollTo != null)
+        {
+            sb.Append(",\"scrollTo\":");
+            AppendJsonString(sb, scrollTo);
+        }
+        sb.Append('}');
+
+        _broadcaster.Broadcast(new WatchSseEvent(sb.ToString()));
+    }
+
+    internal static void AppendJsonString(StringBuilder sb, string value)
+    {
+        sb.Append('"');
+        foreach (var ch in value)
+        {
+            switch (ch)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (ch < 0x20)
+                        sb.Append($"\\u{(int)ch:X4}");
+                    else
+                        sb.Append(ch);
+                    break;
+            }
+        }
+        sb.Append('"');
+    }
 }

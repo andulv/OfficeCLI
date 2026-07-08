@@ -545,124 +545,20 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                     // CONSISTENCY(watch-isolation): no file open — only the
                     // already-cached HTML string is inspected.
                     var selector = message.Substring(7);
-                    var found = WatchEngine.SelectorExistsInHtml(_engine.CurrentHtml, selector);
-                    if (!found)
-                    {
-                        await writer.WriteLineAsync(("err:selector not found in current HTML: " + selector).AsMemory(), token);
-                    }
-                    else
-                    {
+                    if (_engine.TryScroll(selector))
                         await writer.WriteLineAsync("ok".AsMemory(), token);
-                        SendSseEvent("scroll", 0, null, selector, _engine.Version);
-                    }
+                    else
+                        await writer.WriteLineAsync(("err:selector not found in current HTML: " + selector).AsMemory(), token);
                 }
                 else if (message != null)
                 {
                     await writer.WriteLineAsync("ok".AsMemory(), token);
                     // Try to parse as WatchMessage JSON
-                    HandleWatchMessage(message);
+                    _engine.HandleWatchMessage(message);
                 }
             }
             catch (OperationCanceledException) { return; }
             catch { /* ignore pipe errors */ }
-    }
-
-    private void HandleWatchMessage(string json)
-    {
-        try
-        {
-            var msg = JsonSerializer.Deserialize(json, WatchMessageJsonContext.Default.WatchMessage);
-            if (msg == null) return;
-
-            // Scroll-only event: broadcast a CSS selector to all SSE clients
-            // without touching the cached HTML, version, or marks. Used by the
-            // `goto` command to navigate already-running watch viewers.
-            if (msg.Action == "scroll" && !string.IsNullOrEmpty(msg.ScrollTo))
-            {
-                SendSseEvent("scroll", 0, null, msg.ScrollTo, _engine.Version);
-                return;
-            }
-
-            var oldHtml = _engine.CurrentHtml;
-            var baseVersion = _engine.Version;
-
-            // Always update cached full HTML when provided (authoritative snapshot)
-            if (!string.IsNullOrEmpty(msg.FullHtml))
-            {
-                _engine.CurrentHtml = msg.FullHtml;
-            }
-
-            // Apply incremental patch when no full HTML was provided
-            if (string.IsNullOrEmpty(msg.FullHtml))
-            {
-                if (msg.Action == "replace" && msg.Slide > 0 && msg.Html != null)
-                    _engine.CurrentHtml = WatchEngine.PatchSlideInHtml(_engine.CurrentHtml, msg.Slide, msg.Html);
-                else if (msg.Action == "add" && msg.Html != null)
-                    _engine.CurrentHtml = WatchEngine.AppendSlideToHtml(_engine.CurrentHtml, msg.Html);
-                else if (msg.Action == "remove" && msg.Slide > 0)
-                    _engine.CurrentHtml = WatchEngine.RemoveSlideFromHtml(_engine.CurrentHtml, msg.Slide);
-            }
-
-            _engine.BumpVersion();
-
-            // Reconcile all marks against the freshly updated snapshot. Flips
-            // stale flags and refreshes matched_text when the underlying text
-            // changed. CONSISTENCY(path-stability): same naive resolve used on
-            // initial add, no fingerprint.
-            _engine.ReconcileAllMarks();
-
-            // Word: try block-level diff instead of full refresh
-            if (msg.Action == "full" && !string.IsNullOrEmpty(msg.FullHtml)
-                && !string.IsNullOrEmpty(oldHtml) && oldHtml.Contains("data-block=\"1\""))
-            {
-                var patches = WatchEngine.ComputeWordPatches(oldHtml, msg.FullHtml);
-                // Check if CSS styles changed
-                var oldStyle = WatchEngine.ExtractStyleBlock(oldHtml);
-                var newStyle = WatchEngine.ExtractStyleBlock(msg.FullHtml);
-                var styleChanged = oldStyle != newStyle;
-
-                if (patches != null || styleChanged)
-                {
-                    patches ??= new List<WordPatch>();
-                    if (styleChanged)
-                        patches.Insert(0, new WordPatch { Op = "style", Block = 0, Html = newStyle });
-                    SendSseWordPatch(patches, _engine.Version, baseVersion, msg.ScrollTo);
-                    return;
-                }
-            }
-
-            // Excel: try row-level diff instead of full refresh.
-            // Skip when table chrome (colgroup/thead/table width) changed —
-            // row patches can't express those changes, so fall through to
-            // full-action so the browser rebuilds the whole body.
-            if (msg.Action == "full" && !string.IsNullOrEmpty(msg.FullHtml)
-                && !string.IsNullOrEmpty(oldHtml) && oldHtml.Contains("data-row=\"")
-                && WatchEngine.TableChromeSignature(oldHtml) == WatchEngine.TableChromeSignature(msg.FullHtml))
-            {
-                var excelPatches = WatchEngine.ComputeExcelPatches(oldHtml, msg.FullHtml);
-                var oldStyle = WatchEngine.ExtractStyleBlock(oldHtml);
-                var newStyle = WatchEngine.ExtractStyleBlock(msg.FullHtml);
-                var styleChanged = oldStyle != newStyle;
-
-                if (excelPatches != null || styleChanged)
-                {
-                    excelPatches ??= new List<(string Op, string Row, string? Html)>();
-                    if (styleChanged)
-                        excelPatches.Insert(0, ("style", "", newStyle));
-                    SendSseExcelPatch(excelPatches, _engine.Version, baseVersion, msg.ScrollTo);
-                    return;
-                }
-            }
-
-            // Forward to SSE clients (full or PPT incremental)
-            SendSseEvent(msg.Action, msg.Slide, msg.Html, msg.ScrollTo, _engine.Version);
-        }
-        catch
-        {
-            // Legacy format or parse error — treat as full refresh signal
-            _engine.BumpVersion();
-            SendSseEvent("full", 0, null, null, _engine.Version);
-        }
     }
 
     // ==================== Marks (state + ops live in WatchEngine) ====================
@@ -678,88 +574,6 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
     /// Delegates to the engine.
     /// </summary>
     internal void ApplyFullHtmlForTests(string html) => _engine.ApplyFullHtmlForTests(html);
-
-    private void SendSseWordPatch(List<WordPatch> patches, int version, int baseVersion, string? scrollTo)
-    {
-        var sb = new StringBuilder();
-        sb.Append("{\"action\":\"word-patch\"");
-        sb.Append(",\"version\":").Append(version);
-        sb.Append(",\"baseVersion\":").Append(baseVersion);
-        sb.Append(",\"patches\":[");
-        for (int i = 0; i < patches.Count; i++)
-        {
-            if (i > 0) sb.Append(',');
-            sb.Append("{\"op\":\"").Append(patches[i].Op).Append('"');
-            sb.Append(",\"block\":").Append(patches[i].Block);
-            if (patches[i].Html != null)
-            {
-                sb.Append(",\"html\":");
-                AppendJsonString(sb, patches[i].Html!);
-            }
-            sb.Append('}');
-        }
-        sb.Append(']');
-        if (scrollTo != null)
-        {
-            sb.Append(",\"scrollTo\":");
-            AppendJsonString(sb, scrollTo);
-        }
-        sb.Append('}');
-        BroadcastSse(sb.ToString());
-    }
-
-    // ==================== Excel Row-Level Diff ====================
-
-    private void SendSseExcelPatch(List<(string Op, string Row, string? Html)> patches, int version, int baseVersion, string? scrollTo)
-    {
-        var sb = new StringBuilder();
-        sb.Append("{\"action\":\"excel-patch\"");
-        sb.Append(",\"version\":").Append(version);
-        sb.Append(",\"baseVersion\":").Append(baseVersion);
-        sb.Append(",\"patches\":[");
-        for (int i = 0; i < patches.Count; i++)
-        {
-            if (i > 0) sb.Append(',');
-            sb.Append("{\"op\":\"").Append(patches[i].Op).Append('"');
-            sb.Append(",\"row\":\"").Append(patches[i].Row).Append('"');
-            if (patches[i].Html != null)
-            {
-                sb.Append(",\"html\":");
-                AppendJsonString(sb, patches[i].Html!);
-            }
-            sb.Append('}');
-        }
-        sb.Append(']');
-        if (scrollTo != null)
-        {
-            sb.Append(",\"scrollTo\":");
-            AppendJsonString(sb, scrollTo);
-        }
-        sb.Append('}');
-        BroadcastSse(sb.ToString());
-    }
-
-    private void SendSseEvent(string action, int slideNum, string? html, string? scrollTo = null, int version = 0)
-    {
-        // Build JSON manually to avoid dependency
-        var sb = new StringBuilder();
-        sb.Append("{\"action\":\"").Append(action).Append('"');
-        sb.Append(",\"slide\":").Append(slideNum);
-        sb.Append(",\"version\":").Append(version);
-        if (html != null)
-        {
-            sb.Append(",\"html\":");
-            AppendJsonString(sb, html);
-        }
-        if (scrollTo != null)
-        {
-            sb.Append(",\"scrollTo\":");
-            AppendJsonString(sb, scrollTo);
-        }
-        sb.Append('}');
-
-        BroadcastSse(sb.ToString());
-    }
 
     private void BroadcastSse(string sseJson)
         => Broadcast(new WatchSseEvent(sseJson));
@@ -788,29 +602,6 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             }
             foreach (var d in dead) _sseClients.Remove(d);
         }
-    }
-
-    private static void AppendJsonString(StringBuilder sb, string value)
-    {
-        sb.Append('"');
-        foreach (var ch in value)
-        {
-            switch (ch)
-            {
-                case '"': sb.Append("\\\""); break;
-                case '\\': sb.Append("\\\\"); break;
-                case '\n': sb.Append("\\n"); break;
-                case '\r': sb.Append("\\r"); break;
-                case '\t': sb.Append("\\t"); break;
-                default:
-                    if (ch < 0x20)
-                        sb.Append($"\\u{(int)ch:X4}");
-                    else
-                        sb.Append(ch);
-                    break;
-            }
-        }
-        sb.Append('"');
     }
 
     private async Task HandleClientAsync(TcpClient client, CancellationToken token)
@@ -1514,7 +1305,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
         for (int i = 0; i < paths.Count; i++)
         {
             if (i > 0) sb.Append(',');
-            AppendJsonString(sb, paths[i]);
+            WatchEngine.AppendJsonString(sb, paths[i]);
         }
         sb.Append("]}");
         BroadcastSse(sb.ToString());
@@ -1543,7 +1334,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             for (int i = 0; i < snapshot.Length; i++)
             {
                 if (i > 0) sb.Append(',');
-                AppendJsonString(sb, snapshot[i]);
+                WatchEngine.AppendJsonString(sb, snapshot[i]);
             }
             sb.Append("]}");
             var initEvt = Encoding.UTF8.GetBytes($"event: update\ndata: {sb}\n\n");
