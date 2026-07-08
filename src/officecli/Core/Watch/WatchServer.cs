@@ -44,24 +44,10 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
     private Task? _shutdownTask;
 
     // Host-agnostic watch state lives in WatchEngine (owns no sockets, never
-    // opens the document). Selection is held there; the cached HTML/version,
-    // marks, and message dispatch move there in the following steps.
-    private readonly WatchEngine _engine = new();
-
-    // Current marks — advisory annotations attached to document paths. Live in
-    // memory only. Server never opens the document and never inspects DOM —
-    // marks are pure metadata; the browser computes match positions client-side.
-    //
-    // CONSISTENCY(path-stability): element-deletion / position-drift handling deliberately matches
-    // selection — naive positional addressing, no fingerprint, no drift detection. `stale` is only
-    // set when the client reports a path-resolution failure or a `find` miss.
-    // See CLAUDE.md "Design Principles" + "Watch Server Rules".
-    // To migrate to stable-ID paths, grep "CONSISTENCY(path-stability)" and update every deferred
-    // site (selection / mark / any future path consumer) project-wide — never patch mark alone.
-    private readonly List<WatchMark> _currentMarks = new();
-    private readonly object _marksLock = new();
-    private int _marksVersion = 0;
-    private int _nextMarkId = 1;
+    // opens the document): selection, the cached HTML/version, and marks. The
+    // engine is constructed in the ctor because it needs `this` as its
+    // IWatchBroadcaster sink for mark-update events.
+    private readonly WatchEngine _engine;
 
     private const string WaitingHtml = """
         <html><head><meta charset="utf-8"><title>Watching...</title>
@@ -118,6 +104,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
         _port = port;
         _idleTimeout = idleTimeout ?? ResolveIdleTimeout();
         _tcpListener = new TcpListener(IPAddress.Loopback, _port);
+        _engine = new WatchEngine(this);
         if (!string.IsNullOrEmpty(initialHtml))
             _engine.CurrentHtml = initialHtml;
     }
@@ -529,13 +516,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                     // Return {"version":N,"marks":[...]} so callers can do CAS-style
                     // detection. Empty marks → []. Never null.
                     // Uses Relaxed options so CJK content emits literal chars.
-                    WatchMark[] snapshot;
-                    int version;
-                    lock (_marksLock)
-                    {
-                        snapshot = _currentMarks.ToArray();
-                        version = _marksVersion;
-                    }
+                    var (snapshot, version) = _engine.GetMarksAndVersion();
                     var resp = new MarksResponse { Version = version, Marks = snapshot };
                     var payload = JsonSerializer.Serialize(resp, WatchMarkJsonOptions.MarksResponseInfo);
                     await writer.WriteLineAsync(payload.AsMemory(), token);
@@ -544,14 +525,14 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                 {
                     // "mark <json>" — add a mark, return assigned id
                     var payload = message.Substring(5);
-                    var resp = HandleMarkAdd(payload);
+                    var resp = _engine.HandleMarkAdd(payload);
                     await writer.WriteLineAsync(resp.AsMemory(), token);
                 }
                 else if (message != null && message.StartsWith("unmark ", StringComparison.Ordinal))
                 {
                     // "unmark <json>" — remove marks by path or all
                     var payload = message.Substring(7);
-                    var resp = HandleMarkRemove(payload);
+                    var resp = _engine.HandleMarkRemove(payload);
                     await writer.WriteLineAsync(resp.AsMemory(), token);
                 }
                 else if (message != null && message.StartsWith("scroll ", StringComparison.Ordinal))
@@ -628,7 +609,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             // stale flags and refreshes matched_text when the underlying text
             // changed. CONSISTENCY(path-stability): same naive resolve used on
             // initial add, no fingerprint.
-            ReconcileAllMarks();
+            _engine.ReconcileAllMarks();
 
             // Word: try block-level diff instead of full refresh
             if (msg.Action == "full" && !string.IsNullOrEmpty(msg.FullHtml)
@@ -684,196 +665,19 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
         }
     }
 
-    // ==================== Marks ====================
-
-    /// <summary>
-    /// Add a new mark. Normalizes find: if regex flag (truthy via the find
-    /// payload's "regex" field would be parsed by the CLI side; the server
-    /// receives the canonical form already wrapped as r"..." or literal).
-    /// However we ALSO accept the bare-find form here so that callers that
-    /// don't pre-wrap still get correct behaviour. The CLI passes either
-    /// the literal or a pre-wrapped r"..." string.
-    /// </summary>
-    internal string HandleMarkAdd(string json)
-    {
-        try
-        {
-            var req = JsonSerializer.Deserialize(json, WatchMarkJsonContext.Default.MarkRequest);
-            if (req == null)
-                return "{\"error\":\"invalid request\"}";
-
-            // BUG-FUZZER-003/004: path hardening.
-            //   1. Normalize: Trim() strips ASCII + Unicode whitespace from edges.
-            //   2. Reject whitespace-only paths (IsNullOrWhiteSpace catches NBSP,
-            //      U+3000 ideographic space, etc.).
-            //   3. Require leading '/': zero-width space U+200B and BOM U+FEFF
-            //      are not .NET whitespace but are never valid data-path prefixes,
-            //      so a StartsWith('/') check also filters them out.
-            //   4. Store the trimmed form so later `unmark --path /body/p[1]`
-            //      matches what the user typed, not `" /body/p[1] "` with padding.
-            // BUG-BT-R303: error messages must be actionable for AI agents — say
-            // what the accepted format is, not just "invalid".
-            var trimmedPath = req.Path?.Trim() ?? "";
-            if (string.IsNullOrWhiteSpace(trimmedPath) || !trimmedPath.StartsWith("/"))
-                return "{\"error\":\"invalid path: must start with '/' (e.g. /body/p[1] for Word, /slide[1]/shape[@id=N] for PowerPoint)\"}";
-
-            // BUG-TESTER-002: validate color server-side. The browser sets
-            // el.style.backgroundColor = mark.color verbatim, so an unsanitized
-            // value injects CSS into every connected SSE client. Server is the
-            // single trust boundary for both human-typed CLI and machine agents.
-            // CONSISTENCY(mark-color-validation): one validator, both Add and
-            // any future Set/update path must call IsValidMarkColor.
-            //
-            // BUG-FUZZER-001: Trim() before validation AND before storage, so
-            // `"red\n"` doesn't end up stored as `"red\n"` after being accepted
-            // (the validator trims for matching but used to leave the raw form
-            // in the stored mark, causing a validator-vs-storage inconsistency).
-            var trimmedColor = req.Color?.Trim();
-            // BUG-A-R2-M01: accept bare hex (FF00FF, F0F) for consistency with the
-            // rest of officecli's color parsers. The validator below requires the
-            // canonical #-prefixed form, so promote 3/6/8-digit bare hex to that
-            // form before validation. Anything else (named colors, rgb(...),
-            // already-hashed hex) passes through unchanged.
-            trimmedColor = WatchEngine.NormalizeMarkColorInput(trimmedColor);
-            // BUG-BT-R303: actionable error message — list the accepted formats
-            // so AI agents can self-correct without reading the source.
-            if (!string.IsNullOrEmpty(trimmedColor) && !WatchEngine.IsValidMarkColor(trimmedColor))
-                return "{\"error\":\"invalid color: accepted forms are #RGB / #RRGGBB / #RRGGBBAA hex (with or without # prefix), rgb(r,g,b), rgba(r,g,b,a), or named colors (red, blue, yellow, orange, green, purple, ...)\"}";
-
-            var mark = new WatchMark
-            {
-                Path = trimmedPath,
-                Find = req.Find,
-                Color = string.IsNullOrEmpty(trimmedColor) ? "#ffeb3b" : trimmedColor,
-                Note = req.Note,
-                Tofix = req.Tofix,
-                MatchedText = Array.Empty<string>(),
-                Stale = false,
-                CreatedAt = DateTime.UtcNow,
-            };
-
-            string assignedId;
-            WatchMark[] snapshot;
-            string htmlSnapshot;
-            lock (_marksLock)
-            {
-                assignedId = _nextMarkId.ToString();
-                _nextMarkId++;
-                mark.Id = assignedId;
-                // Snapshot _currentHtml under the lock so a concurrent
-                // full-refresh can't race the resolve step.
-                htmlSnapshot = _engine.CurrentHtml;
-                var resolved = WatchEngine.ResolveMark(mark, htmlSnapshot);
-                _currentMarks.Add(resolved);
-                _marksVersion++;
-                snapshot = _currentMarks.ToArray();
-            }
-            _lastActivityTime = DateTime.UtcNow;
-            BroadcastMarkUpdate(snapshot);
-
-            return JsonSerializer.Serialize(
-                new MarkResponse { Id = assignedId },
-                WatchMarkJsonContext.Default.MarkResponse);
-        }
-        catch
-        {
-            return "{\"error\":\"parse failed\"}";
-        }
-    }
-
-    /// <summary>
-    /// Remove marks. UnmarkRequest must have either Path set, or All=true,
-    /// not both. Returns the number of marks removed.
-    /// </summary>
-    internal string HandleMarkRemove(string json)
-    {
-        try
-        {
-            var req = JsonSerializer.Deserialize(json, WatchMarkJsonContext.Default.UnmarkRequest);
-            if (req == null) return "{\"removed\":0}";
-
-            int removed = 0;
-            WatchMark[] snapshot;
-            lock (_marksLock)
-            {
-                if (req.All)
-                {
-                    removed = _currentMarks.Count;
-                    _currentMarks.Clear();
-                }
-                else
-                {
-                    // BUG-FUZZER-003/004: Trim and require leading '/' for symmetry
-                    // with HandleMarkAdd. Without Trim a `unmark --path " /p[1] "`
-                    // would silently miss a mark added as `/p[1]` and vice versa.
-                    var unmarkPath = req.Path?.Trim() ?? "";
-                    if (!string.IsNullOrWhiteSpace(unmarkPath) && unmarkPath.StartsWith("/"))
-                    {
-                        removed = _currentMarks.RemoveAll(m =>
-                            string.Equals(m.Path, unmarkPath, StringComparison.Ordinal));
-                    }
-                }
-                if (removed > 0) _marksVersion++;
-                snapshot = _currentMarks.ToArray();
-            }
-            _lastActivityTime = DateTime.UtcNow;
-            if (removed > 0) BroadcastMarkUpdate(snapshot);
-
-            return JsonSerializer.Serialize(
-                new UnmarkResponse { Removed = removed },
-                WatchMarkJsonContext.Default.UnmarkResponse);
-        }
-        catch
-        {
-            return "{\"removed\":0}";
-        }
-    }
+    // ==================== Marks (state + ops live in WatchEngine) ====================
 
     /// <summary>Test-only accessor for current marks snapshot.</summary>
-    internal WatchMark[] GetMarksSnapshot()
-    {
-        lock (_marksLock) { return _currentMarks.ToArray(); }
-    }
+    internal WatchMark[] GetMarksSnapshot() => _engine.GetMarksSnapshot();
 
     /// <summary>Test-only accessor for the current marks version.</summary>
-    internal int GetMarksVersion()
-    {
-        lock (_marksLock) { return _marksVersion; }
-    }
+    internal int GetMarksVersion() => _engine.GetMarksVersion();
 
     /// <summary>
-    /// Test-only hook: install a full HTML snapshot synchronously and trigger
-    /// mark reconciliation. Used by WatchMarkTests to verify ResolveMark without
-    /// racing the pipe's "ack first, process later" ordering.
+    /// Test-only hook: install a full HTML snapshot and trigger reconciliation.
+    /// Delegates to the engine.
     /// </summary>
-    internal void ApplyFullHtmlForTests(string html)
-    {
-        _engine.CurrentHtml = html;
-        _engine.BumpVersion();
-        ReconcileAllMarks();
-    }
-
-    /// <summary>
-    /// Re-run ResolveMark on every mark in the current list. Called when the
-    /// cached HTML snapshot changes (document reload / full refresh). Updates
-    /// each mark's MatchedText and Stale in place and bumps _marksVersion so
-    /// clients that missed the change can detect it.
-    /// </summary>
-    private void ReconcileAllMarks()
-    {
-        WatchMark[] snapshot;
-        lock (_marksLock)
-        {
-            if (_currentMarks.Count == 0) return;
-            for (int i = 0; i < _currentMarks.Count; i++)
-            {
-                _currentMarks[i] = WatchEngine.ResolveMark(_currentMarks[i], _engine.CurrentHtml);
-            }
-            _marksVersion++;
-            snapshot = _currentMarks.ToArray();
-        }
-        BroadcastMarkUpdate(snapshot);
-    }
+    internal void ApplyFullHtmlForTests(string html) => _engine.ApplyFullHtmlForTests(html);
 
     /// <summary>Replace a single slide fragment in the full HTML by data-slide number.</summary>
     private static string PatchSlideInHtml(string html, int slideNum, string newFragment)
@@ -2135,28 +1939,6 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
         BroadcastSse(sb.ToString());
     }
 
-    /// <summary>
-    /// Wrap a WatchMark[] snapshot in a "mark-update" SSE envelope. Called
-    /// after every mark add/remove, and during initial SSE client handshake.
-    /// The version field is a monotonically-increasing counter that clients
-    /// can use for CAS-style update detection.
-    ///
-    /// Uses the Relaxed encoder so CJK find/note/tofix bytes flow through
-    /// as literal characters instead of \uXXXX escapes.
-    /// </summary>
-    private static string BuildMarkUpdateJson(WatchMark[] marks, int version)
-    {
-        var marksJson = JsonSerializer.Serialize(marks, WatchMarkJsonOptions.WatchMarkArrayInfo);
-        return $"{{\"action\":\"mark-update\",\"version\":{version},\"marks\":{marksJson}}}";
-    }
-
-    private void BroadcastMarkUpdate(WatchMark[] marks)
-    {
-        int version;
-        lock (_marksLock) { version = _marksVersion; }
-        BroadcastSse(BuildMarkUpdateJson(marks, version));
-    }
-
     private async Task HandleSseAsync(NetworkStream stream, CancellationToken token)
     {
         var header = Encoding.UTF8.GetBytes(
@@ -2189,14 +1971,8 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
             // Also dump the current marks snapshot so a freshly connected browser
             // immediately sees any marks the CLI has already added. Mirrors the
             // selection init dump pattern above.
-            WatchMark[] markSnapshot;
-            int markVersion;
-            lock (_marksLock)
-            {
-                markSnapshot = _currentMarks.ToArray();
-                markVersion = _marksVersion;
-            }
-            var markJson = BuildMarkUpdateJson(markSnapshot, markVersion);
+            var (markSnapshot, markVersion) = _engine.GetMarksAndVersion();
+            var markJson = WatchEngine.BuildMarkUpdateJson(markSnapshot, markVersion);
             var markInitEvt = Encoding.UTF8.GetBytes($"event: update\ndata: {markJson}\n\n");
             await stream.WriteAsync(markInitEvt, token);
         }
