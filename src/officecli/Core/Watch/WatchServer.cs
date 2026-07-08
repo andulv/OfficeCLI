@@ -45,16 +45,10 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
     private readonly object _shutdownLock = new();
     private Task? _shutdownTask;
 
-    // Current selection — paths of elements selected in any connected browser.
-    // Single shared list (last-write-wins): all browsers viewing the same file see
-    // the same selection. CLI reads this via the named pipe "get-selection" command.
-    //
-    // CONSISTENCY(path-stability): selection and mark share the same naive positional addressing
-    // contract — no fingerprinting, no drift detection. To upgrade to stable IDs,
-    // grep "CONSISTENCY(path-stability)" and update every deferred site project-wide in one pass.
-    // See CLAUDE.md "Design Principles".
-    private List<string> _currentSelection = new();
-    private readonly object _selectionLock = new();
+    // Host-agnostic watch state lives in WatchEngine (owns no sockets, never
+    // opens the document). Selection is held there; the cached HTML/version,
+    // marks, and message dispatch move there in the following steps.
+    private readonly WatchEngine _engine = new();
 
     // Current marks — advisory annotations attached to document paths. Live in
     // memory only. Server never opens the document and never inspects DOM —
@@ -528,8 +522,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                 {
                     // Return current selection as a JSON array of paths.
                     // Empty selection → "[]". Never null.
-                    string[] snapshot;
-                    lock (_selectionLock) { snapshot = _currentSelection.ToArray(); }
+                    string[] snapshot = _engine.GetSelectionSnapshot();
                     var json = JsonSerializer.Serialize(snapshot, WatchSelectionJsonOptions.StringArrayInfo);
                     await writer.WriteLineAsync(json.AsMemory(), token);
                 }
@@ -2154,7 +2147,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
                 newSelection.Add(trimmed);
             }
 
-            lock (_selectionLock) { _currentSelection = newSelection; }
+            _engine.SetSelection(newSelection);
             _lastActivityTime = DateTime.UtcNow;
 
             // Broadcast to all SSE clients so other browsers can highlight in sync
@@ -2565,8 +2558,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
         // — interleaved bytes would corrupt SSE framing.
         try
         {
-            string[] snapshot;
-            lock (_selectionLock) { snapshot = _currentSelection.ToArray(); }
+            string[] snapshot = _engine.GetSelectionSnapshot();
             var sb = new StringBuilder();
             sb.Append("{\"action\":\"selection-update\",\"paths\":[");
             for (int i = 0; i < snapshot.Length; i++)
