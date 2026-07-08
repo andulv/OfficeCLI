@@ -317,7 +317,7 @@ internal static class WatchNotifier
 /// <summary>
 /// Message sent from command processes to the watch server via named pipe.
 /// </summary>
-internal class WatchMessage
+public class WatchMessage
 {
     /// <summary>"replace", "add", "remove", or "full"</summary>
     public string Action { get; set; } = "full";
@@ -423,7 +423,7 @@ internal readonly struct ScrollResult
 }
 
 /// <summary>A single block-level change for Word incremental updates.</summary>
-internal class WordPatch
+public class WordPatch
 {
     /// <summary>"replace", "add", or "remove"</summary>
     public string Op { get; set; } = "";

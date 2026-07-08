@@ -26,7 +26,7 @@ namespace OfficeCli.Core;
 /// a mark goes stale (find no longer hits), tofix is the human hint for
 /// "what should be done about it".
 /// </summary>
-internal class WatchMark
+public class WatchMark
 {
     [JsonPropertyName("id")]
     public string Id { get; set; } = "";
