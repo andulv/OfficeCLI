@@ -103,7 +103,7 @@ internal class WatchServer : IDisposable, IWatchBroadcaster
         _pipeName = GetWatchPipeName(_filePath);
         _port = port;
         _idleTimeout = idleTimeout ?? ResolveIdleTimeout();
-        _tcpListener = new TcpListener(IPAddress.Loopback, _port);
+        _tcpListener = new TcpListener(IPAddress.Any, _port);
         _engine = new WatchEngine(this);
         if (!string.IsNullOrEmpty(initialHtml))
             _engine.CurrentHtml = initialHtml;
