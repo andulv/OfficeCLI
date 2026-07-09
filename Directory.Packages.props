@@ -1,0 +1,10 @@
+<Project>
+  <!-- Shadow any host repository's Central Package Management: officecli pins its
+       own NuGet versions on each PackageReference. Without this file, NuGet walks
+       up and finds a parent Directory.Packages.props (e.g. catherder-dev's),
+       re-enabling CPM and rejecting officecli's versioned references (NU1008).
+       Keeping the flag off here lets officecli build both standalone and nested. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

@@ -5,17 +5,29 @@
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>OfficeCli</RootNamespace>
     <AssemblyName>officecli</AssemblyName>
-    <Version>1.0.132</Version>
+    <Version>1.0.667</Version>
     <Authors>goworm</Authors>
     <Company>OfficeCLI</Company>
     <Copyright>Copyright © 2026 OfficeCLI (https://OfficeCLI.AI)</Copyright>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
-    <PublishTrimmed>true</PublishTrimmed>
     <CETCompat>false</CETCompat>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!--
+    Standalone installer packaging (single-file, self-contained, trimmed) is an
+    explicit opt-in so officecli stays a plain framework-dependent output that
+    any app can reference as a ProjectReference (a self-contained exe cannot be
+    referenced by a framework-dependent one — NETSDK1151, and that check ignores
+    ProjectReference property overrides, so it must be gated here).
+    Build the distributable with:
+      dotnet publish -c Release -r <rid> -p:PackAsStandalone=true
+  -->
+  <PropertyGroup Condition="'$(PackAsStandalone)' == 'true'">
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <PublishTrimmed>true</PublishTrimmed>
   </PropertyGroup>
 
   <ItemGroup>

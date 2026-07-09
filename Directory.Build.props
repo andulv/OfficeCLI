@@ -1,0 +1,9 @@
+<Project>
+  <!-- officecli pins its own NuGet versions on each PackageReference (see the
+       .csproj files). Opt out of any host repository's Central Package
+       Management so officecli builds correctly both standalone and when nested
+       as a git submodule under a CPM-enabled repo (e.g. catherder-dev). -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

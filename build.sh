@@ -57,7 +57,7 @@ build_config() {
         TMPDIR=$(mktemp -d)
 
         echo "[$CONFIG] Building $RID -> $NAME"
-        dotnet publish "$PROJECT" -c "$CONFIG" -r "$RID" -o "$TMPDIR" --nologo -v quiet
+        dotnet publish "$PROJECT" -c "$CONFIG" -r "$RID" -o "$TMPDIR" --nologo -v quiet -p:PackAsStandalone=true
 
         # Atomic replace: stage as .new alongside the target, sign there, then rename.
         # Overwriting the binary in place would trash the text segment of any
