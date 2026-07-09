@@ -572,5 +572,5 @@ public partial class PowerPointHandler
     // OOXML→HTML rendering glue; the built-in PowerPoint table-style
     // catalogue (11 family templates × 7 accent variants = 74 GUIDs) lives
     // under Core/TableStyles/ with one file per family. See
-    // Core/TableStyles/CLAUDE.md context in Handlers/Pptx/CLAUDE.md.
+    // the Core/TableStyles notes and the PPTX handler conventions.
 }

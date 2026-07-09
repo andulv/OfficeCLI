@@ -1678,7 +1678,7 @@ internal static partial class ChartHelper
         // CONSISTENCY(pt-suffix): accept the unit-qualified form (`18pt`,
         // `10.5pt`) on input — without this, `int.TryParse("18pt")` failed
         // and silently defaulted to 1000 (10pt), so `axisFont=18pt:…` ignored
-        // the size. Mirrors the root CLAUDE.md "Font size input is lenient:
+        // the size. Mirrors the project conventions "Font size input is lenient:
         // accepts `14`, `14pt`, `10.5pt`" rule.
         var sizeStr = parts.Length > 0
             ? (parts[0].EndsWith("pt", System.StringComparison.OrdinalIgnoreCase) ? parts[0][..^2] : parts[0])
@@ -2170,9 +2170,14 @@ internal static partial class ChartHelper
         // reference (e.g. "Sheet1!A1"), emit <c:tx><c:strRef> so Excel resolves
         // the cell on open. Same fix family as R17-B1 (series name strRef).
         // Applies to chart title and cat/val axis titles (R18-B1/B2).
-        if (IsCellReference(titleText))
+        // Accept the natural Excel spelling with a leading '=' (=Sheet1!A1);
+        // without the strip it fell through to the literal-text branch and
+        // the chart displayed the formula string verbatim.
+        var titleRef = titleText.TrimStart();
+        if (titleRef.StartsWith('=')) titleRef = titleRef[1..];
+        if (IsCellReference(titleRef))
         {
-            var formula = NormalizeCellReference(titleText);
+            var formula = NormalizeCellReference(titleRef);
             return new C.Title(
                 new C.ChartText(
                     new C.StringReference(new C.Formula(formula))

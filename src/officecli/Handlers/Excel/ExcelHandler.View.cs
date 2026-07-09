@@ -3,6 +3,7 @@
 
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
 using OfficeCli.Core;
@@ -12,8 +13,9 @@ namespace OfficeCli.Handlers;
 
 public partial class ExcelHandler
 {
-    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
+    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
     {
+        var clip = ParseViewRange(range);
         var sb = new StringBuilder();
         var sheets = GetWorksheets();
         int sheetIdx = 0;
@@ -23,6 +25,7 @@ public partial class ExcelHandler
         foreach (var (sheetName, worksheetPart) in sheets)
         {
             if (truncated) break;
+            if (clip != null && !string.Equals(sheetName, clip.Value.Sheet, StringComparison.OrdinalIgnoreCase)) continue;
             sb.AppendLine($"=== Sheet: {sheetName} ===");
             var sheetData = GetSheet(worksheetPart).GetFirstChild<SheetData>();
             if (sheetData == null) continue;
@@ -35,6 +38,12 @@ public partial class ExcelHandler
                 lineNum++;
                 if (startLine.HasValue && lineNum < startLine.Value) continue;
                 if (endLine.HasValue && lineNum > endLine.Value) break;
+                if (clip != null)
+                {
+                    var rowRefClip = (int)(row.RowIndex?.Value ?? (uint)lineNum);
+                    if (rowRefClip < clip.Value.R1) continue;
+                    if (rowRefClip > clip.Value.R2) break;
+                }
 
                 if (maxLines.HasValue && emitted >= maxLines.Value)
                 {
@@ -46,6 +55,12 @@ public partial class ExcelHandler
                 var cellElements = row.Elements<Cell>();
                 if (cols != null)
                     cellElements = cellElements.Where(c => cols.Contains(ParseCellReference(c.CellReference?.Value ?? "A1").Column));
+                if (clip != null)
+                    cellElements = cellElements.Where(c =>
+                    {
+                        var ci = ColumnNameToIndex(ParseCellReference(c.CellReference?.Value ?? "A1").Column);
+                        return ci >= clip.Value.C1 && ci <= clip.Value.C2;
+                    });
                 // Prefix each cell with its A1 address so a sparse row stays unambiguous
                 // (tab-position != column when gaps collapse).
                 // Agents parse per tab-token with ^([A-Z]+\d+)=(.*)$.
@@ -62,6 +77,43 @@ public partial class ExcelHandler
         }
 
         return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>
+    /// Parse a `view text --range` target ('Sheet1!A1:C10', '/Sheet1/A1:C10',
+    /// or a single cell 'Sheet1!B5') into an inclusive 1-based rectangle.
+    /// Corner order is normalized (C10:A1 works). The sheet must exist —
+    /// unknown names throw not_found listing the available sheets, mirroring
+    /// screenshot mode's range_target_not_found actionability.
+    /// </summary>
+    private (string Sheet, int R1, int C1, int R2, int C2)? ParseViewRange(string? range)
+    {
+        if (string.IsNullOrWhiteSpace(range)) return null;
+        var c = range.Trim();
+        // Sheet1!A1:C3 → /Sheet1/A1:C3 (same normalization as screenshot --range)
+        var bang = c.IndexOf('!');
+        if (bang > 0 && !c.StartsWith('/'))
+            c = "/" + c[..bang] + "/" + c[(bang + 1)..];
+        var m = Regex.Match(c, @"^/([^/]+)/([A-Za-z]{1,3}\d+)(?::([A-Za-z]{1,3}\d+))?$");
+        if (!m.Success)
+            throw new Core.CliException(
+                $"Invalid --range '{range}'. Expected 'Sheet1!A1:C10', '/Sheet1/A1:C10', or a single cell 'Sheet1!B5'.")
+            { Code = "invalid_value" };
+
+        var sheet = m.Groups[1].Value;
+        var names = GetWorksheets().Select(s => s.Item1).ToList();
+        var resolved = names.FirstOrDefault(n => string.Equals(n, sheet, StringComparison.OrdinalIgnoreCase));
+        if (resolved == null)
+            throw new Core.CliException(
+                $"--range sheet '{sheet}' not found. Available sheets: {string.Join(", ", names)}")
+            { Code = "not_found", ValidValues = names.ToArray() };
+
+        var (col1, row1) = ParseCellReference(m.Groups[2].Value);
+        var (col2, row2) = m.Groups[3].Success ? ParseCellReference(m.Groups[3].Value) : (col1, row1);
+        int c1 = ColumnNameToIndex(col1), c2 = ColumnNameToIndex(col2);
+        return (resolved,
+            Math.Min(row1, row2), Math.Min(c1, c2),
+            Math.Max(row1, row2), Math.Max(c1, c2));
     }
 
     public string ViewAsAnnotated(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
@@ -373,8 +425,9 @@ public partial class ExcelHandler
         };
     }
 
-    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
+    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
     {
+        var clip = ParseViewRange(range);
         var sheetsArray = new JsonArray();
         var worksheets = GetWorksheets();
         int emitted = 0;
@@ -383,6 +436,7 @@ public partial class ExcelHandler
         foreach (var (sheetName, worksheetPart) in worksheets)
         {
             if (truncated) break;
+            if (clip != null && !string.Equals(sheetName, clip.Value.Sheet, StringComparison.OrdinalIgnoreCase)) continue;
             var sheetData = GetSheet(worksheetPart).GetFirstChild<SheetData>();
             if (sheetData == null) continue;
 
@@ -393,11 +447,23 @@ public partial class ExcelHandler
                 lineNum++;
                 if (startLine.HasValue && lineNum < startLine.Value) continue;
                 if (endLine.HasValue && lineNum > endLine.Value) break;
+                if (clip != null)
+                {
+                    var rowRefClip = (int)(row.RowIndex?.Value ?? (uint)lineNum);
+                    if (rowRefClip < clip.Value.R1) continue;
+                    if (rowRefClip > clip.Value.R2) break;
+                }
                 if (maxLines.HasValue && emitted >= maxLines.Value) { truncated = true; break; }
 
                 var cellElements = row.Elements<Cell>();
                 if (cols != null)
                     cellElements = cellElements.Where(c => cols.Contains(ParseCellReference(c.CellReference?.Value ?? "A1").Column));
+                if (clip != null)
+                    cellElements = cellElements.Where(c =>
+                    {
+                        var ci = ColumnNameToIndex(ParseCellReference(c.CellReference?.Value ?? "A1").Column);
+                        return ci >= clip.Value.C1 && ci <= clip.Value.C2;
+                    });
 
                 var cellsObj = new JsonObject();
                 foreach (var cell in cellElements)

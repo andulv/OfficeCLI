@@ -220,11 +220,14 @@ public partial class ExcelHandler
                     if (fromMAnc == null || toMAnc == null) { oleUnsupportedSet.Add(key); break; }
                     int newFromCol = ColumnNameToIndex(anchorM.Groups[1].Value) - 1;
                     int newFromRow = int.Parse(anchorM.Groups[2].Value) - 1;
+                    ValidateAnchorCell(newFromCol, newFromRow, (value ?? "").Split(':')[0]);
                     int newToCol, newToRow;
                     if (anchorM.Groups[3].Success)
                     {
                         newToCol = ColumnNameToIndex(anchorM.Groups[3].Value) - 1;
                         newToRow = int.Parse(anchorM.Groups[4].Value) - 1;
+                        ValidateAnchorCell(newToCol, newToRow, (value ?? "").Split(':')[1]);
+                        NormalizeAnchorRect(ref newFromCol, ref newFromRow, ref newToCol, ref newToRow);
                     }
                     else
                     {
@@ -254,8 +257,56 @@ public partial class ExcelHandler
                     break;
             }
         }
+        // Keep the legacy VML shape geometry in lockstep with the OLE
+        // objectPr anchor whenever the rectangle moved. The two parts
+        // desynchronize otherwise (data part updated, presentation part
+        // stale) and older Excel renders the object at the old cell.
+        if (properties.ContainsKey("anchor") || properties.ContainsKey("width") || properties.ContainsKey("height"))
+        {
+            var objectPrVml = oleObjSet.GetFirstChild<EmbeddedObjectProperties>();
+            var objAnchorVml = objectPrVml?.GetFirstChild<ObjectAnchor>();
+            var fromMVml = objAnchorVml?.GetFirstChild<FromMarker>();
+            var toMVml = objAnchorVml?.GetFirstChild<ToMarker>();
+            if (fromMVml != null && toMVml != null && oleObjSet.ShapeId?.Value is uint oleSid)
+            {
+                int.TryParse(fromMVml.GetFirstChild<XDR.ColumnId>()?.Text ?? "0", out var vfc);
+                int.TryParse(fromMVml.GetFirstChild<XDR.RowId>()?.Text ?? "0", out var vfr);
+                int.TryParse(toMVml.GetFirstChild<XDR.ColumnId>()?.Text ?? "0", out var vtc);
+                int.TryParse(toMVml.GetFirstChild<XDR.RowId>()?.Text ?? "0", out var vtr);
+                UpdateOleVmlShapeAnchor(worksheet, oleSid, vfc, vfr, vtc, vtr);
+            }
+        }
         SaveWorksheet(worksheet);
         return oleUnsupportedSet;
+    }
+
+    /// <summary>
+    /// Re-anchor the legacy VML OLE shape (id <c>_x0000_s{shapeId}</c>) when the
+    /// companion objectPr anchor moves. Rewrites the shape's 8-coordinate
+    /// x:Anchor to match, mirroring EnsureExcelVmlShapeForOle on Add. Prefix-
+    /// agnostic (matches externally-authored VML with ns-prefixed elements).
+    /// </summary>
+    private void UpdateOleVmlShapeAnchor(WorksheetPart worksheet, uint shapeId,
+        int fromCol, int fromRow, int toCol, int toRow)
+    {
+        var vmlPart = worksheet.VmlDrawingParts.FirstOrDefault();
+        if (vmlPart == null) return;
+        System.Xml.Linq.XDocument doc;
+        try
+        {
+            using var reader = vmlPart.GetStream(System.IO.FileMode.Open, System.IO.FileAccess.Read);
+            doc = System.Xml.Linq.XDocument.Load(reader);
+        }
+        catch { return; }
+        var vNs = (System.Xml.Linq.XNamespace)"urn:schemas-microsoft-com:vml";
+        var xNs = (System.Xml.Linq.XNamespace)"urn:schemas-microsoft-com:office:excel";
+        var shape = doc.Descendants(vNs + "shape")
+            .FirstOrDefault(s => (string?)s.Attribute("id") == $"_x0000_s{shapeId}");
+        var anchor = shape?.Element(xNs + "ClientData")?.Element(xNs + "Anchor");
+        if (anchor == null) return;
+        anchor.Value = $"{fromCol}, 0, {fromRow}, 0, {toCol}, 0, {toRow}, 0";
+        using var writeStream = vmlPart.GetStream(System.IO.FileMode.Create, System.IO.FileAccess.Write);
+        doc.Save(writeStream);
     }
 
     private List<string> SetPictureByPath(Match m, WorksheetPart worksheet, Dictionary<string, string> properties)
@@ -266,8 +317,7 @@ public partial class ExcelHandler
         var wsDrawing = drawingsPart.WorksheetDrawing
             ?? throw new ArgumentException("Sheet has no drawings/pictures");
 
-        var picAnchors = wsDrawing.Elements<XDR.TwoCellAnchor>()
-            .Where(a => a.Descendants<XDR.Picture>().Any()).ToList();
+        var picAnchors = EnumeratePictureAnchors(wsDrawing).ToList();
         if (picIdx < 1 || picIdx > picAnchors.Count)
             throw new ArgumentException($"Picture index {picIdx} out of range (1..{picAnchors.Count})");
 
@@ -283,7 +333,9 @@ public partial class ExcelHandler
         var cropKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "crop.l", "crop.r", "crop.t", "crop.b",
-            "srcRect", "cropLeft", "cropRight", "cropTop", "cropBottom"
+            "srcRect", "cropLeft", "cropRight", "cropTop", "cropBottom",
+            // Bare composite `crop=l,t,r,b` (the Get emit form) — mirrors Add.
+            "crop"
         };
 
         foreach (var (key, value) in properties)

@@ -82,6 +82,34 @@ public partial class ExcelHandler
     /// evaluator's current result. See the file-level note for the L1/L2 policy and
     /// the on-disk invariant. Called from <see cref="FlushDirtyParts"/> at persist.
     /// </summary>
+    /// <summary>
+    /// Wall-clock budget for the save-time sweep. The sweep is best-effort cache
+    /// hygiene, but it runs synchronously inside every persist — on the resident
+    /// that is the pipe-serving path, so an unbounded sweep turns one expensive
+    /// workbook into "save hangs, SIGKILL loses the edit" (issue #187). When the
+    /// budget is exhausted the sweep stops where it is, sets fullCalcOnLoad so
+    /// any recalc-capable app refreshes the un-swept remainder on open, and the
+    /// persist proceeds. Correctness is unchanged: un-swept cells keep whatever
+    /// cache they had, exactly like cells the evaluator cannot assess.
+    /// </summary>
+    private static readonly TimeSpan FormulaSweepBudget = TimeSpan.FromSeconds(
+        double.TryParse(Environment.GetEnvironmentVariable("OFFICECLI_FORMULA_SWEEP_BUDGET_SECONDS"),
+            System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var s) && s > 0
+            ? s : 5);
+
+    /// <summary>
+    /// Host hooks for background flushes (the resident's idle autosave). A host
+    /// that saves while nobody is waiting may allow the sweep a LARGER budget via
+    /// <see cref="SweepBudgetOverride"/> — but must then supply
+    /// <see cref="SweepYieldRequested"/> so the sweep aborts (same safe path as
+    /// budget exhaustion: fullCalcOnLoad + bounded persist) the moment a command
+    /// arrives and starts waiting on the host's serialization lock. Foreground
+    /// save/close leave both null and get the default budget. Polled per cell —
+    /// keep the delegate to a volatile read.
+    /// </summary>
+    public Func<bool>? SweepYieldRequested { get; set; }
+    public TimeSpan? SweepBudgetOverride { get; set; }
+
     private void RefreshStaleFormulaCaches()
     {
         if (_doc.WorkbookPart == null) return;
@@ -90,16 +118,32 @@ public partial class ExcelHandler
         // landing after a formula that references it — so gate on either signal.
         if (!Modified && _dirtyWorksheets.Count == 0) return;
         var omittedAny = false;
-        foreach (var (_, wsPart) in GetWorksheets())
+        // One shared session across all sheets: memoized formula-cell results and
+        // per-sheet child evaluators survive sheet hops, so a formula referencing
+        // other formula cells costs one evaluation per cell per sweep instead of
+        // one per reference (the recursive-re-eval blowup behind issue #187).
+        var session = new Core.FormulaEvalSession();
+        var sweepClock = System.Diagnostics.Stopwatch.StartNew();
+        var budget = SweepBudgetOverride ?? FormulaSweepBudget;
+        var yieldRequested = SweepYieldRequested;
+        var budgetExhausted = false;
+        foreach (var (sheetName, wsPart) in GetWorksheets())
         {
+            if (budgetExhausted) break;
             var sheetData = GetSheet(wsPart).GetFirstChild<SheetData>();
             if (sheetData == null) continue;
             Core.FormulaEvaluator? evaluator = null;
             var sheetChanged = false;
             foreach (var row in sheetData.Elements<Row>())
             {
+                if (budgetExhausted) break;
                 foreach (var cell in row.Elements<Cell>())
                 {
+                    if (sweepClock.Elapsed > budget || yieldRequested?.Invoke() == true)
+                    {
+                        budgetExhausted = true;
+                        break;
+                    }
                     var formula = cell.CellFormula?.Text;
                     if (string.IsNullOrEmpty(formula)) continue;
                     // Array / dynamic-array spill cells own a multi-cell region;
@@ -120,8 +164,27 @@ public partial class ExcelHandler
                     // cache does not apply.
                     var hasCache = !string.IsNullOrEmpty(cell.CellValue?.Text);
 
-                    evaluator ??= new Core.FormulaEvaluator(sheetData, _doc.WorkbookPart);
-                    var report = evaluator.EvaluateForReport(formula);
+                    evaluator ??= new Core.FormulaEvaluator(sheetData, _doc.WorkbookPart, session, sheetName);
+                    // The session memo is keyed "Sheet!A1". A cell already reached
+                    // through another formula's reference has its result on hand —
+                    // reuse it instead of re-evaluating; symmetrically, feed this
+                    // cell's fresh result back so later references reuse ours.
+                    var memoKey = cell.CellReference?.Value is string cref ? $"{sheetName}!{cref}" : null;
+                    Core.EvalReport report;
+                    if (memoKey != null && session.CellMemo.TryGetValue(memoKey, out var memoized))
+                    {
+                        report = new Core.EvalReport(
+                            memoized.IsError ? Core.EvalReportStatus.Error : Core.EvalReportStatus.Evaluated,
+                            memoized);
+                    }
+                    else
+                    {
+                        var circularBefore = session.CircularHits;
+                        report = evaluator.EvaluateForReport(formula);
+                        if (memoKey != null && report.Result != null && !report.Result.IsLambda
+                            && circularBefore == session.CircularHits)
+                            session.CellMemo[memoKey] = report.Result;
+                    }
                     // Act only when we can confidently recompute the value.
                     if (report.Status != Core.EvalReportStatus.Evaluated) continue;
                     var computed = report.Result!.ToCellValueText();
@@ -151,8 +214,14 @@ public partial class ExcelHandler
                 }
             }
             if (sheetChanged) _dirtyWorksheets.Add(wsPart);
+            if (Environment.GetEnvironmentVariable("OFFICECLI_SWEEP_DEBUG") == "1")
+                Console.Error.WriteLine($"[sweep] {sheetName}: cumulative {sweepClock.ElapsedMilliseconds}ms");
         }
-        if (omittedAny) EnsureFullCalcOnLoad();
+        // Budget ran out mid-sweep: the un-swept remainder may still hold stale
+        // caches — make the opening application recalculate so no reader that
+        // recalcs sees a wrong number. (Cache-trusting headless readers see at
+        // worst what they saw before this feature existed.)
+        if (omittedAny || budgetExhausted) EnsureFullCalcOnLoad();
     }
 
     /// <summary>

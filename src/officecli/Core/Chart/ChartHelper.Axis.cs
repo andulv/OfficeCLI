@@ -286,7 +286,7 @@ internal static partial class ChartHelper
                     {
                         // Same-type only — see ChartHelper.Setter.cs case "crosses"
                         // for the mutual-remove bug rationale.
-                        crsAx2.RemoveAllChildren<C.Crosses>();
+                        // Validate BEFORE mutating (atomicity).
                         var crossVal = value.ToLowerInvariant() switch
                         {
                             "max" => C.CrossesValues.Maximum,
@@ -294,6 +294,7 @@ internal static partial class ChartHelper
                             "autozero" => C.CrossesValues.AutoZero,
                             _ => throw new ArgumentException($"Invalid 'crosses' value: '{value}'. Valid: autoZero, max, min.")
                         };
+                        crsAx2.RemoveAllChildren<C.Crosses>();
                         var newCrosses = new C.Crosses { Val = crossVal };
                         var crsAnchor = crsAx2.GetFirstChild<C.CrossesAt>() as OpenXmlElement
                             ?? crsAx2.GetFirstChild<C.CrossBetween>() as OpenXmlElement;
@@ -311,8 +312,9 @@ internal static partial class ChartHelper
                     if (normalizedRole == "value2" && targetAxis is OpenXmlCompositeElement crsAtAx2)
                     {
                         // Same-type only.
+                        var crossesAtVal2 = ParseHelpers.SafeParseDouble(value, "crossesAt");
                         crsAtAx2.RemoveAllChildren<C.CrossesAt>();
-                        var newCrossesAt = new C.CrossesAt { Val = ParseHelpers.SafeParseDouble(value, "crossesAt") };
+                        var newCrossesAt = new C.CrossesAt { Val = crossesAtVal2 };
                         var cbBefore2 = crsAtAx2.GetFirstChild<C.CrossBetween>();
                         if (cbBefore2 != null) crsAtAx2.InsertBefore(newCrossesAt, cbBefore2);
                         else crsAtAx2.AppendChild(newCrossesAt);
@@ -428,7 +430,9 @@ internal static partial class ChartHelper
                         var scaling = axLb.GetFirstChild<C.Scaling>();
                         if (scaling != null)
                         {
-                            scaling.RemoveAllChildren<C.LogBase>();
+                            // Resolve+validate BEFORE mutating so a bad numeric
+                            // base doesn't wipe the prior valid log scale.
+                            double? newLogBase;
                             if (value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
                                 value.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
                                 value.Equals("log", StringComparison.OrdinalIgnoreCase))
@@ -436,12 +440,16 @@ internal static partial class ChartHelper
                                 // "1" was historically truthy shorthand here too;
                                 // routed through SafeParseDouble + range-check below
                                 // so logBase=1 surfaces as ArgumentException.
-                                scaling.PrependChild(new C.LogBase { Val = 10d });
+                                newLogBase = 10d;
                             }
-                            else if (!value.Equals("none", StringComparison.OrdinalIgnoreCase) &&
-                                     !value.Equals("linear", StringComparison.OrdinalIgnoreCase) &&
-                                     !value.Equals("false", StringComparison.OrdinalIgnoreCase) &&
-                                     !value.Equals("no", StringComparison.OrdinalIgnoreCase))
+                            else if (value.Equals("none", StringComparison.OrdinalIgnoreCase) ||
+                                     value.Equals("linear", StringComparison.OrdinalIgnoreCase) ||
+                                     value.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+                                     value.Equals("no", StringComparison.OrdinalIgnoreCase))
+                            {
+                                newLogBase = null; // remove log scale (linear)
+                            }
+                            else
                             // "0" dropped as a falsy synonym for the same
                             // reason as the Setter.cs site — falls into the
                             // range check below and throws.
@@ -452,8 +460,11 @@ internal static partial class ChartHelper
                                 // ghost-rewrite the chart back to linear.
                                 if (logVal < 2.0 || logVal > 1000.0)
                                     throw new ArgumentException($"Invalid logBase '{value}': must be in the OOXML range [2, 1000] (ST_LogBase).");
-                                scaling.PrependChild(new C.LogBase { Val = logVal });
+                                newLogBase = logVal;
                             }
+                            scaling.RemoveAllChildren<C.LogBase>();
+                            if (newLogBase != null)
+                                scaling.PrependChild(new C.LogBase { Val = newLogBase.Value });
                         }
                     }
                     directlyHandled.Add(key);

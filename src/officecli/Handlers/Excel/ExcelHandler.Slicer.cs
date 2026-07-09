@@ -71,6 +71,16 @@ public partial class ExcelHandler
         var hostWorksheet = FindWorksheet(sheetName)
             ?? throw SheetNotFoundException(sheetName);
 
+        // Validate the anchor BEFORE creating any parts. The anchor was only
+        // checked deep inside AddSlicerDrawingAnchor (step 8), after the
+        // SlicerCachePart, SlicersPart, workbook extLst slicerCache entry and
+        // DefinedName sentinel were all created — so a bad anchor left those
+        // orphaned plus a schema-invalid worksheet (<x:drawing> after extLst)
+        // despite exit 1.
+        if (properties.TryGetValue("anchor", out var slAnchorPre) && !string.IsNullOrWhiteSpace(slAnchorPre)
+            && !TryParseCellRangeAnchor(slAnchorPre, out _, out _, out _, out _))
+            throw new ArgumentException($"Invalid anchor: '{slAnchorPre}'. Expected e.g. 'B2' or 'B2:F7'.");
+
         // 1. Resolve pivot table reference ---------------------------------
         // R26-3: also accept `tableName=` as a user-friendly alias — when the
         // value isn't a path, resolve it as a pivot-table name on the host sheet.
@@ -532,6 +542,80 @@ public partial class ExcelHandler
         }
 
         list.Append(new X14.SlicerRef { Id = slicersPartRelId });
+    }
+
+    // ==================== Removal helpers ====================
+
+    /// <summary>
+    /// Reverse of RegisterSlicerListInWorksheet: drop the x14:slicerRef whose
+    /// Id matches the removed SlicersPart rel id, and prune the now-empty
+    /// slicerList extension (and the worksheet extLst) when nothing remains.
+    /// </summary>
+    private void RemoveSlicerListFromWorksheet(WorksheetPart worksheetPart, string slicersPartRelId)
+    {
+        var worksheet = GetSheet(worksheetPart);
+        var extList = worksheet.GetFirstChild<WorksheetExtensionList>();
+        if (extList == null) return;
+        var ext = extList.Elements<WorksheetExtension>()
+            .FirstOrDefault(e => e.Uri?.Value == SlicerListExtUri);
+        if (ext == null) return;
+        var list = ext.GetFirstChild<X14.SlicerList>();
+        if (list != null)
+        {
+            foreach (var sref in list.Elements<X14.SlicerRef>()
+                .Where(r => r.Id?.Value == slicersPartRelId).ToList())
+                sref.Remove();
+            if (!list.Elements<X14.SlicerRef>().Any())
+                ext.Remove();
+        }
+        else ext.Remove();
+        if (!extList.HasChildren) extList.Remove();
+    }
+
+    /// <summary>
+    /// Reverse of RegisterSlicerCacheInWorkbook: drop the x14:slicerCache whose
+    /// Id matches the removed SlicerCachePart rel id, and prune the now-empty
+    /// slicerCaches extension (and the workbook extLst) when nothing remains.
+    /// </summary>
+    private void RemoveSlicerCacheFromWorkbook(WorkbookPart workbookPart, string slicerCachePartRelId)
+    {
+        var workbook = workbookPart.Workbook!;
+        var extList = workbook.GetFirstChild<WorkbookExtensionList>();
+        if (extList == null) return;
+        var ext = extList.Elements<WorkbookExtension>()
+            .FirstOrDefault(e => e.Uri?.Value == SlicerCachesExtUri);
+        if (ext == null) return;
+        var caches = ext.GetFirstChild<X14.SlicerCaches>();
+        if (caches != null)
+        {
+            foreach (var c in caches.Elements<X14.SlicerCache>()
+                .Where(c => c.Id?.Value == slicerCachePartRelId).ToList())
+                c.Remove();
+            if (!caches.Elements<X14.SlicerCache>().Any())
+                ext.Remove();
+        }
+        else ext.Remove();
+        if (!extList.HasChildren) extList.Remove();
+    }
+
+    /// <summary>
+    /// Reverse of AddSlicerDrawingAnchor: locate and remove the drawing anchor
+    /// whose sle:slicer binds to <paramref name="slicerCacheName"/>. Falls back
+    /// to a raw-XML name match because the sle:slicer often reloads inside an
+    /// AlternateContent block the strongly-typed descendant walk can miss.
+    /// </summary>
+    private void RemoveSlicerDrawingAnchor(WorksheetPart worksheetPart, string slicerCacheName)
+    {
+        var drawingsPart = worksheetPart.DrawingsPart;
+        var wsDrawing = drawingsPart?.WorksheetDrawing;
+        if (wsDrawing == null) return;
+        var anchor = wsDrawing.Elements<XDR.TwoCellAnchor>().FirstOrDefault(a =>
+            a.Descendants<Sle.Slicer>().Any(s => s.Name?.Value == slicerCacheName)
+            || (a.InnerXml.Contains(SlicerDrawingNsUri)
+                && a.InnerXml.Contains($"name=\"{slicerCacheName}\"")));
+        if (anchor == null) return;
+        anchor.Remove();
+        wsDrawing.Save();
     }
 
     // ==================== Drawing anchor ====================

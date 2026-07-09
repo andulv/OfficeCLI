@@ -2127,7 +2127,7 @@ public partial class WordHandler
         // Read each candidate startOverride.N (levels 0..8) via TryGetValue so
         // the TrackingPropertyDictionary marks consumed keys accessed — a plain
         // `foreach (var kvp in properties)` goes through the Dictionary<,>
-        // enumerator and bypasses access tracking (CLAUDE.md handler-as-truth).
+        // enumerator and bypasses access tracking (the project conventions handler-as-truth).
         for (int lvl = 0; lvl <= 8; lvl++)
         {
             var key = $"startOverride.{lvl}";

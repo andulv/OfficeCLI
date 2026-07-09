@@ -453,7 +453,7 @@ public partial class WordHandler
                     // the backing embedded part and (if needed) update
                     // the ProgID automatically from the new extension.
                     // This is the symmetric counterpart to AddOle — the
-                    // part-cleanup rule from CLAUDE.md's Known API
+                    // part-cleanup rule from the project conventions's Known API
                     // Quirks ("always delete old ImagePart to avoid
                     // storage bloat") applies equally to OLE payloads.
                     var ole = run.GetFirstChild<EmbeddedObject>();
@@ -533,7 +533,7 @@ public partial class WordHandler
                     }
                     // Replace the v:imagedata r:id with a new ImagePart, and
                     // delete the old ImagePart to avoid storage bloat
-                    // (mirrors Set src cleanup rule in CLAUDE.md Known
+                    // (mirrors Set src cleanup rule in the project conventions Known
                     // API Quirks for picture/blip replacement).
                     var oleIcon = run.GetFirstChild<EmbeddedObject>();
                     var shapeIcon = oleIcon?.Descendants().FirstOrDefault(e => e.LocalName == "shape");
@@ -1955,7 +1955,7 @@ public partial class WordHandler
                     {
                         // BUG-R4-05: accept unit-qualified widths (cm/in/pt/dxa) in
                         // addition to bare twips. Mirrors the cross-handler width
-                        // contract (root CLAUDE.md). Strip a trailing "dxa" suffix
+                        // contract (the project conventions). Strip a trailing "dxa" suffix
                         // (the form Get now emits) so the bare-twips path still works.
                         var rawWidth = value;
                         long? parsedTwips = null;
@@ -2725,7 +2725,7 @@ public partial class WordHandler
                         // CONSISTENCY(spacing-units): accept unit-qualified lengths
                         // ('10cm', '5in', '12pt') alongside bare twips, matching
                         // Add and the cross-handler convention from
-                        // root CLAUDE.md "Spacing input is lenient". Previous
+                        // the project conventions "Spacing input is lenient". Previous
                         // SafeParseUint-only path rejected '10cm'.
                         var twips = OfficeCli.Core.SpacingConverter.ParseWordSpacing(value);
                         tblPr.TableWidth = new TableWidth { Width = twips.ToString(), Type = TableWidthUnitValues.Dxa };

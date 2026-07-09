@@ -608,8 +608,38 @@ internal class ExcelStyleManager
 
     // ==================== NumberFormat ====================
 
+    // Friendly English keyword aliases for number formats. Consistent with
+    // the project's lenient-input convention (colors accept "red", sizes
+    // accept "14", spacing accepts "0.5cm"). Without this, a user typing the
+    // intuitive word "currency" got the literal string written as a custom
+    // format code — its unquoted letters both mis-rendered the value (the 'y'
+    // is a date token, so 100 showed as a date) and made real Excel refuse
+    // the whole file (0x800A03EC). Only a whole-string case-insensitive match
+    // is rewritten; genuine Excel codes pass through untouched.
+    private static readonly Dictionary<string, string> NumFmtKeywordAliases =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["general"] = "General",
+        ["number"] = "#,##0.00",
+        ["comma"] = "#,##0.00",
+        ["currency"] = "\"$\"#,##0.00",
+        ["accounting"] = "_(\"$\"* #,##0.00_);_(\"$\"* \\(#,##0.00\\);_(\"$\"* \"-\"??_);_(@_)",
+        ["percent"] = "0.00%",
+        ["percentage"] = "0.00%",
+        ["scientific"] = "0.00E+00",
+        ["text"] = "@",
+        ["date"] = "yyyy-mm-dd",
+        ["time"] = "h:mm:ss",
+        ["datetime"] = "yyyy-mm-dd h:mm:ss",
+    };
+
     private static uint GetOrCreateNumFmt(Stylesheet stylesheet, string formatCode)
     {
+        // Resolve friendly keyword aliases (currency, scientific, ...) to real
+        // Excel codes before any validation runs.
+        if (NumFmtKeywordAliases.TryGetValue(formatCode.Trim(), out var aliased))
+            formatCode = aliased;
+
         // R29-1 [BLOCKER]: a formatCode must never be written with an unbalanced
         // number of double-quotes — Excel text-literal delimiters come in matched
         // pairs, and an unclosed literal makes Excel refuse the whole file
@@ -682,6 +712,36 @@ internal class ExcelStyleManager
         if (nfBracketDepth != 0)
             throw new ArgumentException(
                 $"number format has unbalanced square brackets: '{formatCode}'. Bracket codes ([Red], [>=100], [h]) must be closed; writing an unbalanced bracket makes Excel refuse to open the file.");
+
+        // Unquoted letters outside Excel's token alphabet (date/time/era/
+        // General letters) make real Excel refuse the whole file
+        // (0x800A03EC) while schema validation stays green — e.g. a typoed
+        // numfmt=invalid_fmt instead of "invalid_fmt"0. Excel's grammar is
+        // quirky enough (abc opens, xyz does not) that a hard reject risks
+        // false positives on locale codes, so warn instead of block.
+        {
+            const string TokenLetters = "abcdeghlmnprsty";
+            bool warnQuote = false;
+            int warnBracket = 0;
+            char? suspect = null;
+            for (int i = 0; i < formatCode.Length && suspect == null; i++)
+            {
+                var c = formatCode[i];
+                if (c == '"') { warnQuote = !warnQuote; continue; }
+                if (warnQuote) continue;
+                if (c == '\\' || c == '_' || c == '*') { i++; continue; }
+                if (c == '[') { warnBracket++; continue; }
+                if (c == ']') { warnBracket--; continue; }
+                if (warnBracket > 0) continue;
+                if (char.IsLetter(c) && !TokenLetters.Contains(char.ToLowerInvariant(c)))
+                    suspect = c;
+            }
+            if (suspect != null)
+                Console.Error.WriteLine(
+                    $"Warning: number format '{formatCode}' contains the unquoted letter '{suspect}', " +
+                    "which real Excel may reject when opening the file (0x800A03EC). " +
+                    "Quote literal text, e.g. \"text\"0.00.");
+        }
 
         // Check built-in formats
         var builtinMap = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
@@ -888,7 +948,7 @@ internal class ExcelStyleManager
         string name = fontProps.GetValueOrDefault("name",
             baseFont.FontName?.Val?.Value ?? OfficeDefaultFonts.MinorLatin);
         // CONSISTENCY(scheme-color): font.color accepts scheme names
-        // ("accent1"-"accent6", "lt1"/"dk1", "hlink", etc.) per CLAUDE.md.
+        // ("accent1"-"accent6", "lt1"/"dk1", "hlink", etc.) per the project conventions.
         // When matched, store as <color theme="N"/> instead of rgb.
         string? color;
         uint? colorTheme = null;

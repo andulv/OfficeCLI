@@ -219,6 +219,9 @@ irm https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.ps1 | iex
 # Homebrew (macOS / Linux)
 brew install officecli
 
+# Scoop (Windows)
+scoop install officecli
+
 # npm (all platforms — fetches the native binary for your platform)
 npm install -g @officecli/officecli
 ```

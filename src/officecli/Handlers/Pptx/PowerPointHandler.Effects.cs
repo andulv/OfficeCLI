@@ -564,7 +564,7 @@ public partial class PowerPointHandler
         }
 
         var sp3dEl = EnsureShape3D(spPr);
-        // Canonical length input contract (CLAUDE.md): bare number = points,
+        // Canonical length input contract (the project conventions): bare number = points,
         // and pt/cm/in/px/emu suffixes are all accepted. Mirror lineWidth's
         // bare-int-as-points behaviour via EmuConverter.ParseLineWidth, which
         // returns EMU.

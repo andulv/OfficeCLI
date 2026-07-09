@@ -46,7 +46,10 @@ public partial class ExcelHandler
         // letter/underscore/backslash, contain only letter/digit/
         // underscore/period/backslash, and must not parse as a cell
         // reference. Otherwise Excel rejects the file with 0x800A03EC.
-        if (!System.Text.RegularExpressions.Regex.IsMatch(nrName, @"^[A-Za-z_\\][A-Za-z0-9_\\.]*$"))
+        // "Letter" is any Unicode letter (\p{L}) — Excel accepts CJK/
+        // Cyrillic/etc. names; the previous ASCII-only class falsely
+        // rejected them. Emoji/symbols stay rejected (not \p{L}).
+        if (!System.Text.RegularExpressions.Regex.IsMatch(nrName, @"^[\p{L}_\\][\p{L}\p{N}_\\.]*$"))
             throw new ArgumentException($"Invalid defined-name '{nrName}': must start with a letter/underscore and contain only letters, digits, underscores, or periods (no spaces).");
         // Excel caps defined-name identifier length at 255 characters; longer
         // names are silently truncated on open (or the file is rejected with
@@ -103,6 +106,29 @@ public partial class ExcelHandler
         // Sheet-qualified refs must name an existing sheet with a plausible
         // range — garbage like "乱码!!!" written verbatim made real Excel
         // refuse the file while schema validation stayed green.
+        // A bare A1-style range with no sheet qualifier is also INVALID in a
+        // defined-name body — Excel refuses the whole file (0x800A03EC).
+        // When the parent path names a sheet (add /Sheet1 --type namedrange),
+        // qualify with it; otherwise the ref is ambiguous and rejected.
+        if (!refVal.Contains('!')
+            && System.Text.RegularExpressions.Regex.IsMatch(refVal.Replace("$", ""),
+                @"^[A-Za-z]{1,3}\d+(:[A-Za-z]{1,3}\d+)?$"))
+        {
+            var nrParentSheet = parentPath.TrimStart('/').Split('/', 2)[0];
+            if (!string.IsNullOrEmpty(nrParentSheet)
+                && !nrParentSheet.StartsWith("namedrange", StringComparison.OrdinalIgnoreCase)
+                && !nrParentSheet.Equals("workbook", StringComparison.OrdinalIgnoreCase)
+                && FindWorksheet(nrParentSheet) != null)
+            {
+                refVal = $"{Core.ModernFunctionQualifier.QuoteSheetNameForRef(nrParentSheet)}!{refVal}";
+            }
+            else
+            {
+                throw new ArgumentException(
+                    $"Defined-name ref '{refVal}' has no sheet qualifier — Excel refuses unqualified cell ranges " +
+                    "in defined names. Use ref=SheetName!A1:B1, or add via the sheet path (add <file> /Sheet1 --type namedrange ...).");
+            }
+        }
         ValidateDefinedNameRef(refVal);
 
         var workbook = GetWorkbook();
@@ -345,10 +371,14 @@ public partial class ExcelHandler
         var (colName, rowNum) = ParseCellReference(cellRef.ToUpperInvariant());
         var col0 = ColumnNameToIndex(colName) - 1; // x:Column is 0-based
         var row0 = rowNum - 1;
-        // 1025+N is Excel's conventional legacy-VML shape-id base (matches
-        // the OLE path); count existing Note shapes for N.
-        var shapeId = 1025 + System.Text.RegularExpressions.Regex.Matches(
-            xml, "ObjectType=\"Note\"").Count;
+        // Allocate max(existing _x0000_s{N})+1 so the id never collides with a
+        // surviving comment OR OLE shape (both share this namespace). Counting
+        // Note shapes reused ids after a partial remove — see Bug family (3).
+        uint shapeId = 1025;
+        foreach (System.Text.RegularExpressions.Match sm in
+            System.Text.RegularExpressions.Regex.Matches(xml, @"_x0000_s(\d+)"))
+            if (uint.TryParse(sm.Groups[1].Value, out var sid) && sid >= shapeId)
+                shapeId = sid + 1;
         // Anchor: LeftCol,LeftOff,TopRow,TopOff,RightCol,RightOff,BottomRow,BottomOff —
         // the standard "one column right, spanning ~3 rows" popup Excel writes.
         var anchor = $"{col0 + 1}, 15, {row0}, 2, {col0 + 3}, 15, {row0 + 3}, 16";
@@ -371,6 +401,103 @@ public partial class ExcelHandler
         writer.Write(xml);
     }
 
+    /// <summary>
+    /// Re-anchor the legacy VML Note shape when a comment's ref moves.
+    /// Locates the shape whose x:Row/x:Column match <paramref name="oldRef"/>
+    /// and rewrites Row/Column plus the 8-number Anchor to the new cell,
+    /// mirroring the geometry AppendCommentVmlShape writes on Add.
+    /// </summary>
+    /// <returns>
+    /// true if the VML shape's Row/Column (and Anchor) were rewritten;
+    /// false if no matching shape was found (e.g. externally-authored VML
+    /// whose Row/Column no longer carries the old cell). The caller warns
+    /// on false so the desync between data and presentation part is visible
+    /// rather than a silent no-op.
+    /// </returns>
+    private bool UpdateCommentVmlShapeRef(WorksheetPart worksheet, string oldRef, string newRef)
+    {
+        var vmlPart = worksheet.VmlDrawingParts.FirstOrDefault();
+        if (vmlPart == null) return false;
+        string xml;
+        using (var reader = new System.IO.StreamReader(vmlPart.GetStream(System.IO.FileMode.Open, System.IO.FileAccess.Read)))
+            xml = reader.ReadToEnd();
+
+        var (oldColName, oldRowNum) = ParseCellReference(oldRef.ToUpperInvariant());
+        var (newColName, newRowNum) = ParseCellReference(newRef.ToUpperInvariant());
+        int oldCol0 = ColumnNameToIndex(oldColName) - 1, oldRow0 = oldRowNum - 1;
+        int newCol0 = ColumnNameToIndex(newColName) - 1, newRow0 = newRowNum - 1;
+
+        // Prefix-agnostic match: openpyxl and other authors emit ns-prefixed
+        // (e.g. ns2:Row) VML; a fixed "<x:Row>" literal would silently miss it.
+        var rowColRe = new Regex(
+            $@"<(?<rp>\w+:)?Row>\s*{oldRow0}\s*</(?:\w+:)?Row>\s*<(?<cp>\w+:)?Column>\s*{oldCol0}\s*</(?:\w+:)?Column>");
+        var rowColM = rowColRe.Match(xml);
+        if (!rowColM.Success) return false; // no matching shape — desync stays, caller warns
+
+        // Anchor precedes Row/Column inside the same ClientData block; rewrite
+        // the nearest preceding <...Anchor>...</...Anchor> (prefix-agnostic).
+        var newAnchor = $"{newCol0 + 1}, 15, {newRow0}, 2, {newCol0 + 3}, 15, {newRow0 + 3}, 16";
+        var anchorRe = new Regex(@"<(?:\w+:)?Anchor>(?<val>.*?)</(?:\w+:)?Anchor>", RegexOptions.Singleline);
+        Match? nearestAnchor = null;
+        foreach (Match am in anchorRe.Matches(xml))
+        {
+            if (am.Index >= rowColM.Index) break;
+            nearestAnchor = am;
+        }
+        if (nearestAnchor != null)
+        {
+            var valGroup = nearestAnchor.Groups["val"];
+            xml = xml[..valGroup.Index] + newAnchor + xml[(valGroup.Index + valGroup.Length)..];
+            rowColM = rowColRe.Match(xml); // positions shifted after anchor rewrite
+            if (!rowColM.Success) return false;
+        }
+        var rp = rowColM.Groups["rp"].Value;
+        var cp = rowColM.Groups["cp"].Value;
+        xml = xml[..rowColM.Index]
+            + $"<{rp}Row>{newRow0}</{rp}Row><{cp}Column>{newCol0}</{cp}Column>"
+            + xml[(rowColM.Index + rowColM.Length)..];
+
+        using var writer = new System.IO.StreamWriter(vmlPart.GetStream(System.IO.FileMode.Create, System.IO.FileAccess.Write));
+        writer.Write(xml);
+        return true;
+    }
+
+    /// <summary>
+    /// Remove the single legacy VML Note shape anchored at <paramref name="cellRef"/>.
+    /// Used by partial comment removal so a deleted comment's popup shape does
+    /// not linger. Prefix-agnostic Row/Column match (mirrors
+    /// UpdateCommentVmlShapeRef); no-op if the shape is absent.
+    /// </summary>
+    private void RemoveCommentVmlShapeByRef(WorksheetPart worksheet, string cellRef)
+    {
+        var vmlPart = worksheet.VmlDrawingParts.FirstOrDefault();
+        if (vmlPart == null) return;
+        var (colName, rowNum) = ParseCellReference(cellRef.ToUpperInvariant());
+        int col0 = ColumnNameToIndex(colName) - 1, row0 = rowNum - 1;
+        try
+        {
+            System.Xml.Linq.XDocument vmlDoc;
+            using (var stream = vmlPart.GetStream(System.IO.FileMode.Open, System.IO.FileAccess.Read))
+                vmlDoc = System.Xml.Linq.XDocument.Load(stream);
+            var vNs = (System.Xml.Linq.XNamespace)"urn:schemas-microsoft-com:vml";
+            var target = vmlDoc.Descendants(vNs + "shape").FirstOrDefault(s =>
+            {
+                var cd = s.Elements().FirstOrDefault(e => e.Name.LocalName == "ClientData");
+                if (cd == null || (string?)cd.Attribute("ObjectType") != "Note") return false;
+                var rowEl = cd.Elements().FirstOrDefault(e => e.Name.LocalName == "Row");
+                var colEl = cd.Elements().FirstOrDefault(e => e.Name.LocalName == "Column");
+                return rowEl != null && colEl != null
+                    && int.TryParse(rowEl.Value.Trim(), out var r) && r == row0
+                    && int.TryParse(colEl.Value.Trim(), out var c) && c == col0;
+            });
+            if (target == null) return;
+            target.Remove();
+            using var wstream = vmlPart.GetStream(System.IO.FileMode.Create, System.IO.FileAccess.Write);
+            vmlDoc.Save(wstream);
+        }
+        catch { }
+    }
+
     private string AddValidation(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
     {
         var index = position?.Index;
@@ -379,9 +506,12 @@ public partial class ExcelHandler
         var dvWorksheet = FindWorksheet(dvSheetName)
             ?? throw new ArgumentException($"Sheet not found: {dvSheetName}");
 
+        // CONSISTENCY(range-alias): cf/colorscale/iconset/pivottable all take
+        // sqref/range/ref interchangeably; validation lacked `range` only.
         var dvSqref = properties.GetValueOrDefault("sqref")
+            ?? properties.GetValueOrDefault("range")
             ?? properties.GetValueOrDefault("ref")
-            ?? throw new ArgumentException("Property 'sqref' (or 'ref') is required for validation");
+            ?? throw new ArgumentException("Property 'sqref' (or 'range'/'ref') is required for validation");
 
         // NOTE: multi-region sqref ("A1:A5 C1:C5") is legal and opens fine in
         // real Excel — a fuzz report claiming otherwise was a render-service
@@ -390,7 +520,7 @@ public partial class ExcelHandler
         // but DO validate each token's A1 shape: an arbitrary string landed
         // verbatim in sqref= and real Excel refused the file (0x800A03EC)
         // while schema validation stayed green.
-        ValidateSqref(dvSqref, "validation ref");
+        dvSqref = ValidateSqref(dvSqref, "validation ref");
 
         var dv = new DataValidation
         {
@@ -455,6 +585,12 @@ public partial class ExcelHandler
                     throw new ArgumentException(
                         "validation list options must not contain double quotes; Excel refuses files with quoted-literal escapes inside a list formula. Put the options in cells and reference the range instead.");
             }
+            // Non-list formulas land in the A1-only <x:formula1> element —
+            // an R1C1-style ref makes real Excel refuse the file (0x800A03EC)
+            // while schema validation stays green. (For type=list the text is
+            // a literal option list, not a formula, so it's left alone.)
+            if (dv.Type?.Value != DataValidationValues.List)
+                ValidateNoR1C1Reference(dvFormula1);
             dv.Formula1 = new Formula1(NormalizeValidationFormula(dvFormula1, dv.Type?.Value));
         }
         else if (dv.Type?.Value == DataValidationValues.List)
@@ -469,6 +605,8 @@ public partial class ExcelHandler
             if (dvFormula2.Length > 255)
                 throw new ArgumentException(
                     $"validation formula2 is {dvFormula2.Length} chars; Excel's limit is 255.");
+            if (dv.Type?.Value != DataValidationValues.List)
+                ValidateNoR1C1Reference(dvFormula2);
             dv.Formula2 = new Formula2(NormalizeValidationFormula(dvFormula2, dv.Type?.Value));
         }
         else if (dv.Operator?.Value == DataValidationOperatorValues.Between
@@ -608,6 +746,8 @@ public partial class ExcelHandler
                 RegexOptions.IgnoreCase))
             throw new ArgumentException(
                 $"Invalid 'range' value: '{afRange}'. Expected a cell range like 'A1:F100' or 'A1'.");
+        // Canonicalize inverted input (D5:A1) like the rest of the range family.
+        afRange = NormalizeA1Range(afRange);
 
         // CONSISTENCY(autofilter-table-dup): a Table already owns its own
         // <autoFilter> internally; layering a sheet-level <autoFilter> over
@@ -1003,6 +1143,7 @@ public partial class ExcelHandler
         // alongside `totalRow=true` (mirrors the `showHeader` alias
         // pattern above for users coming from Office API vocabulary).
         var hasTotalRow = (properties.TryGetValue("totalRow", out var trVal) && IsTruthy(trVal))
+                       || (properties.TryGetValue("totalsRow", out var tsVal) && IsTruthy(tsVal))
                        || (properties.TryGetValue("showTotals", out var stVal) && IsTruthy(stVal));
 
         var rangeParts = rangeRef.Split(':');
@@ -1010,6 +1151,17 @@ public partial class ExcelHandler
         var (endCol, endRow) = ParseCellReference(rangeParts[1]);
         var startColIdx = ColumnNameToIndex(startCol);
         var endColIdx = ColumnNameToIndex(endCol);
+        // Inverted ranges (D3:A1) used to flow into a negative column count
+        // and surface as a raw internal_error from an array-size computation.
+        // Normalize per axis, matching the drawing-anchor convention for a
+        // backwards drag-select.
+        if (endColIdx < startColIdx)
+        {
+            (startColIdx, endColIdx) = (endColIdx, startColIdx);
+            (startCol, endCol) = (endCol, startCol);
+        }
+        if (endRow < startRow) (startRow, endRow) = (endRow, startRow);
+        rangeRef = $"{startCol}{startRow}:{endCol}{endRow}";
         var colCount = endColIdx - startColIdx + 1;
 
         // T5-ext: autoExpand=true probes the sheet for contiguous
@@ -1084,8 +1236,14 @@ public partial class ExcelHandler
             // Pad with default names if fewer columns provided than range requires
             colNames = new string[colCount];
             for (int i = 0; i < colCount; i++)
+            {
                 colNames[i] = i < userColNames.Length ? userColNames[i] : $"Column{i + 1}";
-
+                // Blank / whitespace-only names make Excel reject the file
+                // (0x800A03EC) — fall back to the default, same as the
+                // header-discovery path.
+                if (string.IsNullOrWhiteSpace(colNames[i]))
+                    colNames[i] = $"Column{i + 1}";
+            }
         }
         else
         {
@@ -1100,18 +1258,29 @@ public partial class ExcelHandler
                     var cellRefStr = $"{colLetter}{startRow}";
                     var headerCell = headerRow?.Elements<Cell>().FirstOrDefault(c => c.CellReference?.Value == cellRefStr);
                     colNames[i] = (headerCell != null ? GetCellDisplayValue(headerCell) : null) ?? $"Column{i + 1}";
-                    if (string.IsNullOrEmpty(colNames[i]))
+                    // Excel rejects a table whose column name is blank OR
+                    // whitespace-only (0x800A03EC on open). IsNullOrEmpty is
+                    // not enough — a "   " header slips through. Fall back to
+                    // the default name and re-stamp the header cell below so
+                    // its visible text matches the tableColumn name.
+                    bool substituted = false;
+                    if (string.IsNullOrWhiteSpace(colNames[i]))
+                    {
                         colNames[i] = $"Column{i + 1}";
+                        substituted = true;
+                    }
                     // Excel rejects a table whose header cell is typed
                     // as a number. Convert the cell to an inline string
                     // so the header reads as text, and tableColumn name
                     // (read above) still matches the cell's visible
-                    // value exactly — Excel also requires that match.
-                    if (headerCell != null && (headerCell.DataType == null || headerCell.DataType.Value == CellValues.Number))
+                    // value exactly — Excel also requires that match. Also
+                    // re-stamp when we substituted a whitespace-only header.
+                    if (headerCell != null && (substituted || headerCell.DataType == null || headerCell.DataType.Value == CellValues.Number))
                     {
                         var text = colNames[i];
                         headerCell.DataType = CellValues.InlineString;
                         headerCell.CellValue = null;
+                        headerCell.CellFormula = null;
                         headerCell.InlineString = new InlineString(new Text(text));
                     }
                 }
@@ -1121,6 +1290,19 @@ public partial class ExcelHandler
                 for (int i = 0; i < colCount; i++)
                     colNames[i] = $"Column{i + 1}";
             }
+        }
+
+        // Validate columns.N.dxfId BEFORE creating the TableDefinitionPart.
+        // A non-numeric id used to throw further down (after AddNewPart and
+        // before Table.Save), leaving an orphan xl/tables/tableN.xml part with
+        // empty content — malformed XML that makes real Excel refuse the file.
+        for (int n = 1; n <= colCount; n++)
+        {
+            if ((properties.TryGetValue($"columns.{n}.dxfId", out var preDxf)
+                    || properties.TryGetValue($"column.{n}.dxfId", out preDxf))
+                && !uint.TryParse(preDxf, out _))
+                throw new ArgumentException(
+                    $"columns.{n}.dxfId requires a numeric dxf id, got: '{preDxf}'");
         }
 
         var tableDefPart = tblWorksheet.AddNewPart<TableDefinitionPart>();
@@ -1278,7 +1460,7 @@ public partial class ExcelHandler
         // TrackingPropertyDictionary marks consumed keys accessed — a plain
         // `foreach (var (rawKey, rawVal) in properties)` goes through the
         // Dictionary<,> enumerator and bypasses access tracking
-        // (CLAUDE.md handler-as-truth). N is 1-based; both `column.` and
+        // (the project conventions handler-as-truth). N is 1-based; both `column.` and
         // `columns.` prefixes are accepted, mirroring the old regex.
         var tblColList = tableColumns.Elements<TableColumn>().ToList();
         for (int n = 1; n <= tblColList.Count; n++)
@@ -1417,7 +1599,7 @@ public partial class ExcelHandler
             // Read each candidate columns.N.totalsFormula via TryGetValue so the
             // TrackingPropertyDictionary marks consumed keys accessed — a plain
             // `foreach (var (rawKey, rawVal) in properties)` bypasses access
-            // tracking (CLAUDE.md handler-as-truth). N is 1-based; accept both
+            // tracking (the project conventions handler-as-truth). N is 1-based; accept both
             // `column.` and `columns.` prefixes, mirroring the old regex.
             for (int n = 1; n <= tblCols.Count; n++)
             {

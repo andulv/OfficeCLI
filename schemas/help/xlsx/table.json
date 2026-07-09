@@ -66,8 +66,9 @@
     },
     "totalRow": {
       "type": "bool",
-      "description": "show total row. Alias: showTotals.",
+      "description": "show total row. Aliases: totalsRow, showTotals.",
       "aliases": [
+        "totalsRow",
         "showTotals"
       ],
       "add": true,

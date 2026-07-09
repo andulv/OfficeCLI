@@ -925,7 +925,7 @@ internal static partial class ChartHelper
             if (dlDefRp != null)
             {
                 if (dlDefRp.FontSize?.HasValue == true)
-                    // CONSISTENCY(canonical-units / project CLAUDE.md): font
+                    // CONSISTENCY(canonical-units / the project conventions): font
                     // sizes emit pt-qualified ("12pt"). Round-trip via labelFont.size
                     // accepts both "12" and "12pt" on input.
                     node.Format["labelFont.size"] = $"{dlDefRp.FontSize.Value / 100}pt";
@@ -2434,7 +2434,7 @@ internal static partial class ChartHelper
         var fill = defRp.GetFirstChild<Drawing.SolidFill>();
         var color = ReadColorFromFill(fill);
         // Canonical: hex colors are emitted with the "#" prefix (project
-        // CLAUDE.md). Earlier this stripped "#" via TrimStart, breaking the
+        // the project conventions). Earlier this stripped "#" via TrimStart, breaking the
         // canonical form for axisFont / legendFont compound readback.
         parts.Add(color ?? "");
 

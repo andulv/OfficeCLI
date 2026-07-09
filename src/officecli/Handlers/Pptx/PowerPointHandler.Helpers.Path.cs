@@ -97,7 +97,7 @@ public partial class PowerPointHandler
             throw new ArgumentException($"Invalid path '{path}': leading '//' is not allowed.");
         if (path.Contains("//"))
             throw new ArgumentException($"Invalid path '{path}': empty path segment ('//') is not allowed.");
-        // CONSISTENCY(table-path-long-form): pptx CLAUDE.md documents long form
+        // CONSISTENCY(table-path-long-form): pptx the project conventions documents long form
         // /slide[N]/table[K]/row[R]/cell[C] as canonical. Query/Add already alias
         // row→tr and cell→tc at their dispatch layer; mirror that here so Get/Set
         // /Remove parse paths also accept long form. Short OOXML form (tr/tc)

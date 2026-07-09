@@ -227,6 +227,28 @@ public partial class ExcelHandler
                     Core.PivotTableHelper.ReadPivotTableProperties(pivotDef, ptNode, pivotParts[i]);
                 children.Add(ptNode);
             }
+
+            // Slicers are addressable (/Sheet1/slicer[N] get/set/remove all
+            // work) but were invisible in the parent sheet's child listing —
+            // the only sheet-level element missing from enumeration.
+            // CONSISTENCY(sheet-children): same pattern as pivottable above.
+            var slicersPart = worksheetPart.GetPartsOfType<SlicersPart>().FirstOrDefault();
+            var slicerElems = slicersPart?.Slicers?
+                .Elements<DocumentFormat.OpenXml.Office2010.Excel.Slicer>().ToList();
+            if (slicerElems != null)
+            {
+                for (int i = 0; i < slicerElems.Count; i++)
+                {
+                    var slNode = new DocumentNode
+                    {
+                        Path = $"/{sheetName}/slicer[{i + 1}]",
+                        Type = "slicer"
+                    };
+                    if (TryFindSlicerByIndex(worksheetPart, i + 1, out var slElem, out var slCache) && slElem != null)
+                        ReadSlicerProperties(slElem, slCache, slNode);
+                    children.Add(slNode);
+                }
+            }
         }
 
         return children;
@@ -243,6 +265,13 @@ public partial class ExcelHandler
         if (cell.CellFormula != null) return true;
         if (!string.IsNullOrEmpty(cell.CellValue?.Text)) return true;
         if (cell.GetFirstChild<DocumentFormat.OpenXml.Spreadsheet.InlineString>() != null) return true;
+        // Explicit empty-string cell (<c t="str"><v/></c>): a stored value
+        // node with a string DataType is real content — COUNTA counts it,
+        // ISBLANK is FALSE — even when the text is empty. Excluding it hid
+        // the cell from bulk enumeration AND from dump, which silently
+        // dropped it on replay. A typeless <c s="1"/> (style only, no value
+        // node) remains non-content.
+        if (cell.DataType?.HasValue == true && cell.CellValue != null) return true;
         return false;
     }
 
@@ -708,7 +737,7 @@ public partial class ExcelHandler
 
                     // Protection readback handled above via the dotted
                     // canonical form (`protection.locked` / `protection.hidden`)
-                    // — see CONSISTENCY(canonical-keys) in CLAUDE.md. Flat
+                    // — see CONSISTENCY(canonical-keys) in the project conventions. Flat
                     // `locked` / `formulahidden` Get emission was removed to
                     // avoid double-emission alongside the dotted form. The
                     // Set side still accepts both flat shorthand and dotted

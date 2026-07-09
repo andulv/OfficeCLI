@@ -535,19 +535,29 @@ public partial class ExcelHandler
     private void ApplyRowRenumberToSheet(WorksheetPart worksheet, string sheetName, IReadOnlyDictionary<int, int> map)
     {
         if (map.Count == 0) return;
+        // Drawing markers use 0-based row indices; the renumber map is keyed by
+        // 1-based row indices. Translate so anchored pictures/charts follow the
+        // rows they sit on (parity with insert/delete's rowMarkerShift).
         ApplySheetRangeMutations(
             worksheet, sheetName,
             refMapper: r => RemapRowsInRangeRef(r, map),
-            formulaTextMapper: f => Core.FormulaRefShifter.ApplyRowRenumberMap(f, sheetName, sheetName, map));
+            formulaTextMapper: f => Core.FormulaRefShifter.ApplyRowRenumberMap(f, sheetName, sheetName, map),
+            rowMarkerShift: m => map.TryGetValue(m + 1, out var n) ? n - 1 : m,
+            crossSheetFormulaMapper: (other, f) => Core.FormulaRefShifter.ApplyRowRenumberMap(f, other, sheetName, map));
     }
 
     private void ApplyColRenumberToSheet(WorksheetPart worksheet, string sheetName, IReadOnlyDictionary<int, int> map)
     {
         if (map.Count == 0) return;
+        // Drawing markers use 0-based column indices; the renumber map is keyed
+        // by 1-based column indices. Translate so anchored objects follow the
+        // columns they sit on (parity with insert/delete's colMarkerShift).
         ApplySheetRangeMutations(
             worksheet, sheetName,
             refMapper: r => RemapColsInRangeRef(r, map),
-            formulaTextMapper: f => Core.FormulaRefShifter.ApplyColRenumberMap(f, sheetName, sheetName, map));
+            formulaTextMapper: f => Core.FormulaRefShifter.ApplyColRenumberMap(f, sheetName, sheetName, map),
+            colMarkerShift: m => map.TryGetValue(m + 1, out var n) ? n - 1 : m,
+            crossSheetFormulaMapper: (other, f) => Core.FormulaRefShifter.ApplyColRenumberMap(f, other, sheetName, map));
     }
 
     private static string? RemapColsInRangeRef(string? refStr, IReadOnlyDictionary<int, int> map)
@@ -664,31 +674,26 @@ public partial class ExcelHandler
         var row2 = (idx2 >= 1 && idx2 <= allRows.Count ? allRows[idx2 - 1] : null)
             ?? throw new ArgumentException($"Row {idx2} not found");
 
-        // Swap RowIndex values and cell references
         var rowIndex1 = row1.RowIndex?.Value ?? (uint)idx1;
         var rowIndex2 = row2.RowIndex?.Value ?? (uint)idx2;
-        row1.RowIndex = new DocumentFormat.OpenXml.UInt32Value(rowIndex2);
-        row2.RowIndex = new DocumentFormat.OpenXml.UInt32Value(rowIndex1);
 
-        // Update cell references (e.g. A1→A3, B1→B3)
-        foreach (var cell in row1.Elements<Cell>())
-        {
-            if (cell.CellReference?.Value != null)
-            {
-                var colRef = Regex.Match(cell.CellReference.Value, @"^([A-Z]+)").Groups[1].Value;
-                cell.CellReference = $"{colRef}{rowIndex2}";
-            }
-        }
-        foreach (var cell in row2.Elements<Cell>())
-        {
-            if (cell.CellReference?.Value != null)
-            {
-                var colRef = Regex.Match(cell.CellReference.Value, @"^([A-Z]+)").Groups[1].Value;
-                cell.CellReference = $"{colRef}{rowIndex1}";
-            }
-        }
+        // Snapshot every row's old RowIndex before the swap so we can build the
+        // oldToNew renumber map afterwards. This routes the swap through the
+        // same machinery as Move (ApplyRowRenumberToSheet): external formulas,
+        // CF/DV sqref, mergeCells, chart series refs and drawing anchors all
+        // follow the swapped content, and formula caches are refreshed at flush
+        // so cachedValue stays consistent with the formula.
+        var oldIdx = sheetData.Elements<Row>().ToDictionary(r => r, r => (int)(r.RowIndex?.Value ?? 0));
 
+        // Physically exchange the two rows in document order, then renumber by
+        // document order — mirrors Move's reposition + RenumberRowsAndCellRefs.
         PowerPointHandler.SwapXmlElements(row1, row2);
+        RenumberRowsAndCellRefs(sheetData);
+
+        var map = BuildRowRenumberMap(oldIdx);
+        ApplyRowRenumberToSheet(worksheet, sheetName, map);
+
+        DeleteCalcChainIfPresent();
         SaveWorksheet(worksheet);
 
         return ($"/{sheetName}/row[{rowIndex2}]", $"/{sheetName}/row[{rowIndex1}]");

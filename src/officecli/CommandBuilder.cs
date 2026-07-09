@@ -123,6 +123,39 @@ static partial class CommandBuilder
         serveCommand.SetAction(result =>
         {
             var file = result.GetValue(serveFileArg)!;
+            // Per-file singleton guard. TryResident's probe-then-spawn has an
+            // inherent race: N clients probing an un-owned file concurrently
+            // all fail the ping and all spawn a resident. Each spawned server
+            // held its own full in-memory copy and whole-file-overwrote on
+            // flush — concurrent writers silently lost every edit except the
+            // last flusher's (observed: 40 parallel sets → 0-2 cells on
+            // disk, all reporting success). Acquire an exclusive lock file
+            // BEFORE opening the document; losers exit quietly and their
+            // clients reconnect to the winner via the re-probe in
+            // TryResident.
+            FileStream? residentLock = null;
+            var lockPath = Path.Combine(Path.GetTempPath(),
+                ResidentServer.GetPipeName(file.FullName) + ".lock");
+            for (int attempt = 0; attempt < 3 && residentLock == null; attempt++)
+            {
+                try
+                {
+                    residentLock = new FileStream(lockPath, FileMode.OpenOrCreate,
+                        FileAccess.ReadWrite, FileShare.None,
+                        bufferSize: 1, FileOptions.DeleteOnClose);
+                }
+                catch (IOException)
+                {
+                    // Another resident holds (or is acquiring) the lock. If it
+                    // is already serving, we're redundant — exit and let the
+                    // client reconnect. Brief retry covers the window where
+                    // the winner crashed without deleting the lock.
+                    if (ResidentClient.TryConnect(file.FullName, out var winnerPipe)) return;
+                    Thread.Sleep(150);
+                }
+            }
+            if (residentLock == null) return;
+            using var heldLock = residentLock;
             using var server = new ResidentServer(file.FullName);
             server.RunAsync().GetAwaiter().GetResult();
         });
@@ -612,7 +645,15 @@ static partial class CommandBuilder
             }
             case "query":
             {
-                var selector = item.Selector ?? "";
+                // `path` is accepted as an alias for `selector` — the generic
+                // field table says "path (set/remove/get target)" and users
+                // carry it over to query; ignoring it silently ran an EMPTY
+                // selector, i.e. returned every node as if the predicate
+                // matched (the most dangerous kind of wrong data). Neither
+                // field present is an error, mirroring the required CLI arg.
+                var selector = item.Selector ?? item.Path ?? "";
+                if (string.IsNullOrEmpty(selector))
+                    throw new ArgumentException("'query' command requires 'selector' field. Example: {\"command\": \"query\", \"selector\": \"row[Score>80]\"}");
                 Func<string, string>? keyResolver =
                     handler is OfficeCli.Handlers.ExcelHandler
                     && OfficeCli.Handlers.ExcelHandler.SelectorTargetsCells(selector)
@@ -1167,6 +1208,42 @@ static partial class CommandBuilder
     }
 
     /// <summary>
+    /// Hard-reject any unmatched `--option` token that
+    /// <see cref="DetectUnmatchedKeyValues"/> did not convert into a
+    /// missing-prop warning. Commands parsed with
+    /// TreatUnmatchedTokensAsErrors=false otherwise swallow unknown flags
+    /// (e.g. `add ... --at A2`) silently with exit 0 — the element lands
+    /// somewhere the caller did not intend and nothing surfaces the typo.
+    /// </summary>
+    internal static void RejectUnknownOptionTokens(
+        System.CommandLine.ParseResult parseResult, List<string> claimedKeyValues)
+    {
+        var tokens = parseResult.UnmatchedTokens;
+        var claimedKeys = new HashSet<string>(
+            claimedKeyValues.Select(kv => kv.Split('=', 2)[0].Trim().TrimStart('-')),
+            StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            var token = tokens[i];
+            if (token == "--") break;                       // explicit passthrough separator
+            if (!token.StartsWith("--") || token.Length <= 2) continue;
+            var key = token[2..];
+            if (key.Contains('='))                          // --key=value form
+                key = key[..key.IndexOf('=')];
+            if (claimedKeys.Contains(key)) continue;        // already warned as missing --prop
+            if (key is "props" or "prop") continue;         // typo forms handled above
+            var valueHint = i + 1 < tokens.Count && !tokens[i + 1].StartsWith("--")
+                ? $"{key}={tokens[i + 1]}"
+                : $"{key}=<value>";
+            throw new OfficeCli.Core.CliException($"Unrecognized option '{token}'.")
+            {
+                Code = "invalid_argument",
+                Suggestion = $"Element properties are passed via --prop, e.g. --prop {valueHint}. Run 'officecli add --help' for the supported options."
+            };
+        }
+    }
+
+    /// <summary>
     /// Reduce a Word handler result path to the meaningful scope label for
     /// UNSUPPORTED messages — "/styles", "/body/p[N]", "/body/p[N]/r[N]".
     /// Stops at the first segment that is not a known top-level Word
@@ -1331,7 +1408,7 @@ static partial class CommandBuilder
         foreach (var prop in KnownProps)
         {
             if (exclude != null && exclude.Contains(prop)) continue;
-            var dist = LevenshteinDistance(lower, prop.ToLowerInvariant());
+            var dist = OfficeCli.Core.EditDistance.Damerau(lower, prop.ToLowerInvariant());
             if (dist > 0 && dist <= Math.Max(2, rawInput.Length / 3))
             {
                 if (dist < bestDist)
@@ -1348,27 +1425,6 @@ static partial class CommandBuilder
         }
 
         return best != null ? (best, bestDist, bestCount == 1) : (null, int.MaxValue, false);
-    }
-
-    internal static int LevenshteinDistance(string s, string t)
-    {
-        if (s.Length == 0) return t.Length;
-        if (t.Length == 0) return s.Length;
-
-        var d = new int[s.Length + 1, t.Length + 1];
-        for (int i = 0; i <= s.Length; i++) d[i, 0] = i;
-        for (int j = 0; j <= t.Length; j++) d[0, j] = j;
-
-        for (int i = 1; i <= s.Length; i++)
-        {
-            for (int j = 1; j <= t.Length; j++)
-            {
-                int cost = s[i - 1] == t[j - 1] ? 0 : 1;
-                d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
-            }
-        }
-
-        return d[s.Length, t.Length];
     }
 
     // ==================== PPT spatial info helpers ====================

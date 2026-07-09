@@ -114,6 +114,21 @@ public partial class ExcelHandler
                     $"Invalid srcRect '{compound}'. Expected 'l=10,r=10,t=5,b=5' (any subset; values are percent 0-100). "
                     + "For raw l/t/r/b numbers use cropLeft/cropTop/cropRight/cropBottom keys.");
         }
+        // CONSISTENCY(picture-crop): bare composite `crop=l,t,r,b` — the exact
+        // form Get emits (and pptx Add already accepts). Without it, dump→batch
+        // replay warned UNSUPPORTED and silently dropped the srcRect.
+        if (properties.TryGetValue("crop", out var cropAll) && !string.IsNullOrWhiteSpace(cropAll)
+            && !cropAll.Contains('='))
+        {
+            var cropParts = cropAll.Split(',');
+            var cropVals = cropParts.Length == 4
+                ? cropParts.Select(ParseCropPercent).ToArray()
+                : null;
+            if (cropVals == null || !cropVals.All(v => v.HasValue))
+                throw new ArgumentException(
+                    $"Invalid crop '{cropAll}'. Expected four comma-separated percentages in l,t,r,b order (e.g. '10,15,5,20').");
+            l = cropVals[0]; t = cropVals[1]; r = cropVals[2]; b = cropVals[3];
+        }
         foreach (var (key, fld) in new[] { ("crop.l", "l"), ("crop.r", "r"), ("crop.t", "t"), ("crop.b", "b") })
         {
             if (properties.TryGetValue(key, out var vs) && !string.IsNullOrWhiteSpace(vs))
@@ -307,6 +322,22 @@ public partial class ExcelHandler
 
     // ==================== Picture Helpers ====================
 
+    // Pictures can hang off any of the three anchor kinds AddPicture emits
+    // (twoCellAnchor / oneCellAnchor / absoluteAnchor). Enumerate in document
+    // order so picture[N] indexing is stable across mixed anchor kinds — every
+    // consumer (Get / Query / Set / Remove / dump) must use this enumerator or
+    // their index spaces diverge and oneCell/absolute pictures silently vanish
+    // from dump output.
+    internal static IEnumerable<OpenXmlCompositeElement> EnumeratePictureAnchors(XDR.WorksheetDrawing wsDrawing)
+    {
+        foreach (var child in wsDrawing.ChildElements)
+        {
+            if (child is XDR.TwoCellAnchor or XDR.OneCellAnchor or XDR.AbsoluteAnchor
+                && child.Descendants<XDR.Picture>().Any())
+                yield return (OpenXmlCompositeElement)child;
+        }
+    }
+
     private DocumentNode? GetPictureNode(string sheetName, WorksheetPart worksheetPart, int index, string path)
     {
         var drawingsPart = worksheetPart.DrawingsPart;
@@ -315,9 +346,7 @@ public partial class ExcelHandler
         var wsDrawing = drawingsPart.WorksheetDrawing;
         if (wsDrawing == null) return null;
 
-        var picAnchors = wsDrawing.Elements<XDR.TwoCellAnchor>()
-            .Where(a => a.Descendants<XDR.Picture>().Any())
-            .ToList();
+        var picAnchors = EnumeratePictureAnchors(wsDrawing).ToList();
 
         if (index < 1 || index > picAnchors.Count)
             return null;
@@ -337,6 +366,10 @@ public partial class ExcelHandler
             }
             if (!string.IsNullOrEmpty(nvProps.Name?.Value))
                 node.Format["name"] = nvProps.Name.Value;
+            // P11 readback — Add writes `title=` into cNvPr @title; without
+            // this the key was write-only and dump silently dropped it.
+            if (!string.IsNullOrEmpty(nvProps.Title?.Value))
+                node.Format["title"] = nvProps.Title.Value;
         }
 
         ReadAnchorPosition(anchor, node);
@@ -490,6 +523,25 @@ public partial class ExcelHandler
         var spPr = shape.ShapeProperties;
         if (spPr?.GetFirstChild<Drawing.NoFill>() != null)
             node.Format["fill"] = "none";
+        else if (spPr?.GetFirstChild<Drawing.GradientFill>() is { } shapeGradFill)
+        {
+            // SH6 readback — reconstruct the "C1-C2[-C3][:angle]" spec that
+            // BuildShapeGradientFill consumes, so dump→batch replays the
+            // gradient instead of silently dropping it to the default fill.
+            var stopColors = shapeGradFill.GetFirstChild<Drawing.GradientStopList>()?
+                .Elements<Drawing.GradientStop>()
+                .Select(gs => gs.GetFirstChild<Drawing.RgbColorModelHex>()?.Val?.Value)
+                .Where(v => !string.IsNullOrEmpty(v))
+                .ToList();
+            if (stopColors is { Count: >= 2 })
+            {
+                var spec = string.Join("-", stopColors.Select(v => ParseHelpers.FormatHexColor(v!)));
+                var linAngle = shapeGradFill.GetFirstChild<Drawing.LinearGradientFill>()?.Angle?.Value ?? 0;
+                var angleDeg = (int)Math.Round(linAngle / 60000.0);
+                if (angleDeg != 0) spec += $":{angleDeg}";
+                node.Format["gradientFill"] = spec;
+            }
+        }
         else
         {
             var shapeFill = spPr?.GetFirstChild<Drawing.SolidFill>();
@@ -621,6 +673,91 @@ public partial class ExcelHandler
     /// Set position/size properties (x, y, width, height) on a TwoCellAnchor.
     /// Returns true if the key was handled, false otherwise.
     /// </summary>
+    // OOXML spreadsheet-drawing extents/positions (<xdr:ext>, <xdr:pos>) are
+    // Int32-bounded EMU (ST_PositiveCoordinate32). Values beyond that pass
+    // SDK save silently but fail schema validation (MaxInclusive) and make
+    // real Excel refuse the workbook (0x800A03EC) — reject at input instead
+    // of persisting an unopenable file. Only oneCell/absolute anchors hit
+    // this: twoCell anchors split spans into whole-column/row markers.
+    internal static long ValidateDrawingCoordEmu(long emu, string key)
+    {
+        if (emu > int.MaxValue)
+            throw new ArgumentException(
+                $"Picture/shape {key} is out of range for a oneCell/absolute drawing anchor: " +
+                $"{emu} EMU exceeds the OOXML limit 2147483647 EMU (~23.5in per axis).");
+        return emu;
+    }
+
+    // Anchor-kind dispatch mirroring ReadAnchorPosition: oneCell keeps x/y as
+    // cell indices but sizes via <xdr:ext> EMU; absolute positions and sizes
+    // are all EMU (ParseEmu accepts "2cm"/"1in"/"NNNemu"/bare EMU).
+    private static bool TrySetAnchorPosition(OpenXmlCompositeElement anchorEl, string key, string value)
+    {
+        switch (anchorEl)
+        {
+            case XDR.TwoCellAnchor two:
+                return TrySetAnchorPosition(two, key, value);
+            case XDR.OneCellAnchor one:
+                switch (key)
+                {
+                    case "x":
+                        if (one.FromMarker?.ColumnId != null)
+                            one.FromMarker.ColumnId.Text = ParseAnchorOrigin(value, "x").ToString();
+                        return true;
+                    case "y":
+                        if (one.FromMarker?.RowId != null)
+                            one.FromMarker.RowId.Text = ParseAnchorOrigin(value, "y").ToString();
+                        return true;
+                    case "width":
+                    {
+                        var ext = one.GetFirstChild<XDR.Extent>();
+                        if (ext != null) ext.Cx = ValidateDrawingCoordEmu(EmuConverter.ParseEmu(value), key);
+                        return true;
+                    }
+                    case "height":
+                    {
+                        var ext = one.GetFirstChild<XDR.Extent>();
+                        if (ext != null) ext.Cy = ValidateDrawingCoordEmu(EmuConverter.ParseEmu(value), key);
+                        return true;
+                    }
+                    default:
+                        return false;
+                }
+            case XDR.AbsoluteAnchor abs:
+                switch (key)
+                {
+                    case "x":
+                    {
+                        var pos = abs.GetFirstChild<XDR.Position>();
+                        if (pos != null) pos.X = ValidateDrawingCoordEmu(EmuConverter.ParseEmu(value), key);
+                        return true;
+                    }
+                    case "y":
+                    {
+                        var pos = abs.GetFirstChild<XDR.Position>();
+                        if (pos != null) pos.Y = ValidateDrawingCoordEmu(EmuConverter.ParseEmu(value), key);
+                        return true;
+                    }
+                    case "width":
+                    {
+                        var ext = abs.GetFirstChild<XDR.Extent>();
+                        if (ext != null) ext.Cx = ValidateDrawingCoordEmu(EmuConverter.ParseEmu(value), key);
+                        return true;
+                    }
+                    case "height":
+                    {
+                        var ext = abs.GetFirstChild<XDR.Extent>();
+                        if (ext != null) ext.Cy = ValidateDrawingCoordEmu(EmuConverter.ParseEmu(value), key);
+                        return true;
+                    }
+                    default:
+                        return false;
+                }
+            default:
+                return false;
+        }
+    }
+
     private static bool TrySetAnchorPosition(XDR.TwoCellAnchor anchor, string key, string value)
     {
         switch (key)
@@ -668,6 +805,47 @@ public partial class ExcelHandler
     /// <summary>
     /// Read position/size from a TwoCellAnchor into a DocumentNode's Format dictionary.
     /// </summary>
+    // Anchor-kind dispatch: oneCell/absolute anchors carry their size in an
+    // <xdr:ext> (EMU) instead of a To marker, and absolute carries x/y as EMU
+    // <xdr:pos>. Emit raw "NNNemu" for EMU-exact values (same exactness
+    // convention as the dump emitter's width/height) plus an anchorMode key
+    // (omitted for the twoCell default) so dump→batch replays the same anchor
+    // kind.
+    private static void ReadAnchorPosition(OpenXmlCompositeElement anchor, DocumentNode node)
+    {
+        switch (anchor)
+        {
+            case XDR.TwoCellAnchor two:
+                ReadAnchorPosition(two, node);
+                return;
+            case XDR.OneCellAnchor one:
+            {
+                node.Format["anchorMode"] = "oneCell";
+                var from = one.FromMarker;
+                if (from != null)
+                {
+                    node.Format["x"] = from.ColumnId?.Text ?? "0";
+                    node.Format["y"] = from.RowId?.Text ?? "0";
+                }
+                var ext = one.GetFirstChild<XDR.Extent>();
+                if (ext?.Cx?.HasValue == true) node.Format["width"] = $"{ext.Cx.Value}emu";
+                if (ext?.Cy?.HasValue == true) node.Format["height"] = $"{ext.Cy.Value}emu";
+                return;
+            }
+            case XDR.AbsoluteAnchor abs:
+            {
+                node.Format["anchorMode"] = "absolute";
+                var pos = abs.GetFirstChild<XDR.Position>();
+                if (pos?.X?.HasValue == true) node.Format["x"] = $"{pos.X.Value}emu";
+                if (pos?.Y?.HasValue == true) node.Format["y"] = $"{pos.Y.Value}emu";
+                var ext = abs.GetFirstChild<XDR.Extent>();
+                if (ext?.Cx?.HasValue == true) node.Format["width"] = $"{ext.Cx.Value}emu";
+                if (ext?.Cy?.HasValue == true) node.Format["height"] = $"{ext.Cy.Value}emu";
+                return;
+            }
+        }
+    }
+
     private static void ReadAnchorPosition(XDR.TwoCellAnchor anchor, DocumentNode node)
     {
         var from = anchor.FromMarker;
@@ -1155,12 +1333,41 @@ public partial class ExcelHandler
         if (!m.Success) return false;
         fromCol = ColumnNameToIndex(m.Groups[1].Value) - 1;
         fromRow = int.Parse(m.Groups[2].Value) - 1;
+        ValidateAnchorCell(fromCol, fromRow, value!.Split(':')[0]);
         if (m.Groups[3].Success)
         {
             toCol = ColumnNameToIndex(m.Groups[3].Value) - 1;
             toRow = int.Parse(m.Groups[4].Value) - 1;
+            ValidateAnchorCell(toCol, toRow, value.Split(':')[1]);
+            // Inverted ranges (D4:B2) written verbatim produce a twoCellAnchor
+            // whose from exceeds to; real Excel refuses the file (0x800A03EC)
+            // while schema validation stays green. Normalize per axis, same
+            // as Excel treats a backwards drag-select.
+            NormalizeAnchorRect(ref fromCol, ref fromRow, ref toCol, ref toRow);
         }
         return true;
+    }
+
+    /// <summary>Swap anchor corners per axis so from ≤ to.</summary>
+    internal static void NormalizeAnchorRect(ref int fromCol, ref int fromRow, ref int toCol, ref int toRow)
+    {
+        if (toCol >= 0 && toCol < fromCol) (fromCol, toCol) = (toCol, fromCol);
+        if (toRow >= 0 && toRow < fromRow) (fromRow, toRow) = (toRow, fromRow);
+    }
+
+    /// <summary>
+    /// Bounds-check a parsed 0-based anchor cell against Excel's real grid
+    /// (A1..XFD1048576). Row 0 (A0) parses to -1 and columns past XFD wrap
+    /// into indices Excel refuses (0x800A03EC) while schema validation stays
+    /// green — reject at parse time instead.
+    /// </summary>
+    internal static void ValidateAnchorCell(int col0, int row0, string original)
+    {
+        const int MaxCol0 = 16383;      // XFD
+        const int MaxRow0 = 1048575;    // 1,048,576 rows, 0-based
+        if (col0 < 0 || col0 > MaxCol0 || row0 < 0 || row0 > MaxRow0)
+            throw new ArgumentException(
+                $"Anchor cell '{original}' is outside Excel's grid (A1..XFD1048576).");
     }
 
     /// <summary>

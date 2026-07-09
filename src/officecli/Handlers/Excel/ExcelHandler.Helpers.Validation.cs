@@ -44,7 +44,67 @@ public partial class ExcelHandler
         if (!ok)
             throw new ArgumentException(
                 $"Invalid {field} '{value}': expected an A1 reference (e.g. 'A1', 'A1:D10', 'A:A', '1:3', 'A1 B2:C5').");
-        return value;
+        // Shape-valid tokens can still point outside Excel's grid: sqref="A0"
+        // passed here, saved fine, and real Excel refused the whole file
+        // (0x800A03EC) — the same out-of-grid family the drawing-anchor parser
+        // rejects. Bounds-check every cell/row/column component.
+        foreach (var tok in trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            foreach (System.Text.RegularExpressions.Match cm in
+                System.Text.RegularExpressions.Regex.Matches(tok, @"\$?([A-Z]+)?\$?([0-9]+)?",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            {
+                if (cm.Length == 0) continue;
+                if (cm.Groups[1].Success && cm.Groups[1].Value.Length > 0)
+                {
+                    var colIdx = ColumnNameToIndex(cm.Groups[1].Value.ToUpperInvariant());
+                    if (colIdx < 1 || colIdx > 16384)
+                        throw new ArgumentException(
+                            $"Invalid {field} '{value}': column '{cm.Groups[1].Value}' is outside Excel's grid (A..XFD).");
+                }
+                if (cm.Groups[2].Success && cm.Groups[2].Value.Length > 0)
+                {
+                    if (!long.TryParse(cm.Groups[2].Value, out var rowNum) || rowNum < 1 || rowNum > 1048576)
+                        throw new ArgumentException(
+                            $"Invalid {field} '{value}': row '{cm.Groups[2].Value}' is outside Excel's grid (1..1048576).");
+                }
+            }
+        }
+        // Canonicalize inverted tokens (F5:D3 → D3:F5, per axis) — merge
+        // rejects them and table normalizes them, but CF/DV wrote them
+        // verbatim, leaving a non-canonical sqref whose behavior in real
+        // Excel is undefined. Same convention as the drawing-anchor and
+        // table-range normalization.
+        var normTokens = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Select(tok =>
+            {
+                var cm = System.Text.RegularExpressions.Regex.Match(tok,
+                    @"^(\$?)([A-Z]+)(\$?)([0-9]+):(\$?)([A-Z]+)(\$?)([0-9]+)$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (cm.Success)
+                {
+                    var c1 = ColumnNameToIndex(cm.Groups[2].Value.ToUpperInvariant());
+                    var c2 = ColumnNameToIndex(cm.Groups[6].Value.ToUpperInvariant());
+                    var r1 = long.Parse(cm.Groups[4].Value);
+                    var r2 = long.Parse(cm.Groups[8].Value);
+                    var colA = c1 <= c2 ? cm.Groups[2].Value : cm.Groups[6].Value;
+                    var colB = c1 <= c2 ? cm.Groups[6].Value : cm.Groups[2].Value;
+                    var rowA = Math.Min(r1, r2);
+                    var rowB = Math.Max(r1, r2);
+                    return $"{colA}{rowA}:{colB}{rowB}";
+                }
+                var wm = System.Text.RegularExpressions.Regex.Match(tok,
+                    @"^\$?([A-Z]+)\$?:\$?([A-Z]+)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (wm.Success
+                    && ColumnNameToIndex(wm.Groups[1].Value.ToUpperInvariant())
+                        > ColumnNameToIndex(wm.Groups[2].Value.ToUpperInvariant()))
+                    return $"{wm.Groups[2].Value}:{wm.Groups[1].Value}";
+                var rm = System.Text.RegularExpressions.Regex.Match(tok, @"^\$?([0-9]+)\$?:\$?([0-9]+)$");
+                if (rm.Success && long.Parse(rm.Groups[1].Value) > long.Parse(rm.Groups[2].Value))
+                    return $"{rm.Groups[2].Value}:{rm.Groups[1].Value}";
+                return tok;
+            });
+        return string.Join(" ", normTokens);
     }
 
     /// <summary>
@@ -105,12 +165,31 @@ public partial class ExcelHandler
             && displayValue != "#OCLI_NOTEVAL!";
     }
 
-    internal static void ValidateFormulaCellRefs(string formula)
+    /// <summary>
+    /// Reject R1C1-style references (R2C3, RC[1], R[-1]C) in a formula string.
+    /// The OOXML &lt;f&gt; element is A1-only; writing R1C1 verbatim makes real
+    /// Excel refuse the file (0x800A03EC) while schema validation stays green.
+    /// Shared by cell formulas and conditional-formatting formulas. Does NOT
+    /// do grid-bounds checking (out-of-range A1 refs are tolerated by Excel in
+    /// CF formulas — only cell-formula validation adds the bounds check).
+    /// </summary>
+    internal static void ValidateNoR1C1Reference(string formula)
     {
         if (string.IsNullOrEmpty(formula)) return;
-        var trimmed = formula.TrimStart('=');
-        // Strip string literals first ("...") so cell-like substrings inside
-        // strings don't trigger validation.
+        var stripped = StripFormulaStringLiterals(formula.TrimStart('='));
+        // Only unambiguous forms are rejected: bracketed offsets, or
+        // R<digits>C<digits> (never a legal A1 token or name). "RC1"/"RC"
+        // stay accepted — RC is a real A1 column / legal name.
+        if (System.Text.RegularExpressions.Regex.IsMatch(stripped,
+                @"(?<![A-Za-z0-9_$])(R\[-?\d+\]C(\[-?\d+\]|\d+)?|R\d*C\[-?\d+\]|R\d+C\d+)(?![A-Za-z0-9_])"))
+            throw new ArgumentException(
+                "Formula contains an R1C1-style reference (e.g. R2C3, RC[1]). OOXML stores formulas in A1 notation only — rewrite the reference in A1 form (e.g. C2, $B$3).");
+    }
+
+    // Blank out "..." string literals so cell-like substrings inside them
+    // don't trigger reference validation.
+    private static string StripFormulaStringLiterals(string trimmed)
+    {
         var sb = new System.Text.StringBuilder(trimmed.Length);
         bool inStr = false;
         for (int i = 0; i < trimmed.Length; i++)
@@ -124,18 +203,17 @@ public partial class ExcelHandler
             }
             sb.Append(inStr ? ' ' : c);
         }
-        var stripped = sb.ToString();
+        return sb.ToString();
+    }
 
-        // R1C1-style references (R2C3, RC[1], R[-1]C) are app-layer syntax —
-        // the OOXML <f> element is A1-only, and writing them verbatim makes
-        // real Excel refuse the file (0x800A03EC) while schema validation
-        // stays green. Only unambiguous forms are rejected: bracketed
-        // offsets, or R<digits>C<digits> (never a legal A1 token or name).
-        // "RC1"/"RC" stay accepted — RC is a real A1 column / legal name.
-        if (System.Text.RegularExpressions.Regex.IsMatch(stripped,
-                @"(?<![A-Za-z0-9_$])(R\[-?\d+\]C(\[-?\d+\]|\d+)?|R\d*C\[-?\d+\]|R\d+C\d+)(?![A-Za-z0-9_])"))
-            throw new ArgumentException(
-                "Formula contains an R1C1-style reference (e.g. R2C3, RC[1]). OOXML stores formulas in A1 notation only — rewrite the reference in A1 form (e.g. C2, $B$3).");
+    internal static void ValidateFormulaCellRefs(string formula)
+    {
+        if (string.IsNullOrEmpty(formula)) return;
+        var trimmed = formula.TrimStart('=');
+        var stripped = StripFormulaStringLiterals(trimmed);
+
+        // R1C1-style references make real Excel refuse the file.
+        ValidateNoR1C1Reference(formula);
         // Match A1-style refs: optional $ + 1-3 letters + optional $ + 1-8 digits.
         // (Excel's row ceiling 1048576 is 7-digit, but 8-digit numbers like
         // A10000000 must still be caught so they're rejected with the clean
@@ -356,9 +434,13 @@ public partial class ExcelHandler
             var name = m.Groups[1].Value.Replace("''", "'");
             if (!names.Contains(name)) return true;
         }
-        // Bare form: Name! — letters/digits/underscore/period (Excel allows these unquoted)
+        // Bare form: Name! — letters/digits/underscore/period (Excel allows these
+        // unquoted). '#' in the lookbehind excludes the #REF! ERROR literal
+        // (e.g. `=#REF!*2` after a row/col delete): that is a cell-level error
+        // marker, not a reference to a sheet named "REF" — classifying it as a
+        // missing sheet sent users hunting for a sheet that never existed.
         foreach (System.Text.RegularExpressions.Match m in
-                 System.Text.RegularExpressions.Regex.Matches(scan, @"(?<![A-Za-z0-9_'.])([A-Za-z_][A-Za-z0-9_.]*)!"))
+                 System.Text.RegularExpressions.Regex.Matches(scan, @"(?<![A-Za-z0-9_'.#])([A-Za-z_][A-Za-z0-9_.]*)!"))
         {
             if (!names.Contains(m.Groups[1].Value)) return true;
         }
@@ -412,6 +494,26 @@ public partial class ExcelHandler
         if (!ok)
             throw new ArgumentException(
                 $"Invalid sparkline range '{range}'. Expected an A1 range like A1:E1 (optionally sheet-qualified).");
+        // Grid-bounds check, same family as ValidateSqref: shape-valid B0 or
+        // A99999999 landed verbatim in <xne:f>. Excel tolerates rather than
+        // rejects these, but the sparkline is silently broken — tighten to
+        // the severity every other cell-ref entry point now enforces.
+        foreach (var tok in r.Split(':'))
+        {
+            var tm = System.Text.RegularExpressions.Regex.Match(tok.Trim(),
+                @"^([A-Za-z]{1,3})?(\d+)?$");
+            if (tm.Groups[1].Success && tm.Groups[1].Value.Length > 0)
+            {
+                var colIdx = ColumnNameToIndex(tm.Groups[1].Value.ToUpperInvariant());
+                if (colIdx < 1 || colIdx > 16384)
+                    throw new ArgumentException(
+                        $"Invalid sparkline range '{range}': column '{tm.Groups[1].Value}' is outside Excel's grid (A..XFD).");
+            }
+            if (tm.Groups[2].Success && tm.Groups[2].Value.Length > 0
+                && (!long.TryParse(tm.Groups[2].Value, out var rowN) || rowN < 1 || rowN > 1048576))
+                throw new ArgumentException(
+                    $"Invalid sparkline range '{range}': row '{tm.Groups[2].Value}' is outside Excel's grid (1..1048576).");
+        }
     }
 
     /// <summary>Sanity-check a defined-name body. Full formula validation is

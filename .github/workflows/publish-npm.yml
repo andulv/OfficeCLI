@@ -47,7 +47,9 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Upgrade npm (trusted publishing + provenance need >= 11.5.1)
-        run: npm install -g npm@latest
+        # Pinned to 11.x: npm 12.0.0 ships a broken provenance path
+        # ("Cannot find module 'sigstore'" in libnpmpublish). Unpin once fixed.
+        run: npm install -g npm@11
 
       - name: Resolve version
         id: ver

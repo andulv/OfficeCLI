@@ -160,7 +160,7 @@ internal static class OutputFormatter
     /// errors, batch had a failed step). For *probe* commands like
     /// `view --mode issues`, success stays true even when issues are listed —
     /// listing issues is the command's normal output, not a failure verdict.
-    /// See CLAUDE.md "JSON Envelope" for the per-command judgment table.
+    /// See the project conventions "JSON Envelope" for the per-command judgment table.
     /// </summary>
     public static string WrapEnvelope(string dataJson, List<CliWarning>? warnings = null, bool success = true)
     {

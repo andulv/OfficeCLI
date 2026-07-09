@@ -324,7 +324,11 @@ static partial class CommandBuilder
                 }
                 foreach (var p in stillUnsupported)
                 {
-                    var suggestion = SuggestPropertyScoped(p, suggestionScope);
+                    // An entry that already carries a handler-embedded hint
+                    // ("薪水 (no such column; available: …)") must not get a
+                    // generic did-you-mean stacked on top — the handler already
+                    // said what's valid. Mirrors CommandBuilder.FormatUnsupported.
+                    var suggestion = p.Contains('(') ? null : SuggestPropertyScoped(p, suggestionScope);
                     allWarnings.Add(new OfficeCli.Core.CliWarning
                     {
                         Message = suggestion != null ? $"Unsupported property: {p} (did you mean: {suggestion}?)" : $"Unsupported property: {p}",

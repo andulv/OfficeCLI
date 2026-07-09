@@ -240,7 +240,13 @@ internal static class GenericXmlQuery
                 var name = PathAliases.Resolve(part[..bracketIdx]);
                 var indexStr = part[(bracketIdx + 1)..^1];
                 if (!int.TryParse(indexStr, out var idx))
-                    throw new ArgumentException($"Invalid path index '{indexStr}' in segment '{part}'. Expected a numeric index.");
+                    // A predicate in the index slot (row[Score>0], row[not(V)])
+                    // means the caller reached the single-node path navigator
+                    // with a FILTER. get is one-node-by-path by contract;
+                    // point at the verbs that run the selector engine.
+                    throw new ArgumentException(AttributeFilter.IsContentFilterPath($"[{indexStr}]")
+                        ? $"'{part}' is a predicate, but this verb navigates by position and expects a numeric index (e.g. {part[..part.IndexOf('[')]}[2]). Predicates work on 'query' (read) and 'set'/'remove' (mutate matched elements)."
+                        : $"Invalid path index '{indexStr}' in segment '{part}'. Expected a numeric index.");
                 if (idx < 1)
                     throw new ArgumentException($"Invalid path index '{idx}' in segment '{part}'. Index must be >= 1.");
                 segments.Add((name, idx));

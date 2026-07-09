@@ -284,6 +284,29 @@ public partial class ExcelHandler
         return value.StartsWith("#") ? value.Substring(1) : value;
     }
 
+    /// <summary>
+    /// Instance-aware internal-hyperlink resolution: everything
+    /// <see cref="TryParseInternalHyperlinkLocation"/> accepts, plus a bare
+    /// token that names an existing workbook defined name. Without the
+    /// defined-name check, link=MyRange fell through to the external-URL
+    /// path and produced a relationship targeting the literal string
+    /// "MyRange" — a hyperlink that tries to open a file of that name.
+    /// A '#'-prefixed defined name (#MyRange) also resolves here.
+    /// </summary>
+    private string? ResolveInternalHyperlinkLocation(string value)
+    {
+        var loc = TryParseInternalHyperlinkLocation(value);
+        if (loc != null) return loc;
+        if (string.IsNullOrEmpty(value)) return null;
+        var bare = value.StartsWith('#') ? value[1..] : value;
+        if (!System.Text.RegularExpressions.Regex.IsMatch(bare, @"^[\p{L}_\\][\p{L}\p{N}_.\\]*$"))
+            return null;
+        var isDefinedName = GetWorkbook().GetFirstChild<DefinedNames>()?
+            .Elements<DefinedName>()
+            .Any(d => d.Name?.Value?.Equals(bare, StringComparison.OrdinalIgnoreCase) == true) == true;
+        return isDefinedName ? bare : null;
+    }
+
     private static bool IsTextNumberFormat(Dictionary<string, string> styleProps)
     {
         foreach (var key in new[] { "numberformat", "numfmt", "format" })

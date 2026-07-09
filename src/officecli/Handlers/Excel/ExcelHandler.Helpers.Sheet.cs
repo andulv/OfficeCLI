@@ -89,7 +89,16 @@ public partial class ExcelHandler
     /// Sheet1!A:A → /Sheet1/col[A]   (whole column)
     /// Paths already starting with '/' are returned unchanged.
     /// </summary>
-    internal static string NormalizeExcelPath(string path)
+    // Excel-quoted sheet name: 'My Data (2024)'!A1 — strip one pair of single
+    // quotes and un-double embedded quotes ('It''s'!A1 → It's). Excel REQUIRES
+    // the quoted form for names with spaces/punctuation, so refs pasted from
+    // formulas arrive quoted. Unquoted names pass through unchanged.
+    internal static string UnquoteSheetName(string s)
+        => s.Length >= 2 && s[0] == '\'' && s[^1] == '\''
+            ? s[1..^1].Replace("''", "'")
+            : s;
+
+    internal string NormalizeExcelPath(string path)
     {
         // Reject malformed segment separators that previously slipped past
         // the regex matchers and exposed raw OOXML local names. DOCX already
@@ -100,16 +109,47 @@ public partial class ExcelHandler
             throw new ArgumentException($"Invalid path '{path}': leading '//' is not allowed.");
         if (path.Contains("//"))
             throw new ArgumentException($"Invalid path '{path}': empty path segment ('//') is not allowed.");
-        // Handle "/Sheet1!A1" — strip leading '/' when '!' is present so native notation is parsed correctly
+        // Handle "/Sheet1!A1" — strip leading '/' when '!' is present so native
+        // notation is parsed correctly. EXCEPT when the first slash segment
+        // names an existing sheet: '!' is legal inside a sheet NAME (Excel
+        // forbids only : \ / ? * [ ]), and reinterpreting "/Q1!Results" as
+        // bang notation made such a sheet permanently unaddressable.
         if (path.StartsWith('/') && path.Contains('!'))
-            path = path[1..];
+        {
+            var seg0 = path[1..];
+            var seg0Slash = seg0.IndexOf('/');
+            var first = seg0Slash < 0 ? seg0 : seg0[..seg0Slash];
+            if (!GetWorksheets().Any(w => w.Name.Equals(first, StringComparison.OrdinalIgnoreCase)))
+                path = path[1..];
+        }
         if (path.Equals("/workbook", StringComparison.OrdinalIgnoreCase)) return "/";
         if (path.StartsWith('/')) return path;
-        var bang = path.IndexOf('!');
-        if (bang > 0)
+        // Excel-quoted sheet ref: 'My Data'!A1 — the '!' separator is the one
+        // FOLLOWING the closing quote (the name itself may contain '!').
+        string? qSheet = null; var rest = "";
+        if (path.StartsWith('\''))
         {
-            var sheet = path[..bang];
-            var selector = path[(bang + 1)..];
+            int qi = 1;
+            while (qi < path.Length)
+            {
+                if (path[qi] == '\'')
+                {
+                    if (qi + 1 < path.Length && path[qi + 1] == '\'') { qi += 2; continue; }
+                    break;
+                }
+                qi++;
+            }
+            if (qi < path.Length - 1 && path[qi + 1] == '!')
+            {
+                qSheet = UnquoteSheetName(path[..(qi + 1)]);
+                rest = path[(qi + 2)..];
+            }
+        }
+        var bang = qSheet != null ? 0 : path.IndexOf('!');
+        if (qSheet != null || bang > 0)
+        {
+            var sheet = qSheet ?? path[..bang];
+            var selector = qSheet != null ? rest : path[(bang + 1)..];
 
             // Whole-row notation: "1:1" or "3:3"
             var wholeRow = System.Text.RegularExpressions.Regex.Match(selector, @"^(\d+):\1$");
@@ -171,6 +211,11 @@ public partial class ExcelHandler
         // (e.g. a SUMIFS authored before its data was imported). Runs before the
         // dirty-part flush so cells it touches are picked up by the loop below.
         RefreshStaleFormulaCaches();
+        // Re-seed chart numCache/strCache from current cell values so offline
+        // consumers (dump/batch, view html) don't read stale series data and
+        // dump→replay stays idempotent. Runs after the formula sweep so charts
+        // referencing formula cells see the reconciled values.
+        RefreshStaleChartCaches();
         foreach (var part in _dirtyWorksheets)
         {
             ReorderWorksheetChildren(GetSheet(part));

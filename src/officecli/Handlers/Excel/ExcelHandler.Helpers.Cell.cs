@@ -17,10 +17,11 @@ public partial class ExcelHandler
 {
 
     // Map a table-column totals-row function token to its OOXML enum and the
-    // SUBTOTAL function code Excel uses. Unknown tokens fall back to SUM (109)
-    // — previously all non-"sum" tokens silently became SUM; this keeps the
-    // same fallback for unknown tokens but routes known ones to the right
-    // enum + SUBTOTAL code.
+    // SUBTOTAL function code Excel uses. Unknown tokens throw — the earlier
+    // SUM fallback silently changed the aggregation the user asked for
+    // (silent-accept enum-miss family). Every token the dump emitter can
+    // produce (TotalsRowFunction InnerText, lowercased) is enumerated below,
+    // so dump→batch replay never hits the throw.
     internal static (TotalsRowFunctionValues, int) MapTotalsRowFunction(string tok) => tok switch
     {
         "sum" => (TotalsRowFunctionValues.Sum, 109),
@@ -33,7 +34,8 @@ public partial class ExcelHandler
         "var" or "variance" => (TotalsRowFunctionValues.Variance, 110),
         "none" or "label" or "" => (TotalsRowFunctionValues.None, 0),
         "custom" => (TotalsRowFunctionValues.Custom, 109),
-        _ => (TotalsRowFunctionValues.Sum, 109)
+        _ => throw new ArgumentException(
+            $"Unknown totals-row function '{tok}'. Valid: sum, average, count, countNums, max, min, stdDev, var, none, custom.")
     };
 
     private string GetCellDisplayValue(Cell cell, Core.FormulaEvaluator? evaluator = null)
@@ -105,6 +107,25 @@ public partial class ExcelHandler
         return value;
     }
 
+    // Underlying stored value for COMPARISON, as opposed to GetCellDisplayValue's
+    // formatted string. A percentage cell compares as 0.5 (not "50%") and a date
+    // as its serial (not "2024-01-15"), so `row[Pct>0.3]` / `row[Hired>45000]`
+    // evaluate against the real number instead of the display text. Non-numeric
+    // cells (text, shared strings, formula results, sentinels) are identical to
+    // the display path, so equality on a formatted literal still works.
+    private string GetCellRawComparisonValue(Cell cell, Core.FormulaEvaluator? evaluator = null)
+    {
+        if (cell.DataType == null)
+        {
+            var raw = cell.CellValue?.Text;
+            if (!string.IsNullOrEmpty(raw) && double.TryParse(raw,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture, out _))
+                return raw;
+        }
+        return GetCellDisplayValue(cell, evaluator);
+    }
+
     private static bool IsCellInMergeRange(string cellRef, string? rangeRef)
     {
         if (string.IsNullOrEmpty(rangeRef) || !rangeRef.Contains(':')) return false;
@@ -123,8 +144,15 @@ public partial class ExcelHandler
     private static bool RangesOverlap(string rangeA, string rangeB)
     {
         if (string.IsNullOrEmpty(rangeA) || string.IsNullOrEmpty(rangeB)) return false;
-        var (a1, a2) = SplitRange(rangeA);
-        var (b1, b2) = SplitRange(rangeB);
+        // Whole-column (A:A) and whole-row (1:3) tokens are legal sqref
+        // members (ValidateSqref admits them), but ParseCellReference below
+        // rejects a bare "A"/"1" — a second dataValidation Add on a sheet
+        // holding any whole-row/col range threw even when geometrically
+        // disjoint. Expand them to explicit rectangles first.
+        var expandedA = ExpandWholeRowColRange(rangeA);
+        var expandedB = ExpandWholeRowColRange(rangeB);
+        var (a1, a2) = SplitRange(expandedA);
+        var (b1, b2) = SplitRange(expandedB);
         var (aSc, aSr) = ParseCellReference(a1);
         var (aEc, aEr) = ParseCellReference(a2);
         var (bSc, bSr) = ParseCellReference(b1);
@@ -137,6 +165,41 @@ public partial class ExcelHandler
         if (aSr > aEr) (aSr, aEr) = (aEr, aSr);
         if (bSr > bEr) (bSr, bEr) = (bEr, bSr);
         return aSci <= bEci && bSci <= aEci && aSr <= bEr && bSr <= aEr;
+    }
+
+    /// <summary>
+    /// Canonicalize an inverted CELL:CELL range (D5:A1 → A1:D5, per axis).
+    /// Well-formed input passes through untouched (keeps $ anchors);
+    /// inverted input is rebuilt without $ (matching the printArea rule).
+    /// </summary>
+    internal static string NormalizeA1Range(string range)
+    {
+        var nm = System.Text.RegularExpressions.Regex.Match(range.Trim(),
+            @"^\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!nm.Success) return range;
+        var nc1 = ColumnNameToIndex(nm.Groups[1].Value.ToUpperInvariant());
+        var nc2 = ColumnNameToIndex(nm.Groups[3].Value.ToUpperInvariant());
+        var nr1 = long.Parse(nm.Groups[2].Value);
+        var nr2 = long.Parse(nm.Groups[4].Value);
+        if (nc1 <= nc2 && nr1 <= nr2) return range;
+        var colA = nc1 <= nc2 ? nm.Groups[1].Value : nm.Groups[3].Value;
+        var colB = nc1 <= nc2 ? nm.Groups[3].Value : nm.Groups[1].Value;
+        return $"{colA}{Math.Min(nr1, nr2)}:{colB}{Math.Max(nr1, nr2)}";
+    }
+
+    // A:A → A1:A1048576, 1:3 → A1:XFD3. Non-whole ranges pass through.
+    private static string ExpandWholeRowColRange(string range)
+    {
+        var wm = System.Text.RegularExpressions.Regex.Match(range.Trim(),
+            @"^\$?([A-Z]+)\$?:\$?([A-Z]+)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (wm.Success)
+            return $"{wm.Groups[1].Value}1:{wm.Groups[2].Value}1048576";
+        var rm = System.Text.RegularExpressions.Regex.Match(range.Trim(),
+            @"^\$?([0-9]+)\$?:\$?([0-9]+)$");
+        if (rm.Success)
+            return $"A{rm.Groups[1].Value}:XFD{rm.Groups[2].Value}";
+        return range;
     }
 
     private static (string, string) SplitRange(string range)
@@ -230,7 +293,36 @@ public partial class ExcelHandler
                 }
             }
         }
+        // Advisory only — a multi-million-cell merge is legal OOXML and
+        // validates green, but real Excel stalls for minutes opening it
+        // (empirically: 16384x1 renders in seconds; 1024x100000 hangs past
+        // a 120s render timeout). Warn so the caller knows the file may be
+        // unusable in practice; do not reject (lenient-input convention).
+        if (TryParseRangeDims(refUpper, out var mergeRows, out var mergeCols)
+            && (long)mergeRows * mergeCols > 10_000_000)
+        {
+            Console.Error.WriteLine(
+                $"Warning: merge range '{refUpper}' spans {(long)mergeRows * mergeCols:N0} cells; " +
+                "real Excel can hang for minutes opening merges this large.");
+        }
         mergeCells.AppendChild(new MergeCell { Reference = refUpper });
+    }
+
+    private static bool TryParseRangeDims(string range, out int rows, out int cols)
+    {
+        rows = cols = 0;
+        var dimParts = range.Split(':');
+        if (dimParts.Length != 2) return false;
+        var m1 = System.Text.RegularExpressions.Regex.Match(dimParts[0], @"^([A-Z]+)(\d+)$");
+        var m2 = System.Text.RegularExpressions.Regex.Match(dimParts[1], @"^([A-Z]+)(\d+)$");
+        if (!m1.Success || !m2.Success) return false;
+        var c1 = ColumnNameToIndex(m1.Groups[1].Value);
+        var c2 = ColumnNameToIndex(m2.Groups[1].Value);
+        var r1 = int.Parse(m1.Groups[2].Value);
+        var r2 = int.Parse(m2.Groups[2].Value);
+        rows = Math.Abs(r2 - r1) + 1;
+        cols = Math.Abs(c2 - c1) + 1;
+        return true;
     }
 
     private DocumentNode GetCellRange(string sheetName, SheetData sheetData, string range, int depth, WorksheetPart? part = null)

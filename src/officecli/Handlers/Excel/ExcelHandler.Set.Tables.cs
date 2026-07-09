@@ -43,13 +43,57 @@ public partial class ExcelHandler
         {
             switch (key.ToLowerInvariant())
             {
-                case "ref":
-                    // Same guard as AddNamedRange: sheet-qualified refs must
-                    // name an existing sheet with a plausible range.
-                    ValidateDefinedNameRef(value);
-                    dn.Text = value;
+                // refersTo / formula: the schema documents them as ref aliases
+                // for add/set/get and Add honors them — Set alone rejected the
+                // aliases as unsupported.
+                case "ref" or "refersto" or "formula":
+                {
+                    // Same guards as AddNamedRange: sheet-qualified refs must
+                    // name an existing sheet, and a bare A1 range without a
+                    // sheet qualifier is invalid in a defined-name body (real
+                    // Excel refuses the file, 0x800A03EC). Qualify with the
+                    // scope sheet when the name is sheet-scoped.
+                    var nrRefVal = value;
+                    // Match Add: defined-name bodies must not carry the
+                    // formula-bar leading '=' (Excel rejects the file).
+                    if (nrRefVal.StartsWith('=')) nrRefVal = nrRefVal.TrimStart('=');
+                    if (!nrRefVal.Contains('!')
+                        && Regex.IsMatch(nrRefVal.Replace("$", ""), @"^[A-Za-z]{1,3}\d+(:[A-Za-z]{1,3}\d+)?$"))
+                    {
+                        var scopeSheetName = dn.LocalSheetId?.HasValue == true
+                            ? workbook.GetFirstChild<Sheets>()?.Elements<Sheet>()
+                                .ElementAtOrDefault((int)dn.LocalSheetId!.Value)?.Name?.Value
+                            : null;
+                        if (scopeSheetName == null)
+                            throw new ArgumentException(
+                                $"Defined-name ref '{nrRefVal}' has no sheet qualifier — Excel refuses unqualified " +
+                                "cell ranges in defined names. Use ref=SheetName!A1:B1.");
+                        nrRefVal = $"{Core.ModernFunctionQualifier.QuoteSheetNameForRef(scopeSheetName)}!{nrRefVal}";
+                    }
+                    ValidateDefinedNameRef(nrRefVal);
+                    dn.Text = nrRefVal;
                     break;
-                case "name": dn.Name = value; break;
+                }
+                case "name":
+                    // CONSISTENCY(remove-refs): renaming a defined name breaks
+                    // every formula/DV/CF/chart still referencing the old name
+                    // (Excel surfaces #NAME?). Mirror the table-remove guard —
+                    // scan the workbook and refuse the rename if the old name is
+                    // still referenced, rather than silently orphaning them.
+                    {
+                        var oldName = dn.Name?.Value;
+                        if (!string.IsNullOrEmpty(oldName)
+                            && !string.Equals(oldName, value, StringComparison.Ordinal))
+                        {
+                            var dnRefs = FindDefinedNameReferences(oldName!);
+                            if (dnRefs.Count > 0)
+                                throw new ArgumentException(
+                                    $"Cannot rename named range '{oldName}': it is referenced by {string.Join(", ", dnRefs)}. " +
+                                    $"Repoint those references first.");
+                        }
+                    }
+                    dn.Name = value;
+                    break;
                 case "comment": dn.Comment = value; break;
                 case "volatile":
                     // CONSISTENCY(definedname-volatile): map to the
@@ -82,6 +126,48 @@ public partial class ExcelHandler
         return nrUnsupported;
     }
 
+    /// <summary>
+    /// Scan the whole workbook for references to a defined name: cell formulas,
+    /// data-validation and conditional-formatting formulas, and chart XML.
+    /// Returns a distinct list of human-readable locations (empty when unused).
+    /// </summary>
+    private List<string> FindDefinedNameReferences(string name)
+    {
+        var refs = new List<string>();
+        var wbPart = _doc.WorkbookPart;
+        if (wbPart == null) return refs;
+        var pattern = @"\b" + Regex.Escape(name) + @"\b";
+        foreach (var wsp in wbPart.WorksheetParts)
+        {
+            if (wsp.Worksheet is null) continue;
+            var wsName = wbPart.Workbook?.Sheets?.Elements<Sheet>()
+                .FirstOrDefault(s => s.Id?.Value == wbPart.GetIdOfPart(wsp))?.Name?.Value ?? "?";
+            foreach (var fcell in wsp.Worksheet.Descendants<Cell>())
+            {
+                var f = fcell.CellFormula?.Text;
+                if (!string.IsNullOrEmpty(f) && Regex.IsMatch(f, pattern, RegexOptions.IgnoreCase))
+                    refs.Add($"{wsName}!{fcell.CellReference?.Value ?? "?"}");
+            }
+            foreach (var f1 in wsp.Worksheet.Descendants<Formula1>())
+                if (!string.IsNullOrEmpty(f1.Text) && Regex.IsMatch(f1.Text, pattern, RegexOptions.IgnoreCase))
+                    refs.Add($"{wsName} (data validation)");
+            foreach (var f2 in wsp.Worksheet.Descendants<Formula2>())
+                if (!string.IsNullOrEmpty(f2.Text) && Regex.IsMatch(f2.Text, pattern, RegexOptions.IgnoreCase))
+                    refs.Add($"{wsName} (data validation)");
+            foreach (var cf in wsp.Worksheet.Descendants<Formula>())
+                if (!string.IsNullOrEmpty(cf.Text) && Regex.IsMatch(cf.Text, pattern, RegexOptions.IgnoreCase))
+                    refs.Add($"{wsName} (conditional formatting)");
+            if (wsp.DrawingsPart != null)
+                foreach (var cp in wsp.DrawingsPart.ChartParts)
+                {
+                    var xml = cp.ChartSpace?.InnerXml;
+                    if (xml != null && Regex.IsMatch(xml, pattern, RegexOptions.IgnoreCase))
+                        refs.Add($"{wsName} (chart)");
+                }
+        }
+        return refs.Distinct().ToList();
+    }
+
     private List<string> SetValidationByPath(Match m, WorksheetPart worksheet, Dictionary<string, string> properties)
     {
         var dvIdx = int.Parse(m.Groups[1].Value);
@@ -100,10 +186,13 @@ public partial class ExcelHandler
             switch (key.ToLowerInvariant())
             {
                 // CONSISTENCY(canonical-key): schema canonical key is 'ref';
-                // 'sqref' retained as legacy alias.
+                // 'sqref' retained as legacy alias. Same shape+grid-bounds
+                // guard as Add — an unchecked A0 saved fine and real Excel
+                // refused the file (0x800A03EC).
                 case "sqref" or "ref":
+                    var dvNormRef = ValidateSqref(value, "validation ref");
                     dv.SequenceOfReferences = new ListValue<StringValue>(
-                        value.Split(' ').Select(s => new StringValue(s)));
+                        dvNormRef.Split(' ').Select(s => new StringValue(s)));
                     break;
                 case "type":
                     dv.Type = value.ToLowerInvariant() switch
@@ -123,9 +212,13 @@ public partial class ExcelHandler
                     // as Add so range refs (C1:C3, Sheet1!A1:A3) are NOT double-quoted.
                     // Previous code only checked !value.StartsWith("\""), which incorrectly
                     // wrapped range refs that pass through unchanged in Add.
+                    if (dv.Type?.Value != DataValidationValues.List)
+                        ValidateNoR1C1Reference(value);
                     dv.Formula1 = new Formula1(NormalizeValidationFormula(value, dv.Type?.Value));
                     break;
                 case "formula2":
+                    if (dv.Type?.Value != DataValidationValues.List)
+                        ValidateNoR1C1Reference(value);
                     dv.Formula2 = new Formula2(NormalizeValidationFormula(value, dv.Type?.Value));
                     break;
                 case "operator":
@@ -178,7 +271,7 @@ public partial class ExcelHandler
     }
 
     // Replace backing embedded part + refresh ProgID. Cleans up the old payload
-    // part (CLAUDE.md Known API Quirks rule: always delete the old part on src
+    // part (the project conventions Known API Quirks rule: always delete the old part on src
 
     private List<string> SetTableColumnByPath(Match m, WorksheetPart worksheet, Dictionary<string, string> properties)
     {
@@ -272,8 +365,38 @@ public partial class ExcelHandler
             {
                 case "name": table.Name = value; break;
                 case "displayname": table.DisplayName = value; break;
-                case "headerrow": table.HeaderRowCount = IsTruthy(value) ? 1u : 0u; break;
+                case "headerrow":
+                {
+                    // A table autoFilter filters BY the header row; Excel
+                    // writes no <autoFilter> when headerRowCount="0" and
+                    // rejects the file outright (0x800A03EC) if a stale one
+                    // is left behind — schema validation stays green, so this
+                    // must be handled here, not caught downstream.
+                    var headerOn = IsTruthy(value);
+                    table.HeaderRowCount = headerOn ? 1u : 0u;
+                    var existingAf = table.GetFirstChild<AutoFilter>();
+                    if (!headerOn)
+                    {
+                        existingAf?.Remove();
+                    }
+                    else if (existingAf == null && table.Reference?.Value is { } tblRef)
+                    {
+                        // Re-enable: restore the filter over the data range
+                        // (header..last data row, excluding a totals row),
+                        // mirroring AddTable.
+                        var afRef = tblRef;
+                        if ((table.TotalsRowCount?.Value ?? 0) > 0 && tblRef.Contains(':'))
+                        {
+                            var afParts = tblRef.Split(':');
+                            var (aCol, aRow) = ParseCellReference(afParts[1]);
+                            afRef = $"{afParts[0]}:{aCol}{aRow - 1}";
+                        }
+                        table.InsertAt(new AutoFilter { Reference = afRef }, 0);
+                    }
+                    break;
+                }
                 case "totalrow":
+                case "totalsrow":   // Excel UI calls it "Total Row"; the plural slips in
                 case "showtotals":
                 {
                     // CONSISTENCY(table-totalrow): mirror Add — toggling
@@ -498,12 +621,27 @@ public partial class ExcelHandler
                 case var k1 when k1.StartsWith("font."):
                     break;
                 case "ref":
+                {
                     // Validate as a real A1 reference (same check add uses):
                     // an arbitrary string here passes schema validation but
                     // real Excel refuses the whole file (0x800A03EC).
                     ParseCellReference(value);
+                    var oldCmtRef = cmtElement.Reference?.Value;
                     cmtElement.Reference = value.ToUpperInvariant();
+                    // The legacy VML shape anchors the comment popup by its
+                    // own x:Row/x:Column — leaving them at the old cell after
+                    // a ref move desynchronizes the two parts and real Excel
+                    // rejects the file (0x800A03EC) while validation stays
+                    // green. Keep the VML in lockstep.
+                    if (!string.IsNullOrEmpty(oldCmtRef)
+                        && !string.Equals(oldCmtRef, cmtElement.Reference!.Value, StringComparison.OrdinalIgnoreCase)
+                        && !UpdateCommentVmlShapeRef(worksheet, oldCmtRef!, cmtElement.Reference!.Value!))
+                        Console.Error.WriteLine(
+                            "Warning: comment moved to " + cmtElement.Reference!.Value
+                            + " but the legacy VML shape anchor could not be located; "
+                            + "the comment popup may still point at the old cell.");
                     break;
+                }
                 case "author":
                     var authors = commentsPart.Comments.GetFirstChild<Authors>()!;
                     var existingAuthors = authors.Elements<Author>().ToList();
@@ -676,6 +814,8 @@ public partial class ExcelHandler
                 case "value1":
                 {
                     // formula1: the comparison threshold for a cellIs rule.
+                    // A1-only element — reject R1C1 (mirrors Add.Cf.cs).
+                    ValidateNoR1C1Reference(value);
                     var f1 = rule?.GetFirstChild<Formula>();
                     if (f1 != null) f1.Text = value;
                     else if (rule != null) rule.InsertAt(new Formula(value), 0);
@@ -685,7 +825,8 @@ public partial class ExcelHandler
                 case "value2":
                 case "formula2":
                 {
-                    // formula2: upper bound for between/notBetween.
+                    // formula2: upper bound for between/notBetween. A1-only.
+                    ValidateNoR1C1Reference(value);
                     var formulas = rule?.Elements<Formula>().ToList();
                     if (formulas != null && formulas.Count >= 2) formulas[1].Text = value;
                     else if (formulas != null && formulas.Count == 1) rule!.InsertAfter(new Formula(value), formulas[0]);

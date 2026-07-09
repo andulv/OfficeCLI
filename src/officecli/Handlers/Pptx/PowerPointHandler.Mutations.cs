@@ -661,7 +661,7 @@ public partial class PowerPointHandler
             // this slide. Also deletes the backing embedded part and the
             // icon image part so the package doesn't bloat with orphaned
             // binaries — same rationale as the picture-replacement quirk
-            // noted in CLAUDE.md.
+            // noted in the project conventions.
             var oleFrames = shapeTree.Elements<GraphicFrame>()
                 .Where(gf => gf.Descendants<DocumentFormat.OpenXml.Presentation.OleObject>().Any())
                 .ToList();

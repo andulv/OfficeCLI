@@ -17,6 +17,37 @@ namespace OfficeCli.Handlers;
 // Per-element-type Add helpers for drawing/anchor paths (ole, picture, shape, slicer, sparkline). Mechanically extracted from the Add() god-method.
 public partial class ExcelHandler
 {
+    /// <summary>
+    /// Allocate the next legacy-VML shape id for a worksheet. OLE objects and
+    /// comments both live in the same <c>_x0000_s{N}</c> namespace inside a
+    /// single VmlDrawingPart, so a colliding id corrupts the file. Scans every
+    /// OleObject.ShapeId and every <c>_x0000_s(N)</c> token in the VML part and
+    /// returns max+1 (never below Excel's conventional 1025 base).
+    /// </summary>
+    private uint AllocateNextVmlShapeId(WorksheetPart worksheet)
+    {
+        uint max = 1024;
+        foreach (var ole in GetSheet(worksheet).Descendants<OleObject>())
+            if (ole.ShapeId?.HasValue == true && ole.ShapeId.Value > max)
+                max = ole.ShapeId.Value;
+        var vmlPart = worksheet.VmlDrawingParts.FirstOrDefault();
+        if (vmlPart != null)
+        {
+            try
+            {
+                string xml;
+                using (var reader = new System.IO.StreamReader(
+                    vmlPart.GetStream(System.IO.FileMode.Open, System.IO.FileAccess.Read)))
+                    xml = reader.ReadToEnd();
+                foreach (Match sm in Regex.Matches(xml, @"_x0000_s(\d+)"))
+                    if (uint.TryParse(sm.Groups[1].Value, out var id) && id > max)
+                        max = id;
+            }
+            catch { }
+        }
+        return max + 1;
+    }
+
     private string AddOle(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
     {
         var index = position?.Index;
@@ -102,10 +133,13 @@ public partial class ExcelHandler
             // ColumnNameToIndex returns 1-based, so subtract 1 here.
             oleFromCol = ColumnNameToIndex(m.Groups[1].Value) - 1;
             oleFromRow = int.Parse(m.Groups[2].Value) - 1;
+            ValidateAnchorCell(oleFromCol, oleFromRow, oleAnchorStr.Split(':')[0]);
             if (m.Groups[3].Success)
             {
                 oleToCol = ColumnNameToIndex(m.Groups[3].Value) - 1;
                 oleToRow = int.Parse(m.Groups[4].Value) - 1;
+                ValidateAnchorCell(oleToCol, oleToRow, oleAnchorStr.Split(':')[1]);
+                NormalizeAnchorRect(ref oleFromCol, ref oleFromRow, ref oleToCol, ref oleToRow);
             }
             else
             {
@@ -136,10 +170,12 @@ public partial class ExcelHandler
         //    logic — Excel 2010+ renders from objectPr/anchor anyway.
         var oleVmlPart = oleWorksheet.VmlDrawingParts.FirstOrDefault()
             ?? oleWorksheet.AddNewPart<VmlDrawingPart>();
-        // Allocate a unique shapeId per worksheet (1025+N is the
-        // conventional Excel starting point for legacy VML shapes).
-        var existingOleCount = GetSheet(oleWorksheet).Descendants<OleObject>().Count();
-        uint oleShapeId = (uint)(1025 + existingOleCount);
+        // Allocate a unique shapeId per worksheet by scanning existing
+        // OleObject shapeIds and every _x0000_s(N) in the companion VML part
+        // (comments share the same id namespace), then taking max+1. A plain
+        // count of live OLE objects collides after a remove: the count falls
+        // back so a new object reuses a surviving object's shapeId.
+        uint oleShapeId = AllocateNextVmlShapeId(oleWorksheet);
         EnsureExcelVmlShapeForOle(oleVmlPart, oleShapeId, oleFromCol, oleFromRow, oleToCol, oleToRow);
 
         // Ensure worksheet references the VML drawing part.
@@ -342,6 +378,10 @@ public partial class ExcelHandler
         // the rendered size stay in sync.
         if (picAnchorMode is "onecell" or "absolute")
         {
+            // <xdr:ext>/<xdr:pos> are Int32-bounded EMU; oversized values
+            // save fine but real Excel rejects the file (0x800A03EC).
+            ValidateDrawingCoordEmu(pwEmu, "width");
+            ValidateDrawingCoordEmu(phEmu, "height");
             var picXfrm = picShape.Descendants<Drawing.Transform2D>().FirstOrDefault();
             if (picXfrm != null)
             {
@@ -379,9 +419,9 @@ public partial class ExcelHandler
                 // syntax as width/height (bare EMU, or "1in", "2cm").
                 long absX = 0, absY = 0;
                 if (properties.TryGetValue("x", out var absXs))
-                    absX = OfficeCli.Core.EmuConverter.ParseEmu(absXs);
+                    absX = ValidateDrawingCoordEmu(OfficeCli.Core.EmuConverter.ParseEmu(absXs), "x");
                 if (properties.TryGetValue("y", out var absYs))
-                    absY = OfficeCli.Core.EmuConverter.ParseEmu(absYs);
+                    absY = ValidateDrawingCoordEmu(OfficeCli.Core.EmuConverter.ParseEmu(absYs), "y");
                 var absAnchor = new XDR.AbsoluteAnchor(
                     new XDR.Position { X = absX, Y = absY },
                     new XDR.Extent { Cx = pwEmu, Cy = phEmu },
@@ -573,6 +613,13 @@ public partial class ExcelHandler
         OfficeCli.Core.ParseHelpers.ValidateXmlText(shpText, "shape text");
         var shpName = properties.GetValueOrDefault("name", "");
 
+        // Atomicity: a validating throw further down (valign/align/underline/
+        // preset/…) used to leave the just-created first-on-sheet DrawingsPart
+        // and its <x:drawing> reference orphaned on disk despite exit 1. Roll
+        // them back if this call is what created them.
+        var shpDrawingsPartWasAbsent = shpWorksheet.DrawingsPart == null;
+        try
+        {
         var shpDrawingsPart = shpWorksheet.DrawingsPart
             ?? shpWorksheet.AddNewPart<DrawingsPart>();
 
@@ -744,7 +791,8 @@ public partial class ExcelHandler
                     "true" or "single" or "sng" => Drawing.TextUnderlineValues.Single,
                     "double" or "dbl" => Drawing.TextUnderlineValues.Double,
                     "none" or "false" => Drawing.TextUnderlineValues.None,
-                    _ => Drawing.TextUnderlineValues.Single
+                    _ => throw new ArgumentException(
+                        $"Unknown underline value '{shpUnder}'. Valid: single, double, none (true/false).")
                 };
             }
 
@@ -800,7 +848,10 @@ public partial class ExcelHandler
                 {
                     "center" or "c" or "ctr" => Drawing.TextAlignmentTypeValues.Center,
                     "right" or "r" => Drawing.TextAlignmentTypeValues.Right,
-                    _ => Drawing.TextAlignmentTypeValues.Left
+                    "left" or "l" => Drawing.TextAlignmentTypeValues.Left,
+                    "justify" or "just" => Drawing.TextAlignmentTypeValues.Justified,
+                    _ => throw new ArgumentException(
+                        $"Unknown align value '{shpAlign}'. Valid: left, center, right, justify.")
                 };
             }
 
@@ -844,6 +895,16 @@ public partial class ExcelHandler
         var shpIdx = PathIndex.FromArrayIndex(shpAnchors.IndexOf(shpAnchor));
 
         return $"/{shpSheetName}/shape[{shpIdx}]";
+        }
+        catch when (shpDrawingsPartWasAbsent)
+        {
+            // Remove the orphan DrawingsPart + <x:drawing> ref this failed
+            // call created, so exit 1 leaves the sheet unchanged.
+            GetSheet(shpWorksheet).GetFirstChild<DocumentFormat.OpenXml.Spreadsheet.Drawing>()?.Remove();
+            if (shpWorksheet.DrawingsPart != null) shpWorksheet.DeletePart(shpWorksheet.DrawingsPart);
+            SaveWorksheet(shpWorksheet);
+            throw;
+        }
     }
 
     private string AddSlicer(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
@@ -957,7 +1018,9 @@ public partial class ExcelHandler
             {
                 "span" => X14.DisplayBlanksAsValues.Span,
                 "zero" => X14.DisplayBlanksAsValues.Zero,
-                _ => X14.DisplayBlanksAsValues.Gap,
+                "gap" => X14.DisplayBlanksAsValues.Gap,
+                _ => throw new ArgumentException(
+                    $"Unknown displayEmptyCellsAs value '{deca}'. Valid: gap, span, zero."),
             };
         }
         if (properties.TryGetValue("displayxaxis", out var dxa) && ParseHelpers.IsTruthy(dxa))

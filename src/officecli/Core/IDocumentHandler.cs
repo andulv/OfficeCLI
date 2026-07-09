@@ -40,6 +40,22 @@ public class InsertPosition
 }
 
 /// <summary>
+/// Shared guard for handlers that do not support the `view text --range`
+/// cell-range subset (docx/pptx/plugins). Kept next to the interface so the
+/// error text stays identical across handlers.
+/// </summary>
+public static class ViewRangeGuard
+{
+    public static void RejectTextRange(string? range, string format)
+    {
+        if (range == null) return;
+        throw new CliException(
+            $"--range on view text is only supported for xlsx (cell ranges like 'Sheet1!A1:C10'). For {format}, use --start/--end to bound the output.")
+        { Code = "invalid_value" };
+    }
+}
+
+/// <summary>
 /// Common interface for all document types (Word/Excel/PowerPoint).
 /// Each handler implements the three-layer architecture:
 ///   - Semantic layer: view (text/annotated/outline/stats/issues)
@@ -49,7 +65,9 @@ public class InsertPosition
 public interface IDocumentHandler : IDisposable
 {
     // === Semantic Layer ===
-    string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null);
+    // range: xlsx-only cell-range subset ('Sheet1!A1:C10' or '/Sheet1/A1:C10');
+    // docx/pptx throw invalid_value when non-null (use --start/--end there).
+    string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null);
     string ViewAsAnnotated(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null);
     string ViewAsOutline();
     string ViewAsStats();
@@ -57,7 +75,7 @@ public interface IDocumentHandler : IDisposable
     // === Structured JSON variants (for --json mode) ===
     System.Text.Json.Nodes.JsonNode ViewAsStatsJson();
     System.Text.Json.Nodes.JsonNode ViewAsOutlineJson();
-    System.Text.Json.Nodes.JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null);
+    System.Text.Json.Nodes.JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null);
     List<DocumentIssue> ViewAsIssues(string? issueType = null, int? limit = null);
 
     // === Query Layer ===

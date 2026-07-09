@@ -51,7 +51,7 @@ public partial class WordHandler
             // BuildSectionNode so `get /` and `get /section[N]` round-trip the
             // same key names. Schema canonical: `columns`, `columnSpace` (with
             // legacy aliases `columns.count`, `columns.space` accepted on
-            // Add/Set, dropped on Get per CLAUDE.md "Get should normalize to
+            // Add/Set, dropped on Get per the project conventions "Get should normalize to
             // the canonical key only"). EqualWidth / separator have no schema
             // canonical alias yet so they keep the dotted form.
             var cols = sectPr.GetFirstChild<Columns>();

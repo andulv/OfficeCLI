@@ -210,7 +210,7 @@ public partial class WordHandler
         // its `begin` is below us — skip past it. Only the begin at
         // depth 0 is the owner. Use InnerText (not enum equality) since
         // SDK v3 enum equality on FieldCharValues is unreliable (same
-        // trap as LineSpacingRuleValues — see WordHandler CLAUDE.md).
+        // trap as LineSpacingRuleValues — see the Word handler conventions).
         int closedDepth = 0;
         OpenXmlElement? sibling = run.PreviousSibling();
         while (sibling != null)

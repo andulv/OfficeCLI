@@ -14,47 +14,12 @@ public partial class PowerPointHandler
         string? FontEquals, string? FontNotEquals, bool? IsTitle, bool? HasAlt,
         Dictionary<string, (string Value, bool Negate)>? Attributes = null);
 
+    // Shared with the Excel query path — see Core/SelectorCommaSplit.cs.
     private static bool ContainsTopLevelComma(string selector)
-    {
-        int depthBracket = 0, depthParen = 0;
-        char? quote = null;
-        foreach (var c in selector)
-        {
-            if (quote.HasValue) { if (c == quote.Value) quote = null; continue; }
-            if (c == '"' || c == '\'') { quote = c; continue; }
-            if (c == '[') depthBracket++;
-            else if (c == ']') depthBracket = Math.Max(0, depthBracket - 1);
-            else if (c == '(') depthParen++;
-            else if (c == ')') depthParen = Math.Max(0, depthParen - 1);
-            else if (c == ',' && depthBracket == 0 && depthParen == 0) return true;
-        }
-        return false;
-    }
+        => Core.SelectorCommaSplit.ContainsTopLevelComma(selector);
 
     private static List<string> SplitTopLevelCommas(string selector)
-    {
-        var parts = new List<string>();
-        int depthBracket = 0, depthParen = 0;
-        char? quote = null;
-        int start = 0;
-        for (int i = 0; i < selector.Length; i++)
-        {
-            var c = selector[i];
-            if (quote.HasValue) { if (c == quote.Value) quote = null; continue; }
-            if (c == '"' || c == '\'') { quote = c; continue; }
-            if (c == '[') depthBracket++;
-            else if (c == ']') depthBracket = Math.Max(0, depthBracket - 1);
-            else if (c == '(') depthParen++;
-            else if (c == ')') depthParen = Math.Max(0, depthParen - 1);
-            else if (c == ',' && depthBracket == 0 && depthParen == 0)
-            {
-                parts.Add(selector.Substring(start, i - start));
-                start = i + 1;
-            }
-        }
-        parts.Add(selector.Substring(start));
-        return parts;
-    }
+        => Core.SelectorCommaSplit.SplitTopLevelCommas(selector);
 
     private static string? FindUnsupportedCombinator(string selector)
     {

@@ -3522,12 +3522,21 @@ public partial class ExcelHandler
             return string.Join(":", parts);
         }
 
-        // Date formats (serial number → DateTime)
-        if (fmt.Contains('y') || fmt.Contains('m') || fmt.Contains('d') || fmt.Contains('h'))
+        // Date formats (serial number → DateTime). The shared detector (not
+        // the old contains-check) prevents digit-placeholder mixes like
+        // Y0.00 from being rendered as dates — Get and the HTML preview must
+        // agree (R99 fixed Get; this fork had the same bugs).
+        if ((fmt.Contains('y') || fmt.Contains('m') || fmt.Contains('d') || fmt.Contains('h'))
+            && ExcelDataFormatter.LooksLikeDateFormatCode(fmtCode))
         {
             try
             {
-                var dt = DateTime.FromOADate(value);
+                // Excel 1900 leap-bug alignment shared with Get: serials 1-59
+                // run a day ahead of the OADate scale; 60 is the fictitious
+                // 1900-02-29 (rendered via the 02-28 approximation, day
+                // patched below).
+                var dt = ExcelDataFormatter.FromExcelSerial(value);
+                var isGhostLeapDay = value >= 60 && value < 61;
                 // Context-sensitive m/mm: after h → minute, otherwise → month
                 // Strategy: mark minute 'm' as '\x01' placeholder, then convert remaining m→M
                 var dotnetFmt = NormalizeDateFormatCase(fmtCode);
@@ -3547,7 +3556,12 @@ public partial class ExcelHandler
                 if (!ContainsCharOutsideQuotes(dotnetFmt, 't'))
                     dotnetFmt = dotnetFmt.Replace("hh", "HH").Replace("h", "H");
                 dotnetFmt = dotnetFmt.Replace("dddd", "dddd").Replace("ddd", "ddd").Replace("dd", "dd");
-                return dt.ToString(dotnetFmt, System.Globalization.CultureInfo.InvariantCulture);
+                var rendered = dt.ToString(dotnetFmt, System.Globalization.CultureInfo.InvariantCulture);
+                // Fictitious 1900-02-29 was approximated as 02-28; patch the
+                // day component in the rendered text (single-date domain, the
+                // day token is the only "28" a Feb-1900 render can contain).
+                if (isGhostLeapDay) rendered = rendered.Replace("28", "29");
+                return rendered;
             }
             catch { return value.ToString(); }
         }

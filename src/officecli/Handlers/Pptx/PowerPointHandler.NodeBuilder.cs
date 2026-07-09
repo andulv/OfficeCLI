@@ -582,7 +582,7 @@ public partial class PowerPointHandler
 
                         // BUG-R6-A: cell padding readback (Set wrote LeftMargin/etc; Get
                         // missed it on the NodeBuilder cell branch). Canonical key is
-                        // "padding.*" per cross-handler rule (root CLAUDE.md).
+                        // "padding.*" per cross-handler rule (the project conventions).
                         if (tcPr?.LeftMargin?.HasValue == true)
                             cellNode.Format["padding.left"] = FormatEmu(tcPr.LeftMargin.Value);
                         if (tcPr?.RightMargin?.HasValue == true)
@@ -1699,7 +1699,7 @@ public partial class PowerPointHandler
             var softEdge = activeEffectList.GetFirstChild<Drawing.SoftEdge>();
             if (softEdge?.Radius?.HasValue == true)
                 // Unit-qualified pt — matches the cross-format canonical from
-                // root CLAUDE.md (line.width "0.75pt", padding "12pt", glow
+                // the project conventions (line.width "0.75pt", padding "12pt", glow
                 // "4pt"). The bare numeric form here was the lone outlier on
                 // the effects readback surface and broke dump round-trip
                 // when set softEdge=<value> re-parses the readback.
@@ -2252,7 +2252,7 @@ public partial class PowerPointHandler
             // canonicalizes the readback to per-script keys
             // (font.latin / font.ea / font.cs). Emitting both bare `font`
             // and `font.latin` violates the no-duplicate-alias rule in the
-            // root CLAUDE.md "Canonical DocumentNode.Format Rules".
+            // the project conventions "Canonical DocumentNode.Format Rules".
             if (fLatin != null) node.Format["font.latin"] = fLatin;
             // CONSISTENCY(per-script-round-trip): emit font.ea / font.cs
             // unconditionally when the source <a:ea>/<a:cs> element is

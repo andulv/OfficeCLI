@@ -30,6 +30,16 @@ if (args.Length == 1 && args[0] == "__update-check__")
     return 0;
 }
 
+// Schema fingerprint: officecli --output-schema-crc → CRC32 of the embedded
+// schemas/help tree. Downstream automation pins this to detect property-
+// surface drift across binary upgrades (same crc → schemas identical,
+// safe to upgrade blind). A flag, not a version: no ordering semantics.
+if (args.Length == 1 && args[0] == "--output-schema-crc")
+{
+    Console.WriteLine(OfficeCli.Help.SchemaCrc.Compute());
+    return 0;
+}
+
 // Unify `--help` with `help` so AI agents see one help surface, not two.
 //   officecli [--help|-h|-?]              → officecli help
 //   officecli <cmd> [--help|-h|-?] [...]  → officecli help <cmd>
@@ -217,5 +227,10 @@ if (args.Length == 0)
     return 0;
 }
 
-var parseResult = rootCommand.Parse(args);
+// Response-file token replacement is OFF: a bare `@…` token must reach the
+// handler verbatim (`set row[N] --prop @height=25` forces the ROW-PROPERTY
+// side of a column-shadow collision, same escape as `query row[@height…]`);
+// the default replacer would reject it as "response file not found".
+var parseResult = rootCommand.Parse(args,
+    new System.CommandLine.ParserConfiguration { ResponseFileTokenReplacer = null });
 return parseResult.Invoke();

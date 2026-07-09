@@ -65,7 +65,8 @@ public partial class ExcelHandler
         Func<string, string?> refMapper,
         Func<string, string>? formulaTextMapper,
         Func<int, int>? rowMarkerShift = null,
-        Func<int, int>? colMarkerShift = null)
+        Func<int, int>? colMarkerShift = null,
+        Func<string, string, string>? crossSheetFormulaMapper = null)
     {
         var ws = GetSheet(worksheet);
 
@@ -165,9 +166,18 @@ public partial class ExcelHandler
             var tbl = tablePart.Table;
             if (tbl == null) continue;
             bool tblDirty = false;
+            // A ListObject is never header-only: Excel itself always keeps at
+            // least one (blank) data row — deleting every data row in the UI
+            // leaves ref A1:B2. Without this floor, a predicate remove that
+            // matched every data row shrank ref to the header row alone, a
+            // shape Excel never writes.
+            int tblHeaderRows = (int)(tbl.HeaderRowCount?.Value ?? 1);
+            int tblTotalsRows = (int)(tbl.TotalsRowCount?.Value ?? 0);
             if (tbl.Reference?.Value != null)
             {
                 var shifted = refMapper(tbl.Reference.Value);
+                if (shifted != null)
+                    shifted = EnsureTableRefRowFloor(shifted, tblHeaderRows + 1 + tblTotalsRows);
                 if (shifted != null && !string.Equals(shifted, tbl.Reference.Value, StringComparison.Ordinal))
                 {
                     tbl.Reference = shifted;
@@ -177,6 +187,8 @@ public partial class ExcelHandler
             if (tbl.AutoFilter?.Reference?.Value != null)
             {
                 var shifted = refMapper(tbl.AutoFilter.Reference.Value);
+                if (shifted != null)
+                    shifted = EnsureTableRefRowFloor(shifted, tblHeaderRows + 1);   // autoFilter spans header+data, no totals
                 if (shifted != null && !string.Equals(shifted, tbl.AutoFilter.Reference.Value, StringComparison.Ordinal))
                 {
                     tbl.AutoFilter.Reference = shifted;
@@ -441,7 +453,12 @@ public partial class ExcelHandler
                 {
                     if (cell.CellFormula == null) continue;
                     if (formulaTextMapper != null && !string.IsNullOrEmpty(cell.CellFormula.Text))
-                        cell.CellFormula.Text = formulaTextMapper(cell.CellFormula.Text);
+                    {
+                        var oldText = cell.CellFormula.Text;
+                        var newText = formulaTextMapper(oldText);
+                        cell.CellFormula.Text = newText;
+                        InvalidateCacheIfShiftBrokeFormula(cell, oldText, newText);
+                    }
                     if (cell.CellFormula.Reference?.Value != null)
                     {
                         var shifted = refMapper(cell.CellFormula.Reference.Value);
@@ -449,6 +466,33 @@ public partial class ExcelHandler
                         else cell.CellFormula.Remove();
                     }
                 }
+            }
+        }
+
+        // 7b. cell formulas in OTHER sheets that reference THIS sheet
+        // (`Summary!A1 = Sheet1!B4`). A row/col insert or delete in one sheet
+        // displaces its cells for every formula everywhere, not just formulas on
+        // the same sheet — otherwise a cross-sheet reference silently points at
+        // the wrong (or now-empty) cell. The per-sheet mapper uses the OTHER
+        // sheet as its "current sheet" so that sheet's UNqualified refs are left
+        // alone; only a ref explicitly qualified with this sheet is shifted.
+        if (crossSheetFormulaMapper != null)
+        {
+            foreach (var (otherName, otherPart) in GetWorksheets())
+            {
+                if (otherPart == worksheet) continue;
+                var otherData = GetSheet(otherPart).GetFirstChild<SheetData>();
+                if (otherData == null) continue;
+                foreach (var row in otherData.Elements<Row>())
+                    foreach (var cell in row.Elements<Cell>())
+                        if (cell.CellFormula != null && !string.IsNullOrEmpty(cell.CellFormula.Text))
+                        {
+                            var oldText = cell.CellFormula.Text;
+                            var newText = crossSheetFormulaMapper(otherName, oldText);
+                            cell.CellFormula.Text = newText;
+                            InvalidateCacheIfShiftBrokeFormula(cell, oldText, newText);
+                        }
+                otherPart.Worksheet.Save();
             }
         }
 
@@ -475,5 +519,32 @@ public partial class ExcelHandler
                 if (changed) GetWorkbook().Save();
             }
         }
+    }
+
+    // A structural shift that rewrites a formula to contain #REF! (its target
+    // row/col was deleted) must not leave the pre-delete cached value behind:
+    // `get` would keep reporting the old number with evaluated=true and
+    // `view text` would present it as truth, while Excel shows #REF!. Persist
+    // what Excel itself would after recalc — an error-typed cell with #REF! as
+    // the cached value — so display shows #REF! and `view issues` classifies it
+    // as a formula error (not a stale number).
+    // Grow a shifted table ref back to its minimum legal row span (header +
+    // one data row + totals). Column span and anchor are untouched; a
+    // single-cell ref passes through unchanged.
+    private static string EnsureTableRefRowFloor(string refStr, int minRowSpan)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(
+            refStr, @"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!m.Success) return refStr;
+        int r1 = int.Parse(m.Groups[2].Value), r2 = int.Parse(m.Groups[4].Value);
+        if (r2 - r1 + 1 >= minRowSpan) return refStr;
+        return $"{m.Groups[1].Value}{r1}:{m.Groups[3].Value}{r1 + minRowSpan - 1}";
+    }
+
+    private static void InvalidateCacheIfShiftBrokeFormula(Cell cell, string oldText, string newText)
+    {
+        if (newText == oldText || !newText.Contains("#REF!", StringComparison.Ordinal)) return;
+        cell.DataType = CellValues.Error;
+        cell.CellValue = new CellValue("#REF!");
     }
 }

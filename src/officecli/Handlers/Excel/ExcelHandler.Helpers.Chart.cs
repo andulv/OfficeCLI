@@ -74,6 +74,38 @@ public partial class ExcelHandler
             .ToList();
         if (chartIdx < 1 || chartIdx > chartFrames.Count) return;
         var gf = chartFrames[chartIdx - 1];
+        // Externally-authored charts (e.g. openpyxl) hang off oneCellAnchor /
+        // absoluteAnchor. Bailing out here dropped x/y/width/height from Get,
+        // so dump emitted no position and replay parked the chart at the
+        // default origin — covering the sheet data. Read the from+ext (or
+        // pos+ext) rectangle instead; replay normalizes to a twoCell anchor
+        // at the same rectangle, which preserves the rendered layout.
+        if (gf.Parent is XDR.OneCellAnchor oneAnchor)
+        {
+            var oFrom = oneAnchor.FromMarker;
+            var oExt = oneAnchor.GetFirstChild<XDR.Extent>();
+            if (oFrom == null || oExt?.Cx?.HasValue != true || oExt.Cy?.HasValue != true) return;
+            int.TryParse(oFrom.GetFirstChild<XDR.ColumnId>()?.Text ?? "0", out var oCol);
+            int.TryParse(oFrom.GetFirstChild<XDR.RowId>()?.Text ?? "0", out var oRow);
+            long.TryParse(oFrom.GetFirstChild<XDR.ColumnOffset>()?.Text ?? "0", out var oColOff);
+            long.TryParse(oFrom.GetFirstChild<XDR.RowOffset>()?.Text ?? "0", out var oRowOff);
+            chartNode.Format["x"] = OfficeCli.Core.EmuConverter.FormatEmu((long)oCol * EmuPerColApprox + oColOff);
+            chartNode.Format["y"] = OfficeCli.Core.EmuConverter.FormatEmu((long)oRow * EmuPerRowApprox + oRowOff);
+            chartNode.Format["width"] = OfficeCli.Core.EmuConverter.FormatEmu(oExt.Cx.Value);
+            chartNode.Format["height"] = OfficeCli.Core.EmuConverter.FormatEmu(oExt.Cy.Value);
+            return;
+        }
+        if (gf.Parent is XDR.AbsoluteAnchor absAnchor)
+        {
+            var aPos = absAnchor.GetFirstChild<XDR.Position>();
+            var aExt = absAnchor.GetFirstChild<XDR.Extent>();
+            if (aExt?.Cx?.HasValue != true || aExt.Cy?.HasValue != true) return;
+            chartNode.Format["x"] = OfficeCli.Core.EmuConverter.FormatEmu(aPos?.X?.Value ?? 0);
+            chartNode.Format["y"] = OfficeCli.Core.EmuConverter.FormatEmu(aPos?.Y?.Value ?? 0);
+            chartNode.Format["width"] = OfficeCli.Core.EmuConverter.FormatEmu(aExt.Cx.Value);
+            chartNode.Format["height"] = OfficeCli.Core.EmuConverter.FormatEmu(aExt.Cy.Value);
+            return;
+        }
         if (gf.Parent is not XDR.TwoCellAnchor anchor) return;
         var fromM = anchor.FromMarker;
         var toM = anchor.ToMarker;

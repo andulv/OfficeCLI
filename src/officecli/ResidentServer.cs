@@ -462,7 +462,22 @@ public class ResidentServer : IDisposable
             if (!_dirty || !_editable) return;
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            _handler.Save();
+            // Idle flush runs while nobody waits, so the xlsx formula-cache sweep
+            // may take a generous budget — provided it yields the moment a client
+            // connects and starts waiting on _commandLock (an aborted sweep falls
+            // back to fullCalcOnLoad exactly like budget exhaustion, so this only
+            // trades sweep completeness for command latency, never correctness).
+            var xlsx = _handler as ExcelHandler;
+            if (xlsx != null)
+            {
+                xlsx.SweepBudgetOverride = TimeSpan.FromSeconds(60);
+                xlsx.SweepYieldRequested = () => Volatile.Read(ref _pendingClients) > 0;
+            }
+            try { _handler.Save(); }
+            finally
+            {
+                if (xlsx != null) { xlsx.SweepBudgetOverride = null; xlsx.SweepYieldRequested = null; }
+            }
             sw.Stop();
             _dirty = false;
             RecordSaveDuration(sw.Elapsed);
@@ -632,8 +647,14 @@ public class ResidentServer : IDisposable
         }
     }
 
+    // Number of accepted business clients not yet finished. Autosave's formula
+    // sweep polls this (via the handler's SweepYieldRequested hook) so a command
+    // arriving mid-sweep interrupts it instead of waiting out the sweep budget.
+    private int _pendingClients;
+
     private async Task HandleClientWithLockAsync(NamedPipeServerStream server, CancellationToken token)
     {
+        Interlocked.Increment(ref _pendingClients);
         try
         {
             await _commandLock.WaitAsync(token);
@@ -655,6 +676,7 @@ public class ResidentServer : IDisposable
         }
         finally
         {
+            Interlocked.Decrement(ref _pendingClients);
             await server.DisposeAsync();
         }
     }
@@ -1199,7 +1221,7 @@ public class ResidentServer : IDisposable
         deferHandler?.ReconcileGlobalIds();
 
         // Judgment contract: batch is classified as a judgment command (root
-        // CLAUDE.md "Judgment: any batch step failed -> outer false"). The
+        // the project conventions "Judgment: any batch step failed -> outer false"). The
         // verdict flips to failure as soon as ANY step is rejected. Keeps
         // envelope.success / exit code in lockstep with the non-resident
         // path.
@@ -1400,6 +1422,10 @@ public class ResidentServer : IDisposable
             byte[]? directPng = null;
             var gridCols = req.GetIntArg("grid") ?? 0;
             var renderMode = (req.GetArgOrNull("render") ?? "auto").ToLowerInvariant();
+            // --range clips a data-path region out of the HTML preview — mirrors
+            // CommandBuilder.View.cs: native/direct-PNG backends are bypassed.
+            var rangeArg = req.GetArgOrNull("range");
+            if (rangeArg != null) renderMode = "html";
             var sw = req.GetIntArg("screenshot-width") ?? 1600;
             var sh = req.GetIntArg("screenshot-height") ?? 1200;
             // CONSISTENCY(screenshot-default-first-page): mirror CommandBuilder.View.cs —
@@ -1410,6 +1436,9 @@ public class ResidentServer : IDisposable
             if (_handler is OfficeCli.Handlers.PowerPointHandler pptShotHandler)
             {
                 var effectiveFilter = pageFilter;
+                if (rangeArg != null && string.IsNullOrEmpty(effectiveFilter)
+                    && System.Text.RegularExpressions.Regex.Match(rangeArg, @"^/slide\[(\d+)\]") is { Success: true } slideM)
+                    effectiveFilter = slideM.Groups[1].Value;
                 if (string.IsNullOrEmpty(effectiveFilter) && start is null && end is null && gridCols == 0)
                     effectiveFilter = "1";
                 var (pStart, pEnd) = ResolvePptHtmlPage(effectiveFilter, start, end, pptShotHandler);
@@ -1535,13 +1564,17 @@ public class ResidentServer : IDisposable
             }
             else if (_handler is OfficeCli.Handlers.WordHandler wordShotHandler)
             {
-                var effectiveFilter = string.IsNullOrEmpty(pageFilter) ? "1" : pageFilter;
+                var effectiveFilter = rangeArg != null
+                    ? pageFilter
+                    : (string.IsNullOrEmpty(pageFilter) ? "1" : pageFilter);
                 if (renderMode != "html" && OperatingSystem.IsWindows())
                 {
                     // See the pptx branch: only an editable handler must be released
                     // (its write handle blocks Word); a read-only handler coexists.
                     if (_editable) _handler.Dispose();
-                    try { directPng = OfficeCli.Core.WordPdfBackend.Render(_filePath, effectiveFilter); } catch { directPng = null; }
+                    // effectiveFilter is only null under --range, which forces
+                    // renderMode=html — this native branch is then unreachable.
+                    try { directPng = OfficeCli.Core.WordPdfBackend.Render(_filePath, effectiveFilter!); } catch { directPng = null; }
                     if (_editable)
                     {
                         _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable);
@@ -1570,7 +1603,10 @@ public class ResidentServer : IDisposable
             {
                 var tmpHtml = Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(_filePath)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
                 File.WriteAllText(tmpHtml, html!);
-                var rs = OfficeCli.Core.HtmlScreenshot.Capture(tmpHtml, pngPath, sw, sh);
+                var rs = rangeArg != null
+                    ? OfficeCli.Core.HtmlScreenshot.CaptureClipped(tmpHtml, pngPath,
+                        OfficeCli.Core.HtmlScreenshot.ResolveClipDataPaths(rangeArg))
+                    : OfficeCli.Core.HtmlScreenshot.Capture(tmpHtml, pngPath, sw, sh);
                 try { File.Delete(tmpHtml); } catch { /* ignore */ }
                 if (!rs.Ok)
                 {
@@ -1681,7 +1717,7 @@ public class ResidentServer : IDisposable
             else if (modeKey is "outline" or "o")
                 Console.WriteLine(_handler.ViewAsOutlineJson().ToJsonString(OutputFormatter.PublicJsonOptions));
             else if (modeKey is "text" or "t")
-                Console.WriteLine(_handler.ViewAsTextJson(start, end, maxLines, cols).ToJsonString(OutputFormatter.PublicJsonOptions));
+                Console.WriteLine(_handler.ViewAsTextJson(start, end, maxLines, cols, req.GetArgOrNull("range")).ToJsonString(OutputFormatter.PublicJsonOptions));
             else if (modeKey is "annotated" or "a")
                 Console.WriteLine(OutputFormatter.FormatView(mode, _handler.ViewAsAnnotated(start, end, maxLines, cols), format));
             else if (modeKey is "issues" or "i")
@@ -1720,7 +1756,7 @@ public class ResidentServer : IDisposable
             switch (modeKey)
             {
                 case "text" or "t":
-                    output = _handler.ViewAsText(start, end, maxLines, cols); break;
+                    output = _handler.ViewAsText(start, end, maxLines, cols, req.GetArgOrNull("range")); break;
                 case "annotated" or "a":
                     output = _handler.ViewAsAnnotated(start, end, maxLines, cols); break;
                 case "outline" or "o":
@@ -1898,7 +1934,12 @@ public class ResidentServer : IDisposable
 
     private void ExecuteQuery(ResidentRequest req, OutputFormat format)
     {
-        var selector = req.GetArg("selector", "");
+        // `path` aliases `selector` (batch items routed here carry whichever
+        // field the caller wrote); an empty selector would silently match
+        // every node — mirror CommandBuilder's batch-query guard.
+        var selector = req.GetArgOrNull("selector") ?? req.GetArgOrNull("path") ?? "";
+        if (string.IsNullOrEmpty(selector))
+            throw new ArgumentException("'query' requires a selector. Example: {\"command\": \"query\", \"selector\": \"row[Score>80]\"}");
         // CONSISTENCY(cell-selector-alias): mirror the direct-mode normalization +
         // boolean engine in CommandBuilder.GetQuery.cs — without alias normalization,
         // resident-mode Excel cell queries with short aliases (bold, size, ...)
@@ -1911,6 +1952,14 @@ public class ResidentServer : IDisposable
         var textFilter = req.GetArgOrNull("find");
         if (!string.IsNullOrEmpty(textFilter))
             results = results.Where(n => n.Text != null && AttributeFilter.MatchesTextFilter(n.Text, textFilter)).ToList();
+        // --compact: same line renderer as direct mode (CommandBuilder owns the
+        // format contract); short-circuits before JSON hydration.
+        if (req.GetArgOrNull("compact") == "true")
+        {
+            foreach (var w2 in warnings) Console.Error.WriteLine(w2.Message);
+            Console.WriteLine(CommandBuilder.FormatNodesCompact(_handler, results, req.GetArgOrNull("fields")));
+            return;
+        }
         // CONSISTENCY(query-json-children): hydrate Children from Get(path, depth=1)
         // for JSON output so consumers see the same shape as `get --json`. Mirrors
         // the post-processing in CommandBuilder.GetQuery.cs.
@@ -2100,7 +2149,7 @@ public class ResidentServer : IDisposable
         // cell-key hint for a 0-based r0c0 reaches resident-mode users too.
         var parts = unsupported.Select(u =>
         {
-            if (u.Contains("(valid ", StringComparison.Ordinal)) return u; // handler already hinted
+            if (u.Contains('(')) return u; // handler already embedded a hint (valid props / no such column / …)
             var s = CommandBuilder.SuggestPropertyScoped(u, scope);
             return s != null ? $"{u} (did you mean: {s}?)" : u;
         });

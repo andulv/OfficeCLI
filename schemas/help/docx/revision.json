@@ -22,7 +22,7 @@
       "type": "enum",
       "values": ["ins", "del", "moveTo", "moveFrom", "format"],
       "add": false, "set": false, "get": true,
-      "examples": ["query /revision[@type=ins]"],
+      "examples": ["query revision[@type=ins]"],
       "readback": "revision type (read-only on the revision node; create with --prop revision.type=… on the host element)",
       "enforcement": "report"
     },
@@ -39,7 +39,7 @@
       "description": "Author of the revision. Surfaced on `query revision` nodes and on host elements (run/paragraph/…) that carry an ins/del/*PrChange ancestor. Supply via --prop revision.author=… on the host element to create. **Run host is stricter:** `set <run> --prop revision.author=X` alone is rejected — without an action to attribute, the legacy fallback wrote an empty-snapshot rPrChange (recording no change). Either pair revision.author with a real format prop (`--prop bold=true`), or pass `--prop revision.type=ins|del|moveFrom|moveTo` so the wrap itself is the action. The same strictness applies to bare `revision.type=format` on Run. Non-Run hosts (paragraph/table/row/cell/section) still accept bare attribution and emit an empty-snapshot *PrChange — needed for dump→batch round-trip of table-level markers whose pre-change baseline can't be reconstructed. Also accepted alongside `find` (and `replace` / format / paragraph props) — the find dispatch wraps each match in the matching marker shape and attributes it to this author.",
       "add": false, "set": false, "get": true,
       "examples": [
-        "query /revision[@author=Alice]",
+        "query revision[@author=Alice]",
         "set /body --prop find=fox --prop replace=cat --prop revision.author=Alice",
         "set /body --prop find=red --prop bold=true --prop revision.author=Bob",
         "set /body --prop find=BAD --prop replace= --prop revision.author=Carol",

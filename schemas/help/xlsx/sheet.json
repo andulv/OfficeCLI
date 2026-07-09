@@ -13,7 +13,7 @@
     "stable":     ["/<sheetName>"],
     "positional": ["/Sheet1", "/Sheet2"]
   },
-  "note": "Add accepts name, position, autoFilter, tabColor, and hidden — these forward to the same code paths Set uses, preserving Add/Set symmetry. `freeze` remains Set-only.",
+  "note": "Add accepts name, position, autoFilter, tabColor, and hidden. autoFilter/tabColor/hidden forward to the same code paths Set uses; `position` is Add-only (reorder an existing sheet with the move command); `freeze` remains Set-only.",
   "properties": {
     "name": {
       "type": "string",

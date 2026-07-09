@@ -3865,8 +3865,32 @@ public partial class PowerPointHandler
     }
 
     /// <summary>
+    /// Per-preset inscribed text rectangle, as width/height fractions of the
+    /// shape's bounding box. Sourced from the OOXML presetShapeDefinitions
+    /// &lt;rect&gt; element (the region PowerPoint actually lays text into):
+    /// a diamond's text area is the centered w/2 × h/2 rectangle, an ellipse's
+    /// is the cos45° inscribed rect, etc. Presets not listed use the full box.
+    /// </summary>
+    // Keyed by the preset's OOXML InnerText: SDK v3 enum-structs render as
+    // "ShapeTypeValues { }" under ToString(), so InnerText is the stable key.
+    private static readonly Dictionary<string, (double W, double H)> PresetTextRectFactors = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["diamond"] = (0.50, 0.50),
+        ["ellipse"] = (0.7071, 0.7071),
+        ["triangle"] = (0.50, 0.50),
+        ["rtTriangle"] = (0.50, 0.3333),
+        ["pentagon"] = (0.60, 0.6667),
+        ["hexagon"] = (0.7071, 0.7071),
+        ["octagon"] = (0.7071, 0.7071),
+        ["cloud"] = (0.60, 0.55),
+        ["teardrop"] = (0.7071, 0.7071),
+    };
+
+    /// <summary>
     /// Estimates whether the given text will overflow the shape bounds.
     /// Uses per-character width estimation (CJK vs Latin) and reads actual line spacing from the shape.
+    /// Non-rectangular presets shrink the usable area to their inscribed text
+    /// rect (a diamond holds ~half the width/height its bounding box suggests).
     /// Returns a warning message if overflow is detected, null otherwise.
     /// </summary>
     internal static string? CheckTextOverflow(Shape shape)
@@ -3911,6 +3935,19 @@ public partial class PowerPointHandler
             }
         }
 
+        // Non-rectangular presets: text lives in the preset's inscribed rect,
+        // not the bounding box — shrink the box before subtracting insets.
+        var presetName = spPr?.GetFirstChild<Drawing.PresetGeometry>()?.Preset?.InnerText;
+        string presetNote = "";
+        double heightFactor = 1.0;
+        if (presetName != null && PresetTextRectFactors.TryGetValue(presetName, out var f))
+        {
+            shapeWidthPt *= f.W;
+            shapeHeightPt *= f.H;
+            heightFactor = f.H;
+            presetNote = $" ({presetName} text area is the inscribed {f.W * 100:F0}%×{f.H * 100:F0}% rect of the bounding box)";
+        }
+
         double usableWidth = shapeWidthPt - (leftEmu + rightEmu) / emuPerPt;
         double usableHeight = shapeHeightPt - (topEmu + bottomEmu) / emuPerPt;
         // If usable area is negative/zero, shape is too small for even its own margins
@@ -3924,7 +3961,7 @@ public partial class PowerPointHandler
             // Round up to 0.05cm for cleaner values
             minHeightCm = Math.Ceiling(minHeightCm * 20) / 20.0;
             long minHeightEmu = (long)Math.Round(minHeightCm * EmuConverter.EmuPerCmF);
-            return $"text overflow: need ≥{defaultLinePt:F0}pt, usable 0pt (shape {shapeHeightPt:F0}pt < margins {marginPt:F0}pt). suggest.height={EmuConverter.FormatEmu(minHeightEmu)}";
+            return $"text overflow: need ≥{defaultLinePt:F0}pt, usable 0pt (shape {shapeHeightPt:F0}pt < margins {marginPt:F0}pt){presetNote}. suggest.height={EmuConverter.FormatEmu(minHeightEmu)}";
         }
 
         // Collect font size from each paragraph's runs; track the max for line height calculation
@@ -4024,12 +4061,13 @@ public partial class PowerPointHandler
             + spaceBeforePt + spaceAfterPt * Math.Max(textLines.Length - 1, 0);
         if (estimatedHeight > usableHeight * 1.05) // 5% tolerance for rounding
         {
-            // Calculate minimum height: estimated text height + margins, converted to cm
-            double minHeightCm = (estimatedHeight + marginPt) / 72.0 * 2.54;
+            // Minimum height: text + margins must fit the INSCRIBED rect, so a
+            // shrunk preset scales the suggested bounding-box height back up.
+            double minHeightCm = (estimatedHeight + marginPt) / heightFactor / 72.0 * 2.54;
             // Round up to 0.05cm for cleaner values
             minHeightCm = Math.Ceiling(minHeightCm * 20) / 20.0;
             long minHeightEmu = (long)Math.Round(minHeightCm * EmuConverter.EmuPerCmF);
-            return $"text overflow: {totalLines} lines at {fontSizePt:F1}pt need {estimatedHeight:F0}pt, usable {usableHeight:F0}pt. suggest.height={EmuConverter.FormatEmu(minHeightEmu)}";
+            return $"text overflow: {totalLines} lines at {fontSizePt:F1}pt need {estimatedHeight:F0}pt, usable {usableHeight:F0}pt{presetNote}. suggest.height={EmuConverter.FormatEmu(minHeightEmu)}";
         }
         return null;
     }

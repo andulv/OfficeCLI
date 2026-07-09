@@ -110,7 +110,7 @@ public partial class ExcelHandler
             sheets.AppendChild(newSheet);
         }
 
-        // Add/Set symmetry (CLAUDE.md): apply autoFilter / tabColor / hidden
+        // Add/Set symmetry (the project conventions): apply autoFilter / tabColor / hidden
         // at creation time by funneling into the same code paths Set uses,
         // so property bags accepted by Set are also accepted by Add.
         var sheetLevelForwarded = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -443,6 +443,23 @@ public partial class ExcelHandler
                 ShiftCellsDownInColumn(cellSheetData, shiftCol, shiftRow);
         }
 
+        // Atomicity: validate a type=boolean value BEFORE FindOrCreateCell
+        // appends the cell to the sheet. A throw AFTER the cell is created
+        // used to leave a corrupt <c t="b"><v>garbage</v></c> persisted on
+        // disk (real Excel then refuses the file, 0x800A03EC) even though the
+        // Add reported an error. The later in-switch check stays as a
+        // defense-in-depth guard.
+        {
+            var upfrontType = properties.GetValueOrDefault("type")?.ToLowerInvariant();
+            var upfrontValue = (properties.GetValueOrDefault("value")
+                ?? properties.GetValueOrDefault("text"))?.Trim().ToLowerInvariant();
+            if ((upfrontType is "boolean" or "bool") && !string.IsNullOrEmpty(upfrontValue)
+                && upfrontValue is not ("true" or "false" or "yes" or "no" or "1" or "0"))
+                throw new ArgumentException(
+                    $"Cannot store '{properties.GetValueOrDefault("value") ?? properties.GetValueOrDefault("text")}' as boolean; " +
+                    "value must be true/false, yes/no, or 1/0. Use type=string to keep the literal text.");
+        }
+
         var cell = FindOrCreateCell(cellSheetData, cellRef);
 
         // CONSISTENCY(cell-value-alias): Set accepts "text" as alias for
@@ -477,8 +494,13 @@ public partial class ExcelHandler
                 Console.Error.WriteLine(
                     "Warning: Both value= and formula= supplied — using formula, value ignored.");
             }
-            // Auto-detect formula: value starting with '=' is treated as formula
-            if (value.StartsWith('=') && value.Length > 1)
+            // Auto-detect formula: value starting with '=' is treated as
+            // formula — UNLESS type=string was supplied (explicitly, or forced
+            // by the apostrophe branch above). Mirrors the Set-path gate; see
+            // ExcelHandler.Set.cs case "value".
+            var addForcedString = properties.TryGetValue("type", out var addTypeVal)
+                && addTypeVal.Equals("string", StringComparison.OrdinalIgnoreCase);
+            if (!addForcedString && value.StartsWith('=') && value.Length > 1)
             {
                 RejectCrossWorkbookFormula(value);
                 ValidateFormulaCellRefs(value);
@@ -542,7 +564,7 @@ public partial class ExcelHandler
                     && inferredDate >= new System.DateTime(1900, 1, 1))
                 {
                     cell.CellValue = new CellValue(
-                        inferredDate.ToOADate().ToString(System.Globalization.CultureInfo.InvariantCulture));
+                        ExcelDataFormatter.ToExcelSerial(inferredDate).ToString(System.Globalization.CultureInfo.InvariantCulture));
                     cell.DataType = null;
                 }
                 else if (!double.TryParse(safeValue, out var dbl) || !double.IsFinite(dbl))
@@ -605,6 +627,20 @@ public partial class ExcelHandler
             }
             else
             {
+                // Validate a boolean retype BEFORE mutating DataType. When the
+                // cell already holds text and type=boolean arrives with no new
+                // value, the switch below would stamp t="b" onto that text and
+                // only the later check would throw — leaving a corrupt
+                // <c t="b"><v>hello</v></c> Excel refuses (0x800A03EC). The
+                // R114 upfront guard only sees the incoming value=, not the
+                // existing cell text, so guard that here too.
+                if ((cellType.Equals("boolean", StringComparison.OrdinalIgnoreCase)
+                        || cellType.Equals("bool", StringComparison.OrdinalIgnoreCase))
+                    && cell.CellValue?.Text?.Trim().ToLowerInvariant() is { Length: > 0 } existingBool
+                    && existingBool is not ("true" or "false" or "yes" or "no" or "1" or "0"))
+                    throw new ArgumentException(
+                        $"Cannot store '{cell.CellValue?.Text}' as boolean; value must be true/false, yes/no, or 1/0. " +
+                        "Use type=string to keep the literal text.");
                 cell.DataType = cellType.ToLowerInvariant() switch
                 {
                     "string" or "str" => new EnumValue<CellValues>(CellValues.String),
@@ -631,6 +667,13 @@ public partial class ExcelHandler
                         cell.CellValue = new CellValue("1");
                     else if (boolText == "false" || boolText == "no" || boolText == "0")
                         cell.CellValue = new CellValue("0");
+                    else if (!string.IsNullOrEmpty(boolText))
+                        // A t="b" cell whose value isn't 0/1 makes real Excel
+                        // refuse the whole file (0x800A03EC). Reject up front,
+                        // mirroring the type=date guard.
+                        throw new ArgumentException(
+                            $"Cannot store '{cell.CellValue?.Text}' as boolean; value must be true/false, yes/no, or 1/0. " +
+                            "Use type=string to keep the literal text.");
                 }
                 // CONSISTENCY(cell-type-parity): mirror Set's value auto-detect
                 // path (ExcelHandler.Set.cs lines 1025-1033) — parse the cell
@@ -651,7 +694,7 @@ public partial class ExcelHandler
                                 $"Cannot store '{dateText}' as date; Excel does not support dates before 1900-01-01 " +
                                 $"(serial epoch is 1899-12-30). Use type=string to keep the literal text.");
                         cell.CellValue = new CellValue(
-                            dt.ToOADate().ToString(System.Globalization.CultureInfo.InvariantCulture));
+                            ExcelDataFormatter.ToExcelSerial(dt).ToString(System.Globalization.CultureInfo.InvariantCulture));
                     }
                     else if (!string.IsNullOrEmpty(dateText))
                     {
@@ -735,7 +778,7 @@ public partial class ExcelHandler
             // Validate the scheme BEFORE creating the <hyperlinks> container
             // (same fix as the Set path): a rejected scheme used to leave an
             // empty schema-invalid <x:hyperlinks/> behind — Excel 0x800A03EC.
-            var addLinkIsInternal = TryParseInternalHyperlinkLocation(linkUrl) != null;
+            var addLinkIsInternal = ResolveInternalHyperlinkLocation(linkUrl) != null;
             if (!addLinkIsInternal)
                 Core.HyperlinkUriValidator.RequireSafeScheme(linkUrl, "link");
             var ws = GetSheet(cellWorksheet);
@@ -765,7 +808,7 @@ public partial class ExcelHandler
             // the link. Handler-as-truth: consumed here so it is not reported
             // unsupported (schema hyperlink.json documents cell display=).
             var hlDisplay = properties.GetValueOrDefault("display");
-            var addInternalLoc = TryParseInternalHyperlinkLocation(linkUrl);
+            var addInternalLoc = ResolveInternalHyperlinkLocation(linkUrl);
             if (addInternalLoc != null)
             {
                 var hl = new Hyperlink
@@ -1028,6 +1071,17 @@ public partial class ExcelHandler
                 newCol.Width = parsedColWidth;
                 newCol.CustomWidth = true;
             }
+            else if (newCol.Width == null)
+            {
+                // A <col> with no width attribute renders ZERO-width in real
+                // Excel (verified via remote render: the inserted column and
+                // its cells visually vanish while Get/dump still see them).
+                // Materializing for Get/Query symmetry must therefore carry
+                // the sheet's default width explicitly.
+                newCol.Width = ws.SheetFormatProperties?.DefaultColumnWidth?.Value
+                    ?? ws.SheetFormatProperties?.BaseColumnWidth?.Value + 0.43
+                    ?? 8.43;
+            }
             if (hasColHidden)
             {
                 newCol.Hidden = addColHidden!.Equals("true", StringComparison.OrdinalIgnoreCase)
@@ -1103,7 +1157,7 @@ public partial class ExcelHandler
         // IEnumerable.GetEnumerator on the Dictionary<> static type, which does
         // NOT fire TrackingPropertyDictionary's shadow GetEnumerator — so applied
         // keys like bold/italic were never marked accessed and surfaced as a
-        // false unsupported_property (exit 2). See CLAUDE.md tracking pitfalls.
+        // false unsupported_property (exit 2). See the project conventions tracking pitfalls.
         // Each helper accepts the short key plus its font.* alias.
         if ((properties.TryGetValue("bold", out var rBold) && ParseHelpers.IsTruthy(rBold)) ||
             (properties.TryGetValue("font.bold", out var rFBold) && ParseHelpers.IsTruthy(rFBold)))

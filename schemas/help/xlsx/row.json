@@ -13,7 +13,7 @@
   "paths": {
     "positional": ["/SheetName/row[N]"]
   },
-  "note": "Row index N is 1-based. Add/Set asymmetry: all formatting props are currently Set-only. Insert/move/clone at an occupied slot shifts every row at or past the slot down by one, and every range-bearing structure on the sheet (mergeCells, CF/DV sqref, autoFilter, hyperlink/table refs, named ranges, formula cell-refs) follows the displacement. 'add --from /SheetName/row[K]' with --before/--after clones cells + single-row mergeCells; relative formula refs are delta-shifted to the new anchor (Excel 'Insert Copied Cells' parity). Excel-style whole-row references (1:1; 2:5 spans on set) are accepted as input aliases for row[N]; readback paths stay canonical.",
+  "note": "Row index N is 1-based. Add/Set asymmetry: all formatting props are currently Set-only. Insert/move/clone at an occupied slot shifts every row at or past the slot down by one, and every range-bearing structure on the sheet (mergeCells, CF/DV sqref, autoFilter, hyperlink/table refs, named ranges, formula cell-refs) follows the displacement. 'add --from /SheetName/row[K]' with --before/--after clones cells + single-row mergeCells; relative formula refs are delta-shifted to the new anchor (Excel 'Insert Copied Cells' parity). Excel-style whole-row references (1:1; 2:5 spans on set) are accepted as input aliases for row[N]; readback paths stay canonical. Set also accepts TABLE COLUMN names as prop keys (`--prop Salary=9000` writes that column's cell in the row, symmetric with query row[Salary>5000]). When a key names BOTH a row property and a table column (e.g. a column headed 'Height'), the bare key is rejected as ambiguous (invalid_selector) — force the side with `--prop col.Height=180` (column cell) or `--prop @height=25` (row property); same col./@ escape vocabulary as query row[col.X…]/row[@X…].",
   "examples": [
     {
       "title": "Filter rows by column name (resolves against a ListObject or a detected header-row table)",
@@ -21,6 +21,14 @@
         "officecli query book.xlsx \"row[Salary>5000]\"",
         "officecli query book.xlsx \"row[Region=West and Sales>1000]\"",
         "officecli query book.xlsx \"row[Status=open or Priority=high]\""
+      ]
+    },
+    {
+      "title": "Write a table column's cell on a row; disambiguate a column that shadows a row property",
+      "commands": [
+        "officecli set book.xlsx \"/Sheet1/row[2]\" --prop Salary=9000",
+        "officecli set book.xlsx \"/Sheet1/row[2]\" --prop col.Height=180",
+        "officecli set book.xlsx \"/Sheet1/row[2]\" --prop @height=25"
       ]
     }
   ],

@@ -82,6 +82,10 @@ public partial class ExcelHandler
             rowByIndex[er.RowIndex!.Value] = er;
         int exCursor = 0; // points at the first existing row with index > last processed
         var importedFormulaCells = new List<Cell>();
+        // Lazily created the first time an ISO date is imported, so a detected
+        // date cell gets a date number format (matching Set/Add) instead of
+        // displaying its raw serial number.
+        Core.ExcelStyleManager? styleManager = null;
 
         for (int r = 0; r < rows.Count; r++)
         {
@@ -142,7 +146,14 @@ public partial class ExcelHandler
                     cell.CellValue = null;
                     cell.DataType = null;
                 }
-                SetCellValueWithTypeDetection(cell, fields[c]);
+                if (SetCellValueWithTypeDetection(cell, fields[c]))
+                {
+                    // Date cell — apply a date number format so it shows as a
+                    // date, not the raw serial. Mirrors Set/Add (numFmt yyyy-mm-dd).
+                    styleManager ??= new Core.ExcelStyleManager(_doc.WorkbookPart!);
+                    cell.StyleIndex = styleManager.ApplyStyle(cell,
+                        new Dictionary<string, string> { ["numberformat"] = "yyyy-mm-dd" });
+                }
                 if (cell.CellFormula != null && cell.CellValue == null)
                     importedFormulaCells.Add(cell);
             }
@@ -234,14 +245,16 @@ public partial class ExcelHandler
     /// Set a cell's value with automatic type detection.
     /// Order: number -> date (ISO) -> boolean -> formula -> string
     /// </summary>
-    private static void SetCellValueWithTypeDetection(Cell cell, string value)
+    /// <returns>true when the value was stored as a DATE (serial number needing
+    /// a date number format); false for every other type.</returns>
+    private static bool SetCellValueWithTypeDetection(Cell cell, string value)
     {
         // Empty
         if (string.IsNullOrEmpty(value))
         {
             cell.CellValue = null;
             cell.DataType = null;
-            return;
+            return false;
         }
 
         // R13-1: enforce Excel's 32767-char per-cell limit at the CSV/TSV
@@ -258,7 +271,7 @@ public partial class ExcelHandler
             cell.CellFormula = new CellFormula(OfficeCli.Core.PivotTableHelper.SanitizeXmlText(OfficeCli.Core.ModernFunctionQualifier.Qualify(value[1..])));
             cell.CellValue = null;
             cell.DataType = null;
-            return;
+            return false;
         }
 
         // Number (integer or decimal)
@@ -274,16 +287,16 @@ public partial class ExcelHandler
             // thousands separators, "Infinity"/"NaN").
             cell.CellValue = new CellValue(NormalizeNumericCellText(value, numVal));
             cell.DataType = null; // numeric is default
-            return;
+            return false;
         }
 
         // Date: ISO 8601 formats (yyyy-MM-dd, yyyy-MM-ddTHH:mm:ss, etc.)
         if (TryParseIsoDate(value, out var dateVal))
         {
             // Excel stores dates as OLE Automation date numbers
-            cell.CellValue = new CellValue(dateVal.ToOADate().ToString(CultureInfo.InvariantCulture));
+            cell.CellValue = new CellValue(ExcelDataFormatter.ToExcelSerial(dateVal).ToString(CultureInfo.InvariantCulture));
             cell.DataType = null; // numeric
-            return;
+            return true; // caller applies a date number format
         }
 
         // Boolean: TRUE/FALSE (case-insensitive)
@@ -291,18 +304,19 @@ public partial class ExcelHandler
         {
             cell.CellValue = new CellValue("1");
             cell.DataType = new EnumValue<CellValues>(CellValues.Boolean);
-            return;
+            return false;
         }
         if (value.Equals("FALSE", StringComparison.OrdinalIgnoreCase))
         {
             cell.CellValue = new CellValue("0");
             cell.DataType = new EnumValue<CellValues>(CellValues.Boolean);
-            return;
+            return false;
         }
 
         // String (fallback)
         cell.CellValue = new CellValue(value);
         cell.DataType = new EnumValue<CellValues>(CellValues.String);
+        return false;
     }
 
     private static bool TryParseIsoDate(string value, out DateTime result)
@@ -387,8 +401,12 @@ public partial class ExcelHandler
                     // End of row
                     currentRow.Add(field.ToString());
                     field.Clear();
-                    if (currentRow.Count > 0 && !(currentRow.Count == 1 && currentRow[0] == ""))
-                        rows.Add(currentRow);
+                    // Keep blank lines as single-empty-field rows: dropping
+                    // them shifted every subsequent line up (r4 landed on row
+                    // 2). The import loop skips materializing all-empty rows,
+                    // so no phantom <row> elements are written — only the row
+                    // cursor advances, preserving source line positions.
+                    rows.Add(currentRow);
                     currentRow = new List<string>();
                     i++;
                     if (i < content.Length && content[i] == '\n')
@@ -399,8 +417,8 @@ public partial class ExcelHandler
                     // End of row
                     currentRow.Add(field.ToString());
                     field.Clear();
-                    if (currentRow.Count > 0 && !(currentRow.Count == 1 && currentRow[0] == ""))
-                        rows.Add(currentRow);
+                    // Blank lines preserved — see the \r branch above.
+                    rows.Add(currentRow);
                     currentRow = new List<string>();
                     i++;
                 }

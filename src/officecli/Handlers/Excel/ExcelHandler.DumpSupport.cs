@@ -353,12 +353,16 @@ public partial class ExcelHandler
     {
         var worksheet = FindWorksheet(sheetName)
             ?? throw new ArgumentException($"Sheet not found: {sheetName}");
-        var extLst = GetSheet(worksheet).GetFirstChild<WorksheetExtensionList>();
-        if (extLst == null) return 0;
-        // Each <x14:slicer r:id> under the slicerList ext references one
-        // SlicerPart; the slicer[N] Get index space walks the same list.
-        return extLst.Descendants()
-            .Count(e => e.LocalName == "slicer" && e.NamespaceUri.Contains("2009/9/main"));
+        // Count slicer DEFINITIONS, not the worksheet extLst <x14:slicer r:id>
+        // references. Excel groups every slicer bound to a sheet into one
+        // shared SlicersPart with N <x14:slicer> children but only ONE extLst
+        // reference to that part — counting references returned 1 for N
+        // slicers and the dump silently dropped slicer[2..N]. Mirror the
+        // slicer[N] Get index space (Helpers.Node.cs / TryFindSlicerByIndex),
+        // which enumerates the first SlicersPart's Slicers collection.
+        var slicersPart = worksheet.GetPartsOfType<SlicersPart>().FirstOrDefault();
+        return slicersPart?.Slicers?
+            .Elements<DocumentFormat.OpenXml.Office2010.Excel.Slicer>().Count() ?? 0;
     }
 
     /// <summary>
@@ -621,8 +625,7 @@ public partial class ExcelHandler
             ?? throw new ArgumentException($"Sheet not found: {sheetName}");
         var wsDrawing = worksheet.DrawingsPart?.WorksheetDrawing;
         if (wsDrawing == null) return (0, 0);
-        var pictures = wsDrawing.Elements<DocumentFormat.OpenXml.Drawing.Spreadsheet.TwoCellAnchor>()
-            .Count(a => a.Descendants<DocumentFormat.OpenXml.Drawing.Spreadsheet.Picture>().Any());
+        var pictures = EnumeratePictureAnchors(wsDrawing).Count();
         var shapes = EnumerateLeafShapes(wsDrawing).Count();
         return (pictures, shapes);
     }
@@ -636,15 +639,17 @@ public partial class ExcelHandler
     /// HasFromOffset flags anchors whose From marker carries a non-zero
     /// offset (real-Excel-authored); the add vocabulary cannot express that,
     /// so the emitter surfaces it as a warning.</summary>
-    public sealed record DumpAnchorEmu(int X, int Y, long WidthEmu, long HeightEmu, bool HasFromOffset);
+    /// <summary>Mode is the anchor kind ("twoCell" / "oneCell" / "absolute").
+    /// For absolute anchors X/Y are unused; XEmu/YEmu carry the EMU position
+    /// (the add vocabulary takes x/y as EMU for anchorMode=absolute).</summary>
+    public sealed record DumpAnchorEmu(int X, int Y, long WidthEmu, long HeightEmu, bool HasFromOffset,
+        string Mode = "twoCell", long XEmu = 0, long YEmu = 0);
 
     public DumpAnchorEmu? GetDumpPictureAnchorEmu(string sheetName, int index)
     {
         var wsDrawing = FindWorksheet(sheetName)?.DrawingsPart?.WorksheetDrawing;
         if (wsDrawing == null) return null;
-        var picAnchors = wsDrawing.Elements<DocumentFormat.OpenXml.Drawing.Spreadsheet.TwoCellAnchor>()
-            .Where(a => a.Descendants<DocumentFormat.OpenXml.Drawing.Spreadsheet.Picture>().Any())
-            .ToList();
+        var picAnchors = EnumeratePictureAnchors(wsDrawing).ToList();
         if (index < 1 || index > picAnchors.Count) return null;
         return AnchorToEmuRect(picAnchors[index - 1]);
     }
@@ -658,9 +663,31 @@ public partial class ExcelHandler
         return AnchorToEmuRect(shapes[index - 1].anchor);
     }
 
-    private static DumpAnchorEmu? AnchorToEmuRect(
-        DocumentFormat.OpenXml.Drawing.Spreadsheet.TwoCellAnchor anchor)
+    private static DumpAnchorEmu? AnchorToEmuRect(OpenXmlCompositeElement anchorEl)
     {
+        // oneCell / absolute anchors carry size in <xdr:ext> (EMU) instead of
+        // a To marker; absolute additionally carries position as EMU <xdr:pos>.
+        if (anchorEl is DocumentFormat.OpenXml.Drawing.Spreadsheet.OneCellAnchor one)
+        {
+            var oFrom = one.FromMarker;
+            var oExt = one.GetFirstChild<DocumentFormat.OpenXml.Drawing.Spreadsheet.Extent>();
+            if (oFrom == null || oExt?.Cx?.HasValue != true || oExt.Cy?.HasValue != true) return null;
+            static int OP(string? s) => int.TryParse(s, out var v) ? v : 0;
+            static long OPL(string? s) => long.TryParse(s, out var v) ? v : 0;
+            return new DumpAnchorEmu(OP(oFrom.ColumnId?.Text), OP(oFrom.RowId?.Text),
+                oExt.Cx.Value, oExt.Cy.Value,
+                OPL(oFrom.ColumnOffset?.Text) != 0 || OPL(oFrom.RowOffset?.Text) != 0,
+                Mode: "oneCell");
+        }
+        if (anchorEl is DocumentFormat.OpenXml.Drawing.Spreadsheet.AbsoluteAnchor abs)
+        {
+            var aPos = abs.GetFirstChild<DocumentFormat.OpenXml.Drawing.Spreadsheet.Position>();
+            var aExt = abs.GetFirstChild<DocumentFormat.OpenXml.Drawing.Spreadsheet.Extent>();
+            if (aExt?.Cx?.HasValue != true || aExt.Cy?.HasValue != true) return null;
+            return new DumpAnchorEmu(0, 0, aExt.Cx.Value, aExt.Cy.Value, false,
+                Mode: "absolute", XEmu: aPos?.X?.Value ?? 0, YEmu: aPos?.Y?.Value ?? 0);
+        }
+        if (anchorEl is not DocumentFormat.OpenXml.Drawing.Spreadsheet.TwoCellAnchor anchor) return null;
         var from = anchor.FromMarker;
         var to = anchor.ToMarker;
         if (from == null || to == null) return null;
@@ -687,9 +714,7 @@ public partial class ExcelHandler
         var drawingsPart = worksheet?.DrawingsPart;
         var wsDrawing = drawingsPart?.WorksheetDrawing;
         if (worksheet == null || drawingsPart == null || wsDrawing == null) return null;
-        var picAnchors = wsDrawing.Elements<DocumentFormat.OpenXml.Drawing.Spreadsheet.TwoCellAnchor>()
-            .Where(a => a.Descendants<DocumentFormat.OpenXml.Drawing.Spreadsheet.Picture>().Any())
-            .ToList();
+        var picAnchors = EnumeratePictureAnchors(wsDrawing).ToList();
         if (index < 1 || index > picAnchors.Count) return null;
         var picture = picAnchors[index - 1]
             .Descendants<DocumentFormat.OpenXml.Drawing.Spreadsheet.Picture>().First();
@@ -716,6 +741,32 @@ public partial class ExcelHandler
     /// round-trip yet. Mirrors PptxBatchEmitter's EmitAuxiliaryPartsScan
     /// contract: silent data loss is worse than a noisy warning.
     /// </summary>
+    // Worksheet children the batch emitter round-trips (or that replay
+    // regenerates as a side effect). Anything outside this set is content
+    // dump will silently lose — surface it as an unsupported_feature warning
+    // instead (mirrors PptxBatchEmitter.EmitAuxiliaryPartsScan).
+    private static readonly HashSet<string> DumpHandledWorksheetChildren = new(StringComparer.Ordinal)
+    {
+        "sheetPr", "dimension", "sheetViews", "sheetFormatPr", "cols",
+        "sheetData", "sheetProtection", "autoFilter", "sortState",
+        "mergeCells", "conditionalFormatting", "dataValidations",
+        "hyperlinks", "printOptions", "pageMargins", "pageSetup",
+        "headerFooter", "rowBreaks", "colBreaks", "drawing",
+        "legacyDrawing", "legacyDrawingHF", "oleObjects", "tableParts",
+        "extLst", "phoneticPr", "sheetCalcPr", "ignoredErrors",
+    };
+
+    // extLst ext URIs the emitter consumes (sparklines, slicer list, x14
+    // conditional formatting, x14 data validations, timeline).
+    private static readonly HashSet<string> DumpHandledExtUris = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "{05C60535-1F16-4fd2-B633-E4A46CF9E463}",
+        "{725AE2AE-9491-48be-B2B4-4EB974FC3084}",
+        "{78C0D931-6437-407d-A8EE-F0AAD7539E65}",
+        "{B025F937-C7B1-47D3-B67F-A62EFF666E3E}",
+        "{FF2B5EF4-FFF2-40B4-BE49-F238E27FC236}",
+    };
+
     public List<(string Element, string Reason)> GetDumpUnsupportedFeatures(string sheetName)
     {
         var result = new List<(string, string)>();
@@ -723,9 +774,25 @@ public partial class ExcelHandler
         if (worksheet == null) return result;
         var ws = GetSheet(worksheet);
 
-        // PR2-6 round-trip tables/cf/validations/comments/charts/sparklines/
-        // pictures/shapes/pivots/slicers/chartEx/OLE; nothing scans here
-        // today — kept as the hook for future unsupported content.
+        foreach (var child in ws.ChildElements)
+        {
+            var name = child.LocalName;
+            if (DumpHandledWorksheetChildren.Contains(name)) continue;
+            result.Add((name,
+                $"worksheet element <{name}> is not round-tripped by dump; it will be missing after replay"));
+        }
+
+        var wsExtLst = ws.GetFirstChild<WorksheetExtensionList>();
+        if (wsExtLst != null)
+        {
+            foreach (var ext in wsExtLst.Elements<WorksheetExtension>())
+            {
+                var uri = ext.Uri?.Value ?? "";
+                if (DumpHandledExtUris.Contains(uri)) continue;
+                result.Add(($"extLst ext {uri}",
+                    $"worksheet extension {uri} is not round-tripped by dump; its content will be missing after replay"));
+            }
+        }
         return result;
     }
 }

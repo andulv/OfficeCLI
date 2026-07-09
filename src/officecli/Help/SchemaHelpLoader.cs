@@ -781,7 +781,7 @@ internal static class SchemaHelpLoader
         int bestDist = int.MaxValue;
         foreach (var c in candidates)
         {
-            var dist = LevenshteinDistance(lower, c.ToLowerInvariant());
+            var dist = OfficeCli.Core.EditDistance.Damerau(lower, c.ToLowerInvariant());
             // Accept distance up to max(2, len/3) — same rule CommandBuilder uses.
             var maxDist = Math.Max(2, lower.Length / 3);
             if (dist <= maxDist && dist < bestDist)
@@ -792,28 +792,5 @@ internal static class SchemaHelpLoader
         }
 
         return best ?? substringHit;
-    }
-
-    private static int LevenshteinDistance(string s, string t)
-    {
-        if (s.Length == 0) return t.Length;
-        if (t.Length == 0) return s.Length;
-
-        var d = new int[s.Length + 1, t.Length + 1];
-        for (int i = 0; i <= s.Length; i++) d[i, 0] = i;
-        for (int j = 0; j <= t.Length; j++) d[0, j] = j;
-
-        for (int i = 1; i <= s.Length; i++)
-        {
-            for (int j = 1; j <= t.Length; j++)
-            {
-                int cost = s[i - 1] == t[j - 1] ? 0 : 1;
-                d[i, j] = Math.Min(
-                    Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1),
-                    d[i - 1, j - 1] + cost);
-            }
-        }
-
-        return d[s.Length, t.Length];
     }
 }

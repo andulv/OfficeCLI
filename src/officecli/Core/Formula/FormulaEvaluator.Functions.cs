@@ -1180,19 +1180,43 @@ internal partial class FormulaEvaluator
         return FR(sum);
     }
 
+    /// <summary>
+    /// Pre-extract the (criteria-range, criteria) pairs of a *IFS call ONCE.
+    /// Flattening inside the per-row loop re-copied the whole criteria range for
+    /// every row scanned — O(rows²·criteria) element copies, the dominant cost on
+    /// SUMIFS-heavy workbooks (issue #187). Returns null when any criteria range
+    /// fails to resolve — the caller maps that to its own "no row matches" result,
+    /// exactly as the per-row `cr == null → match=false` used to.
+    /// </summary>
+    private static List<(FormulaResult?[] Range, string Crit)>? ExtractCriteriaPairs(List<object> args, int start)
+    {
+        var pairs = new List<(FormulaResult?[], string)>();
+        for (int c = start; c + 1 < args.Count; c += 2)
+        {
+            var cr = AsResults(args[c]);
+            if (cr == null) return null;
+            pairs.Add((cr, args[c + 1] is FormulaResult cv ? cv.AsString() : ""));
+        }
+        return pairs;
+    }
+
+    private static bool MatchesAllCriteria(List<(FormulaResult?[] Range, string Crit)> pairs, int i)
+    {
+        foreach (var (cr, crit) in pairs)
+            if (i >= cr.Length || !MatchesCriteria(cr[i], crit)) return false;
+        return true;
+    }
+
     private FormulaResult? EvalSumIfs(List<object> args)
     {
         if (args.Count < 3) return null;
         var sumRange = AsResults(args[0]); if (sumRange == null) return null;
+        var pairs = ExtractCriteriaPairs(args, 1);
+        if (pairs == null) return FR(0); // unresolvable criteria range: no row matches
         double sum = 0;
         for (int i = 0; i < sumRange.Length; i++)
-        {
-            var match = true;
-            for (int c = 1; c + 1 < args.Count; c += 2)
-            { var cr = AsResults(args[c]); var crit = args[c + 1] is FormulaResult cv ? cv.AsString() : "";
-              if (cr == null || i >= cr.Length || !MatchesCriteria(cr[i], crit)) { match = false; break; } }
-            if (match) { var n = AsNumeric(sumRange[i]); if (n.HasValue) sum += n.Value; }
-        }
+            if (MatchesAllCriteria(pairs, i))
+            { var n = AsNumeric(sumRange[i]); if (n.HasValue) sum += n.Value; }
         return FR(sum);
     }
 
@@ -1223,15 +1247,11 @@ internal partial class FormulaEvaluator
     {
         if (args.Count < 2) return null;
         var first = AsResults(args[0]); if (first == null) return null;
+        var pairs = ExtractCriteriaPairs(args, 0);
+        if (pairs == null) return FR(0); // unresolvable criteria range: no row matches
         int count = 0;
         for (int i = 0; i < first.Length; i++)
-        {
-            var match = true;
-            for (int c = 0; c + 1 < args.Count; c += 2)
-            { var cr = AsResults(args[c]); var crit = args[c + 1] is FormulaResult cv ? cv.AsString() : "";
-              if (cr == null || i >= cr.Length || !MatchesCriteria(cr[i], crit)) { match = false; break; } }
-            if (match) count++;
-        }
+            if (MatchesAllCriteria(pairs, i)) count++;
         return FR(count);
     }
 
@@ -1252,15 +1272,12 @@ internal partial class FormulaEvaluator
     {
         if (args.Count < 3) return null;
         var avgRange = AsResults(args[0]); if (avgRange == null) return null;
+        var pairs = ExtractCriteriaPairs(args, 1);
+        if (pairs == null) return FormulaResult.Error("#DIV/0!"); // unresolvable criteria range: no row matches
         var vals = new List<double>();
         for (int i = 0; i < avgRange.Length; i++)
-        {
-            var match = true;
-            for (int c = 1; c + 1 < args.Count; c += 2)
-            { var cr = AsResults(args[c]); var crit = args[c + 1] is FormulaResult cv ? cv.AsString() : "";
-              if (cr == null || i >= cr.Length || !MatchesCriteria(cr[i], crit)) { match = false; break; } }
-            if (match) { var n = AsNumeric(avgRange[i]); if (n.HasValue) vals.Add(n.Value); }
-        }
+            if (MatchesAllCriteria(pairs, i))
+            { var n = AsNumeric(avgRange[i]); if (n.HasValue) vals.Add(n.Value); }
         return vals.Count > 0 ? FR(vals.Average()) : FormulaResult.Error("#DIV/0!");
     }
 
@@ -1268,15 +1285,12 @@ internal partial class FormulaEvaluator
     {
         if (args.Count < 3) return null;
         var valRange = AsResults(args[0]); if (valRange == null) return null;
+        var pairs = ExtractCriteriaPairs(args, 1);
+        if (pairs == null) return FR(0); // unresolvable criteria range: no row matches
         var vals = new List<double>();
         for (int i = 0; i < valRange.Length; i++)
-        {
-            var match = true;
-            for (int c = 1; c + 1 < args.Count; c += 2)
-            { var cr = AsResults(args[c]); var crit = args[c + 1] is FormulaResult cv ? cv.AsString() : "";
-              if (cr == null || i >= cr.Length || !MatchesCriteria(cr[i], crit)) { match = false; break; } }
-            if (match) { var n = AsNumeric(valRange[i]); if (n.HasValue) vals.Add(n.Value); }
-        }
+            if (MatchesAllCriteria(pairs, i))
+            { var n = AsNumeric(valRange[i]); if (n.HasValue) vals.Add(n.Value); }
         return vals.Count > 0 ? FR(isMax ? vals.Max() : vals.Min()) : FR(0);
     }
 

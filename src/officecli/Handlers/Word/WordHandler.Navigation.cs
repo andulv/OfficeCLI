@@ -2561,7 +2561,7 @@ public partial class WordHandler
                 // Open XML SDK v3 enum .ToString() returns "FooValues { }"
                 // — use .InnerText to get the actual XML attribute value
                 // ("center", "right", "begin", etc.). Same trap as the
-                // LineSpacingRuleValues note in WordHandler CLAUDE.md.
+                // LineSpacingRuleValues note in the Word handler conventions.
                 var ptabAlign = ptabEl.Alignment?.HasValue == true ? ptabEl.Alignment.InnerText : null;
                 var ptabRelTo = ptabEl.RelativeTo?.HasValue == true ? ptabEl.RelativeTo.InnerText : null;
                 var ptabLeader = ptabEl.Leader?.HasValue == true ? ptabEl.Leader.InnerText : null;
@@ -6548,7 +6548,7 @@ public partial class WordHandler
             // fifths-of-percent, so divide by 50 and append '%' so dump→batch
             // can recognize and re-emit pct cell widths.
             // BUG-R4-05: emit width with explicit unit suffix (dxa/%) — root
-            // CLAUDE.md mandates unit-qualified width readback. Bare integer
+            // the project conventions mandates unit-qualified width readback. Bare integer
             // ("3000") is the historic bug.
             // BUG-R4B(BUG1): decimal-tolerant cell-width read.
             if (SafeWidth(tcPr.TableCellWidth?.Width) is int cwRaw)

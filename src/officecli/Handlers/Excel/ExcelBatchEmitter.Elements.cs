@@ -93,6 +93,12 @@ public static partial class ExcelBatchEmitter
             CopyString(t, "name", props, "name");
             CopyString(t, "displayName", props, "displayName");
             CopyString(t, "style", props, "style");
+            // A table with no tableStyleInfo renders plain; AddTable defaults
+            // to TableStyleMedium2, so an omitted style key restyled the
+            // replayed table (visible SSIM drift on externally-authored
+            // files). Emit the explicit `none` alias to preserve plainness.
+            if (!props.ContainsKey("style"))
+                props["style"] = "none";
             // headerRow defaults true on Add; totalRow defaults false — emit
             // only the non-default direction to keep round-trip idempotent.
             if (t.Format.TryGetValue("headerRow", out var hr) && hr is bool hrB && !hrB)
@@ -141,15 +147,20 @@ public static partial class ExcelBatchEmitter
     private static void EmitConditionalFormats(ExcelHandler xl, string sheetPath, int count,
         List<BatchItem> items, List<UnsupportedWarning> warnings)
     {
-        for (int i = 1; i <= count; i++)
+        // Iterate cf RULES, not cf elements. A <conditionalFormatting> element
+        // can hold several <cfRule> children (Excel stacks rules on one range);
+        // the cf[N] Get index space and `count` are per-element and only expose
+        // rule[0], so emitting per-element dropped rule[1..N] silently. The
+        // per-rule enumeration surfaces each rule as its own add-command.
+        List<DocumentNode> cfNodes;
+        try { cfNodes = xl.GetDumpCfRuleNodes(sheetPath.TrimStart('/')); }
+        catch (Exception ex)
         {
-            DocumentNode cf;
-            try { cf = xl.Get($"{sheetPath}/cf[{i}]"); }
-            catch (Exception ex)
-            {
-                warnings.Add(new UnsupportedWarning("conditionalformatting", $"{sheetPath}/cf[{i}]", ex.Message));
-                continue;
-            }
+            warnings.Add(new UnsupportedWarning("conditionalformatting", sheetPath, ex.Message));
+            return;
+        }
+        foreach (var cf in cfNodes)
+        {
             var type = cf.Format.TryGetValue("type", out var tv) ? tv as string ?? "" : "";
             var props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             CopyString(cf, "ref", props, "ref");
@@ -406,6 +417,18 @@ public static partial class ExcelBatchEmitter
             {
                 props.Remove("data");
                 props.Remove("categories");
+                // BuildChartProps also emits combined literal `series{N}` keys
+                // ("Name:1,2,3"). For externally-authored files whose series
+                // carry no numCache the values half is empty, producing a
+                // malformed dangling-colon spec ("'Sheet'!B1:") — drop those;
+                // the dotted series{N}.name/.values refs below replay the
+                // series and repopulate the cache. Well-formed combined keys
+                // are kept: they carry the resolved cache literals.
+                foreach (var combinedKey in props.Keys
+                    .Where(k => System.Text.RegularExpressions.Regex.IsMatch(k, @"^series\d+$")
+                        && (props[k].Length == 0 || props[k].EndsWith(":")))
+                    .ToList())
+                    props.Remove(combinedKey);
                 for (int n = 0; n < series.Count; n++)
                 {
                     var s = series[n];
@@ -521,8 +544,20 @@ public static partial class ExcelBatchEmitter
             var picAnchor = xl.GetDumpPictureAnchorEmu(sheetName, i);
             if (picAnchor != null)
             {
-                props["x"] = picAnchor.X.ToString();
-                props["y"] = picAnchor.Y.ToString();
+                if (picAnchor.Mode == "absolute")
+                {
+                    // Absolute anchors position by EMU <xdr:pos>, and the add
+                    // vocabulary takes x/y as EMU for anchorMode=absolute.
+                    props["anchorMode"] = "absolute";
+                    props["x"] = $"{picAnchor.XEmu}emu";
+                    props["y"] = $"{picAnchor.YEmu}emu";
+                }
+                else
+                {
+                    if (picAnchor.Mode == "oneCell") props["anchorMode"] = "oneCell";
+                    props["x"] = picAnchor.X.ToString();
+                    props["y"] = picAnchor.Y.ToString();
+                }
                 props["width"] = $"{picAnchor.WidthEmu}emu";
                 props["height"] = $"{picAnchor.HeightEmu}emu";
                 if (picAnchor.HasFromOffset)
@@ -538,6 +573,7 @@ public static partial class ExcelBatchEmitter
             }
             CopyString(pic, "alt", props, "alt");
             CopyString(pic, "name", props, "name");
+            CopyString(pic, "title", props, "title");
             CopyValue(pic, "rotation", props, "rotation");
             CopyString(pic, "flip", props, "flip");
             CopyString(pic, "crop", props, "crop");
@@ -569,6 +605,7 @@ public static partial class ExcelBatchEmitter
             CopyString(shp, "name", props, "name");
             CopyString(shp, "geometry", props, "preset");
             CopyString(shp, "fill", props, "fill");
+            CopyString(shp, "gradientFill", props, "gradientFill");
             CopyValue(shp, "x", props, "x");
             CopyValue(shp, "y", props, "y");
             CopyValue(shp, "width", props, "width");

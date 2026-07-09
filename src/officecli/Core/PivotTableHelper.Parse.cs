@@ -379,7 +379,7 @@ internal static partial class PivotTableHelper
     // as distinct values; XML "percent" deserializes to .Percent, and
     // EnumValue<T>.ToString() yields garbage like "showdataasvalues { }"
     // (same class of bug as LineSpacingRuleValues.Auto.ToString() documented
-    // in CLAUDE.md "Known API Quirks"). Reading InnerText sidesteps both
+    // in the project conventions "Known API Quirks"). Reading InnerText sidesteps both
     // traps — no silent enum-fall-through, no SDK ToString() footguns.
     private static string ShowDataAsToCanonicalToken(EnumValue<ShowDataAsValues>? showDataAs)
     {

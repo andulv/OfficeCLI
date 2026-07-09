@@ -70,6 +70,46 @@ internal static class ExcelDataFormatter
         BuiltInFormats.TryGetValue(numFmtId, out var code) ? code : null;
 
     /// <summary>
+    /// Convert a DateTime to an Excel 1900-system serial. .NET's ToOADate
+    /// runs one day AHEAD of Excel for dates before 1900-03-01 (Excel keeps
+    /// Lotus 1-2-3's fictitious 1900-02-29 as serial 60); writing the raw
+    /// OADate stored 1900-02-28 as serial 60, which Excel reads back as
+    /// 02-29. Mirrors the read-side adjustment in FormatDate.
+    /// </summary>
+    public static double ToExcelSerial(DateTime dt)
+    {
+        var oa = dt.ToOADate();
+        return dt < new DateTime(1900, 3, 1) && oa >= 2 ? oa - 1 : oa;
+    }
+
+    /// <summary>
+    /// Shared date-format-code detector for Get and the HTML preview (which
+    /// previously kept a forked contains-check that misclassified Y0.00 as a
+    /// date). A format mixing date tokens with digit placeholders is not a
+    /// date; fractional seconds (ss.00) are the one exception.
+    /// </summary>
+    public static bool LooksLikeDateFormatCode(string formatCode)
+        => IsDateFormat(0, formatCode);
+
+    /// <summary>
+    /// Excel-1900-system serial → DateTime, applying the Lotus leap-bug
+    /// alignment (serial 60 is the fictitious 1900-02-29 — mapped to
+    /// 02-28's DateTime here since .NET has no such date, callers wanting
+    /// the exact string should special-case 60; serials 1-59 run one day
+    /// ahead of the OADate scale). Shared with the HTML preview.
+    /// </summary>
+    public static DateTime FromExcelSerial(double value)
+    {
+        if (value >= 60 && value < 61)
+            // Fictitious 1900-02-29: no DateTime exists; approximate with
+            // 02-28 (+ time fraction). Callers that render a date string
+            // should special-case the day (see FormatDate / the HTML branch).
+            return new DateTime(1900, 2, 28).AddDays(value - 60);
+        if (value >= 1 && value < 60) value += 1;
+        return DateTime.FromOADate(value);
+    }
+
+    /// <summary>
     /// Format a raw numeric cell value using its number format.
     /// Returns null if no formatting is needed (raw value is fine as-is).
     /// </summary>
@@ -77,14 +117,43 @@ internal static class ExcelDataFormatter
     {
         var formatCode = customFormatCode ?? (BuiltInFormats.TryGetValue(numFmtId, out var b) ? b : null);
 
-        if (IsDateFormat(numFmtId, formatCode))
+        // Multi-section formats (pos;neg;zero;text): the DETECTORS below must
+        // see only the section that applies to THIS value. Whole-string
+        // scanning misclassified m/d/yy;0% — the digit in the negative
+        // section defeated the date check and the % matched the percent
+        // check, so a positive date serial rendered as a huge percentage.
+        // Formatting itself still receives the full code where the formatter
+        // has its own section handling (FormatPercent's sign-magnitude rule).
+        var detectCode = formatCode;
+        if (detectCode != null && detectCode.Contains(';'))
+        {
+            var sections = detectCode.Split(';');
+            detectCode = value switch
+            {
+                > 0 => sections[0],
+                < 0 => sections.Length > 1 ? sections[1] : sections[0],
+                _ => sections.Length > 2 ? sections[2] : sections[0],
+            };
+            if (string.IsNullOrWhiteSpace(detectCode)) return null;
+        }
+
+        // Elapsed-time accumulator formats ([h]:mm:ss, [mm]:ss, [s]) count
+        // total units instead of wrapping into a calendar time — 1.5 under
+        // [h]:mm:ss is 36:00:00, not "1899-12-31 12:00". IsDateFormat strips
+        // bracket codes before scanning, so these used to fall through to
+        // the calendar-date path and render a nonsense wrapped date.
+        if (detectCode != null
+            && Regex.IsMatch(detectCode, @"\[(h+|m+|s+)\]", RegexOptions.IgnoreCase))
+            return FormatElapsed(value, detectCode);
+
+        if (IsDateFormat(numFmtId, detectCode))
             // 1904 date system: serials count from 1904-01-01, which is
             // exactly 1462 days after the 1900 system's 1899-12-30 epoch
             // that FromOADate assumes. Without the shift a date1904
             // workbook's cells read back four years early.
-            return FormatDate(date1904 ? value + 1462 : value, formatCode);
+            return FormatDate(date1904 ? value + 1462 : value, detectCode);
 
-        if (IsPercentFormat(formatCode))
+        if (IsPercentFormat(detectCode))
             return FormatPercent(value, formatCode!);
 
         return null; // let caller fall back to raw value
@@ -132,6 +201,15 @@ internal static class ExcelDataFormatter
         var stripped = Regex.Replace(formatCode, "\"[^\"]*\"", "");
         stripped = BracketCodeRegex.Replace(stripped, "");
 
+        // A date/time format never mixes date tokens with numeric
+        // placeholders (0/#) — the only exception is fractional seconds
+        // (ss.00), normalized away first. Without this, a garbage custom
+        // format like Y0.00 tripped the date heuristic and Get displayed the
+        // numeric value 5000 as the date string 1913-09-08.
+        var noSecondsFraction = Regex.Replace(stripped, @"s\.0+", "s", RegexOptions.IgnoreCase);
+        if (noSecondsFraction.IndexOfAny(new[] { '0', '#' }) >= 0)
+            return false;
+
         return DateTokenRegex.IsMatch(stripped);
     }
 
@@ -142,10 +220,59 @@ internal static class ExcelDataFormatter
         return stripped.Contains('%');
     }
 
+    // Serial days → accumulated h/m/s per the first bracketed token; the
+    // tokens after it decide whether minute/second parts are appended.
+    private static string FormatElapsed(double value, string formatCode)
+    {
+        var negative = value < 0;
+        var totalSeconds = (long)Math.Round(Math.Abs(value) * 86400);
+        var acc = Regex.Match(formatCode, @"\[(h+|m+|s+)\]", RegexOptions.IgnoreCase);
+        var unit = char.ToLowerInvariant(acc.Groups[1].Value[0]);
+        var rest = formatCode[(acc.Index + acc.Length)..];
+        var restStripped = Regex.Replace(rest, "\"[^\"]*\"", "");
+        string text;
+        switch (unit)
+        {
+            case 'h':
+            {
+                var h = totalSeconds / 3600;
+                var mm = totalSeconds % 3600 / 60;
+                var ss = totalSeconds % 60;
+                var hasMin = restStripped.Contains('m', StringComparison.OrdinalIgnoreCase);
+                var hasSec = restStripped.Contains('s', StringComparison.OrdinalIgnoreCase);
+                text = hasMin && hasSec ? $"{h}:{mm:00}:{ss:00}"
+                    : hasMin ? $"{h}:{mm:00}"
+                    : h.ToString();
+                break;
+            }
+            case 'm':
+            {
+                var mTotal = totalSeconds / 60;
+                var ss = totalSeconds % 60;
+                text = restStripped.Contains('s', StringComparison.OrdinalIgnoreCase)
+                    ? $"{mTotal}:{ss:00}"
+                    : mTotal.ToString();
+                break;
+            }
+            default:
+                text = totalSeconds.ToString();
+                break;
+        }
+        return negative ? "-" + text : text;
+    }
+
     private static string FormatDate(double value, string? formatCode)
     {
         try
         {
+            // Excel's 1900 date system deliberately keeps Lotus 1-2-3's leap
+            // bug: serial 60 is the fictitious 1900-02-29, and serials 1-59
+            // (Jan/Feb 1900) run one day AHEAD of the OADate scale FromOADate
+            // uses. Serials 61+ agree exactly.
+            if (value >= 60 && value < 61)
+                return "1900-02-29";
+            if (value >= 1 && value < 60)
+                value += 1;
             var dt = DateTime.FromOADate(value);
 
             // Detect whether time component is significant
@@ -205,7 +332,10 @@ internal static class ExcelDataFormatter
         // Count decimal places from the section (e.g. "0.00%" → 2)
         var match = Regex.Match(section, @"0\.(0+)%");
         int decimals = match.Success ? match.Groups[1].Value.Length : 0;
-        var num = (value * 100).ToString($"F{decimals}", System.Globalization.CultureInfo.InvariantCulture) + "%";
+        // A ',' in the digit placeholder run requests thousands grouping
+        // (#,##0.00% renders 123,455.55%); F-format never groups.
+        var numFormat = section.Contains(',') ? $"N{decimals}" : $"F{decimals}";
+        var num = (value * 100).ToString(numFormat, System.Globalization.CultureInfo.InvariantCulture) + "%";
         // Re-attach the section's literal prefix/suffix around the digit run by
         // replacing the numeric placeholder token (the '#'/'0'/'.'/'%' span) with
         // the rendered number. This carries '(' ... ')' accounting wrappers.

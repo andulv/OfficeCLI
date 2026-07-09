@@ -16,8 +16,9 @@ namespace OfficeCli.Handlers;
 
 public partial class PowerPointHandler
 {
-    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
+    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
     {
+        Core.ViewRangeGuard.RejectTextRange(range, "pptx");
         var sb = new StringBuilder();
         int slideNum = 0;
         int totalSlides = GetSlideParts().Count();
@@ -469,8 +470,9 @@ public partial class PowerPointHandler
         };
     }
 
-    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
+    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
     {
+        Core.ViewRangeGuard.RejectTextRange(range, "pptx");
         var slidesArray = new JsonArray();
         int slideNum = 0;
         int totalSlides = GetSlideParts().Count();

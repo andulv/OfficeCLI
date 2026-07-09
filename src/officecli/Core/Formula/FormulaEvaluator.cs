@@ -180,11 +180,47 @@ internal class RangeData
 ///   FormulaEvaluator.Functions.cs — function dispatch + implementations
 ///   FormulaEvaluator.Helpers.cs   — math utilities, comparison helpers
 /// </summary>
+/// <summary>
+/// State shared by every <see cref="FormulaEvaluator"/> instance participating in
+/// one evaluation session (a root evaluator plus the per-sheet children it spawns
+/// for cross-sheet references). Without it, each cross-sheet cell dereference
+/// created a fresh evaluator whose <c>_cellIndex</c> re-scanned the whole target
+/// sheet, and every formula cell reached through a reference was re-evaluated from
+/// scratch — O(n²)+ blowup on workbooks whose formulas reference other formula
+/// cells (issue: resident pegs CPU and flush hangs on formula-heavy xlsx).
+/// Callers that batch many evaluations (the save-time cache sweep) can pass one
+/// session across per-sheet evaluators so memoized results survive sheet hops.
+/// </summary>
+internal sealed class FormulaEvalSession
+{
+    internal readonly HashSet<string> Visiting = new(StringComparer.OrdinalIgnoreCase);
+    internal readonly Dictionary<string, FormulaEvaluator> SheetEvaluators = new(StringComparer.OrdinalIgnoreCase);
+    internal readonly Dictionary<string, SheetData?> SheetDataByName = new(StringComparer.OrdinalIgnoreCase);
+    // Memoized result per formula cell ("Sheet!A1" → result). Only completed,
+    // cycle-free evaluations are stored; the seed-0 value a circular chain
+    // returns depends on the entry point and must never be reused.
+    internal readonly Dictionary<string, FormulaResult> CellMemo = new(StringComparer.OrdinalIgnoreCase);
+    // Populated-extent cache for whole-column/row clamping ("A:A" → used rows).
+    // Keyed by SheetData reference; evaluation never adds/removes rows or cells,
+    // so the extent is stable for the session's lifetime.
+    internal readonly Dictionary<SheetData, (int Min, int Max)> RowExtentBySheet = new();
+    internal readonly Dictionary<SheetData, (int Min, int Max)> ColExtentBySheet = new();
+    // Materialized-range cache ("Sheet|col,row,w,h" → RangeData). Many formulas
+    // scan the same criteria/data columns (SUMIFS/COUNTIF over PLN!$F:$F etc.);
+    // materializing the rect once per session instead of once per formula is the
+    // difference between minutes and seconds on formula-heavy workbooks. Safe for
+    // the same reason CellMemo is: cell results are stable within a session.
+    internal readonly Dictionary<string, RangeData> RangeMemo = new(StringComparer.OrdinalIgnoreCase);
+    internal int CircularHits;
+    internal int CrossSheetDepth;
+}
+
 internal partial class FormulaEvaluator
 {
     private readonly SheetData _sheetData;
     private readonly WorkbookPart? _workbookPart;
-    private readonly HashSet<string> _visiting;
+    private readonly FormulaEvalSession _session;
+    private HashSet<string> _visiting => _session.Visiting;
     private readonly HashSet<string> _expandingNames = new(StringComparer.OrdinalIgnoreCase);
     // LET / LAMBDA variable bindings (innermost scope). Names are case-insensitive.
     private readonly Dictionary<string, FormulaResult> _bindings = new(StringComparer.OrdinalIgnoreCase);
@@ -239,13 +275,26 @@ internal partial class FormulaEvaluator
     }
 
     public FormulaEvaluator(SheetData sheetData, WorkbookPart? workbookPart = null)
-        : this(sheetData, workbookPart, new HashSet<string>(StringComparer.OrdinalIgnoreCase), 0, "") { }
+        : this(sheetData, workbookPart, new FormulaEvalSession(), 0, "") { }
 
-    private FormulaEvaluator(SheetData sheetData, WorkbookPart? workbookPart, HashSet<string> visiting, int depth, string sheetKey)
+    /// <summary>
+    /// Root evaluator bound to a caller-owned session, so several root evaluators
+    /// (one per sheet in a sweep) share memoized cell results and per-sheet child
+    /// evaluators. <paramref name="sheetKey"/> must be the real sheet name when a
+    /// session is shared — it namespaces the memo/circular keys ("REP!A1").
+    /// </summary>
+    internal FormulaEvaluator(SheetData sheetData, WorkbookPart? workbookPart, FormulaEvalSession session, string sheetKey)
+        : this(sheetData, workbookPart, session, 0, sheetKey)
+    {
+        if (!string.IsNullOrEmpty(sheetKey))
+            session.SheetEvaluators[sheetKey] = this;
+    }
+
+    private FormulaEvaluator(SheetData sheetData, WorkbookPart? workbookPart, FormulaEvalSession session, int depth, string sheetKey)
     {
         _sheetData = sheetData;
         _workbookPart = workbookPart;
-        _visiting = visiting;
+        _session = session;
         _depth = depth;
         _sheetKey = sheetKey;
     }
@@ -1032,7 +1081,14 @@ internal partial class FormulaEvaluator
     {
         cellRef = StripDollar(cellRef).ToUpperInvariant();
         var qualifiedRef = string.IsNullOrEmpty(_sheetKey) ? cellRef : $"{_sheetKey}!{cellRef}";
-        if (!_visiting.Add(qualifiedRef)) return FormulaResult.Number(0); // circular ref: use 0 as initial value (matches Excel iterative calc)
+        if (!_visiting.Add(qualifiedRef))
+        {
+            // Circular ref: use 0 as initial value (matches Excel iterative calc).
+            // Count the hit so in-flight evaluations know their result is
+            // entry-point-dependent and must not be memoized.
+            _session.CircularHits++;
+            return FormulaResult.Number(0);
+        }
         try
         {
             var cell = FindCell(cellRef);
@@ -1043,6 +1099,14 @@ internal partial class FormulaEvaluator
             // would kill the resident process (DoS).
             if (cell.CellFormula?.Text != null)
             {
+                // Memoized? Referenced formula cells are re-evaluated (their
+                // cached <v> may be stale), but within one session the formula's
+                // own result cannot change — reuse it. Skipped while LET/LAMBDA
+                // bindings are live: the referenced cell's evaluation currently
+                // sees the caller's bindings (pre-existing quirk), so a result
+                // computed under bindings must not leak into other contexts.
+                if (_bindings.Count == 0 && _session.CellMemo.TryGetValue(qualifiedRef, out var memoized))
+                    return memoized;
                 // Primary: probe the real remaining stack (adapts to formula
                 // complexity, so complex nested formulas are covered too).
                 // Secondary: a high fixed backstop. Over either, surface a
@@ -1067,8 +1131,20 @@ internal partial class FormulaEvaluator
                 _parseDepth = 0;
                 try
                 {
+                    var circularBefore = _session.CircularHits;
                     var evaluated = EvaluateFormula(ModernFunctionQualifier.Unqualify(cell.CellFormula.Text));
-                    if (evaluated != null) return evaluated;
+                    if (evaluated != null)
+                    {
+                        // Memoize only clean results: no live bindings (see lookup
+                        // guard above) and no circular fallback during this
+                        // evaluation (a 0-seeded cycle result depends on where the
+                        // cycle was entered). Lambdas capture evaluator state and
+                        // are not safe to replay.
+                        if (_bindings.Count == 0 && !evaluated.IsLambda
+                            && circularBefore == _session.CircularHits)
+                            _session.CellMemo[qualifiedRef] = evaluated;
+                        return evaluated;
+                    }
                 }
                 catch { /* fall through to cached value */ }
                 finally { _sameSheetDepth--; _parseDepth = savedParseDepth; }
@@ -1116,7 +1192,10 @@ internal partial class FormulaEvaluator
         // (e.g. a 25-sheet chain reporting 22 instead of erroring). Matches the
         // same-sheet ResolveCellResult guard — depth exceeded → visible error,
         // never a silent numeric lie.
-        if (_depth > 20) return FormulaResult.Error("#NUM!"); // depth guard
+        // Chain depth lives on the session (not the instance) because child
+        // evaluators are cached per sheet and reused at whatever depth the
+        // current chain happens to be.
+        if (_session.CrossSheetDepth > 20) return FormulaResult.Error("#NUM!"); // depth guard
 
         var bangIdx = sheetCellRef.IndexOf('!');
         if (bangIdx < 0) return FormulaResult.Number(0);
@@ -1137,9 +1216,19 @@ internal partial class FormulaEvaluator
             return FormulaResult.Number(0);
         }
 
-        // ResolveCellResult will handle circular detection using qualified ref (sheetKey!cellRef)
-        var eval = new FormulaEvaluator(sheetData, _workbookPart, _visiting, _depth + 1, sheetName);
-        return eval.ResolveCellResult(cellRef);
+        // ResolveCellResult will handle circular detection using qualified ref
+        // (sheetKey!cellRef). Reuse one child evaluator per sheet: a fresh
+        // instance per dereference rebuilt _cellIndex (a full sheet scan) for
+        // EVERY cell read through a cross-sheet range — the dominant cost on
+        // SUMIFS/COUNTIF-heavy workbooks.
+        if (!_session.SheetEvaluators.TryGetValue(sheetName, out var eval) || !ReferenceEquals(eval._sheetData, sheetData))
+        {
+            eval = new FormulaEvaluator(sheetData, _workbookPart, _session, _depth + 1, sheetName);
+            _session.SheetEvaluators[sheetName] = eval;
+        }
+        _session.CrossSheetDepth++;
+        try { return eval.ResolveCellResult(cellRef); }
+        finally { _session.CrossSheetDepth--; }
     }
 
     /// <summary>
@@ -1149,23 +1238,27 @@ internal partial class FormulaEvaluator
     {
         if (string.IsNullOrEmpty(sheetName)) return _sheetData;
         if (_workbookPart == null) return null;
+        if (_session.SheetDataByName.TryGetValue(sheetName, out var cachedSheet)) return cachedSheet;
+        SheetData? resolved;
         try
         {
             var sheet = _workbookPart.Workbook?.Descendants<Sheet>()
                 .FirstOrDefault(s => string.Equals(s.Name?.Value, sheetName, StringComparison.OrdinalIgnoreCase));
-            if (sheet?.Id?.Value == null) return null;
-            var wsPart = (WorksheetPart)_workbookPart.GetPartById(sheet.Id.Value);
-            return wsPart.Worksheet?.GetFirstChild<SheetData>();
+            var wsPart = sheet?.Id?.Value != null ? (WorksheetPart)_workbookPart.GetPartById(sheet.Id!.Value!) : null;
+            resolved = wsPart?.Worksheet?.GetFirstChild<SheetData>();
         }
-        catch { return null; }
+        catch { resolved = null; }
+        _session.SheetDataByName[sheetName] = resolved;
+        return resolved;
     }
 
     /// <summary>
     /// Scan a sheet's populated rows to find min/max row index. Returns (0,0) if empty.
     /// Used to clamp entire-column references like "A:A" to the actual data area.
     /// </summary>
-    private static (int minRow, int maxRow) GetPopulatedRowRange(SheetData sheetData)
+    private (int minRow, int maxRow) GetPopulatedRowRange(SheetData sheetData)
     {
+        if (_session.RowExtentBySheet.TryGetValue(sheetData, out var cached)) return cached;
         int minRow = int.MaxValue, maxRow = 0;
         foreach (var row in sheetData.Elements<Row>())
         {
@@ -1176,15 +1269,18 @@ internal partial class FormulaEvaluator
                 if (i > maxRow) maxRow = i;
             }
         }
-        return maxRow == 0 ? (0, 0) : (minRow, maxRow);
+        var extent = maxRow == 0 ? (0, 0) : (minRow, maxRow);
+        _session.RowExtentBySheet[sheetData] = extent;
+        return extent;
     }
 
     /// <summary>
     /// Scan a sheet's populated cells to find min/max column index. Returns (0,0) if empty.
     /// Used to clamp entire-row references like "1:1" to the actual data area.
     /// </summary>
-    private static (int minCol, int maxCol) GetPopulatedColRange(SheetData sheetData)
+    private (int minCol, int maxCol) GetPopulatedColRange(SheetData sheetData)
     {
+        if (_session.ColExtentBySheet.TryGetValue(sheetData, out var cached)) return cached;
         int minCol = int.MaxValue, maxCol = 0;
         foreach (var row in sheetData.Elements<Row>())
             foreach (var cell in row.Elements<Cell>())
@@ -1200,7 +1296,9 @@ internal partial class FormulaEvaluator
                     }
                 }
             }
-        return maxCol == 0 ? (0, 0) : (minCol, maxCol);
+        var extent = maxCol == 0 ? (0, 0) : (minCol, maxCol);
+        _session.ColExtentBySheet[sheetData] = extent;
+        return extent;
     }
 
     private Cell? FindCell(string cellRef)
@@ -1274,6 +1372,14 @@ internal partial class FormulaEvaluator
         }
 
         var rows = r2 - r1 + 1; var cols = cMax - cMin + 1;
+        // Same rect-shaped memo as ResolveRef — literal range tokens ("A1:B3",
+        // "Sheet!A:A") route here instead, and repeat just as often.
+        var rangeMemoKey = rows * cols > 1
+            ? $"{sheetPrefix ?? _sheetKey}|{cMin},{r1},{cols},{rows}"
+            : null;
+        if (rangeMemoKey != null && _session.RangeMemo.TryGetValue(rangeMemoKey, out var memoRange))
+            return memoRange;
+        var circularBefore = _session.CircularHits;
         var cells = new FormulaResult?[rows, cols];
         for (int r = 0; r < rows; r++)
             for (int c = 0; c < cols; c++)
@@ -1287,7 +1393,10 @@ internal partial class FormulaEvaluator
         // answer correctly when given a literal range token (`A1:B3`) — the
         // tokenizer routes those through Expand2DRange, bypassing ResolveRef
         // where Round 2 introduced BaseRow/BaseCol propagation.
-        return new RangeData(cells) { BaseRow = r1, BaseCol = cMin, BaseSheet = sheetPrefix };
+        var range = new RangeData(cells) { BaseRow = r1, BaseCol = cMin, BaseSheet = sheetPrefix };
+        if (rangeMemoKey != null && circularBefore == _session.CircularHits)
+            _session.RangeMemo[rangeMemoKey] = range;
+        return range;
     }
 
     private static (string col, int row) ParseRef(string r)

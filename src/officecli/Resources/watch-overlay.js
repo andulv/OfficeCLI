@@ -295,7 +295,7 @@
     // its find no longer matches, we flip a visual-only stale class and
     // move on — same naive positional model as selection. No fingerprint,
     // no drift detection. grep "CONSISTENCY(path-stability)" for deferred
-    // sites. See CLAUDE.md Watch Server Rules.
+    // sites. See the project conventions Watch Server Rules.
     var _marks = [];
 
     function _isRegexFind(find) {

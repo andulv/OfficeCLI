@@ -922,7 +922,7 @@ public partial class PowerPointHandler
                       // CONSISTENCY(highlight): a:highlight — Set's curated case
                       // in SetRunOrShapeProperties writes it; route Add through
                       // the same fan-out so both paths support it (root
-                      // CLAUDE.md Feature Implementation Checklist).
+                      // the project conventions Feature Implementation Checklist).
                       "highlight" };
                 // CONSISTENCY(tracking-prop): explicit TryGetValue per known
                 // key instead of `.Where(...)` iteration. Foreach over the

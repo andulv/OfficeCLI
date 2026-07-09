@@ -45,12 +45,18 @@ public partial class ExcelHandler
         }
 
         // Check for sheet prefix: Sheet1!cell[...]
-        // Only treat '!' as sheet separator if NOT part of '!=' operator
-        var exclMatch = Regex.Match(selector, @"^(.+?)!(?!=)");
-        if (exclMatch.Success)
+        // Only a TOP-LEVEL '!' (outside brackets/quotes, not part of '!=')
+        // separates the sheet — a '!' inside a predicate value
+        // (row[F="x!"], row[Msg~=hello!]) is literal text, and the old
+        // ^(.+?)!(?!=) regex swallowed everything up to it as a "sheet".
+        var bangIdx = Core.SelectorCommaSplit.TopLevelIndexOf(selector, '!');
+        if (bangIdx > 0 && (bangIdx + 1 >= selector.Length || selector[bangIdx + 1] != '='))
         {
-            sheet = exclMatch.Groups[1].Value;
-            selector = selector[(exclMatch.Length)..];
+            // Excel-quoted names ('My Data (2024)'!row[...]) arrive quoted —
+            // the scanner already treats the quoted span as opaque, so the
+            // top-level '!' is the real separator; strip the quotes here.
+            sheet = UnquoteSheetName(selector[..bangIdx]);
+            selector = selector[(bangIdx + 1)..];
         }
 
         // Parse element and attributes: cell[attr=value]
@@ -135,11 +141,18 @@ public partial class ExcelHandler
         }
 
         var value = GetCellDisplayValue(cell);
+        // Stored value for a formatted cell (0.5, not "50%"; date serial, not the
+        // formatted date). Equality matches EITHER form so `value=50%` (display)
+        // and `value=0.5` (stored) both hit the same percentage cell.
+        var rawValue = GetCellRawComparisonValue(cell);
+        bool ValueMatches(string target) =>
+            value.Equals(target, StringComparison.OrdinalIgnoreCase)
+            || rawValue.Equals(target, StringComparison.OrdinalIgnoreCase);
 
         // Value filters
-        if (selector.ValueEquals != null && !value.Equals(selector.ValueEquals, StringComparison.OrdinalIgnoreCase))
+        if (selector.ValueEquals != null && !ValueMatches(selector.ValueEquals))
             return false;
-        if (selector.ValueNotEquals != null && value.Equals(selector.ValueNotEquals, StringComparison.OrdinalIgnoreCase))
+        if (selector.ValueNotEquals != null && ValueMatches(selector.ValueNotEquals))
             return false;
         if (selector.ValueContains != null && !value.Contains(selector.ValueContains, StringComparison.OrdinalIgnoreCase))
             return false;

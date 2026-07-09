@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // CONSISTENCY(watch-isolation): this file does not reference OfficeCli.Handlers, does not open files,
-// does not write to disk. See CLAUDE.md "Watch Server Rules". To relax this red line,
+// does not write to disk. See the project conventions "Watch Server Rules". To relax this red line,
 // grep "CONSISTENCY(watch-isolation)" and review every file in the watch subsystem project-wide.
 
 using System.IO.Pipes;

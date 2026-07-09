@@ -476,14 +476,25 @@ public static partial class ExcelBatchEmitter
             });
         if (sheetNode.Format.TryGetValue("protect", out var prot) && prot is bool pb && pb)
         {
+            var protProps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["protect"] = "true" };
+            // Round-trip the stored hashes verbatim (legacy password attr and
+            // the modern algorithm set) — previously the password was dropped
+            // and replay silently degraded to passwordless protection.
+            foreach (var hashKey in new[]
+            {
+                "passwordHash", "protection.algorithm", "protection.hash",
+                "protection.salt", "protection.spinCount",
+            })
+            {
+                if (sheetNode.Format.TryGetValue(hashKey, out var hv) && hv?.ToString() is { Length: > 0 } hvS)
+                    protProps[hashKey] = hvS;
+            }
             items.Add(new BatchItem
             {
                 Command = "set",
                 Path = sheetPath,
-                Props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["protect"] = "true" },
+                Props = protProps,
             });
-            warnings.Add(new UnsupportedWarning("sheet.password", sheetPath,
-                "sheet protection password hashes cannot be round-tripped; protection is emitted without a password"));
         }
 
         // Manual page breaks. Get exposes them as comma-joined index lists;
@@ -655,9 +666,33 @@ public static partial class ExcelBatchEmitter
         if (formula != null)
             return "=" + formula.TrimStart('=');
 
-        // Style-only cell: no stored value at all.
         var text = cell.Text ?? "";
-        if (string.IsNullOrEmpty(raw) && text.Length == 0) return null;
+        if (string.IsNullOrEmpty(raw) && text.Length == 0)
+        {
+            // Explicit empty-STRING cell (<c t="str"><v/></c>): COUNTA counts
+            // it and ISBLANK returns FALSE, so dropping it changes formula
+            // results on replay. There is no set vocabulary for it (set
+            // value= clears the cell), so replay through add cell, which
+            // writes the same t="str"/<v/> shape. A bare typeless cell
+            // (no value, no string type) is semantically absent — Excel
+            // itself prunes those on save — and stays dropped.
+            if (type is "String" or "SharedString" or "InlineString"
+                && cell.Path is { } emptyPath && emptyPath.LastIndexOf('/') > 0)
+            {
+                corrective.Add(new BatchItem
+                {
+                    Command = "add",
+                    Parent = emptyPath[..emptyPath.LastIndexOf('/')],
+                    Type = "cell",
+                    Props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["ref"] = LastPathSegment(emptyPath),
+                        ["value"] = "",
+                    },
+                });
+            }
+            return null;
+        }
 
         switch (type)
         {

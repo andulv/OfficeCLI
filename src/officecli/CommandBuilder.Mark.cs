@@ -98,7 +98,7 @@ static partial class CommandBuilder
             // CONSISTENCY(find-regex): reuse WordHandler.Set.cs:60-61's regex→raw-string conversion
             // so mark and set share the exact same find/regex vocabulary (literal | r"..." | regex=true flag).
             // To change the find parsing protocol, grep "CONSISTENCY(find-regex)" and update every call site
-            // project-wide in one pass — never patch mark alone. See CLAUDE.md Design Principles.
+            // project-wide in one pass — never patch mark alone. See the project conventions Design Principles.
             props.TryGetValue("find", out var findText);
             findText ??= "";
             if (props.TryGetValue("regex", out var regexFlag) && ParseHelpers.IsTruthySafe(regexFlag)

@@ -111,6 +111,14 @@ static partial class CommandBuilder
                 }
             }
 
+            // TreatUnmatchedTokensAsErrors=false exists so the bare key=value
+            // warnings above can fire — but it also let a completely unknown
+            // `--flag value` pair (e.g. `--at A2`) vanish silently with exit 0,
+            // placing the element somewhere the caller did not intend. Any
+            // remaining unmatched --option that DetectUnmatchedKeyValues did
+            // not claim is a hard error, matching set/get behavior.
+            RejectUnknownOptionTokens(result, unmatchedKvWarnings);
+
             if (string.IsNullOrEmpty(type) && string.IsNullOrEmpty(from))
             {
                 throw new OfficeCli.Core.CliException("Either --type or --from must be specified.")

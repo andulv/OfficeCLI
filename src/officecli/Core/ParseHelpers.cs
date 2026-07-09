@@ -653,7 +653,7 @@ internal static class ParseHelpers
             // dk/lt collapse to canonical dark/light (no separate user-facing
             // form). tx/bg map to text/background — the SDK distinguishes
             // SchemeColorValues.Text1 / Background1 from Dark1 / Light1, and
-            // CLAUDE.md ("scheme colors pass through unchanged") demands the
+            // the project conventions ("scheme colors pass through unchanged") demands the
             // user-supplied form survives Get; collapsing tx1→dark1 would
             // break that contract for text1/text2/background1/background2 set
             // by the user.

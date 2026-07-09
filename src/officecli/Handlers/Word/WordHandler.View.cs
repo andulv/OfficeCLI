@@ -327,8 +327,9 @@ public partial class WordHandler
 
     // ==================== Semantic Layer ====================
 
-    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
+    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
     {
+        Core.ViewRangeGuard.RejectTextRange(range, "docx");
         var body = _doc.MainDocumentPart?.Document?.Body;
         if (body == null) return "(empty document)";
 
@@ -1031,8 +1032,9 @@ public partial class WordHandler
         return result;
     }
 
-    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
+    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
     {
+        Core.ViewRangeGuard.RejectTextRange(range, "docx");
         var body = _doc.MainDocumentPart?.Document?.Body;
         if (body == null) return new JsonObject { ["elements"] = new JsonArray() };
 

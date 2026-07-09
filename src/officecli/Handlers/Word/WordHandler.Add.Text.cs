@@ -2247,7 +2247,7 @@ public partial class WordHandler
         // (not via the generic TypedAttributeFallback at the tail) so a run
         // carrying ONLY a hint (no ea/ascii/…) still materializes a <w:rFonts>
         // — TypedAttributeFallback's generic binding for a hint-only run is
-        // fragile (project CLAUDE.md: schema reflection is a last-resort fallback,
+        // fragile (the project conventions: schema reflection is a last-resort fallback,
         // not the canonical path). The hint composes with ascii/hAnsi/ea/cs.
         string? nrHint = properties.TryGetValue("font.hint", out var rfHintVal) ? rfHintVal : null;
         if (nrAscii != null || nrHAnsi != null || nrEa != null || nrCs != null

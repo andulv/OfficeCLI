@@ -144,7 +144,7 @@ public partial class PowerPointHandler
                     OfficeCli.Core.SvgImageHelper.AppendSvgExtension(picture.BlipFill.Blip, picSvgRelId);
 
                 // Crop support (mirrors Set's crop emitter — keep keys/semantics
-                // identical per CLAUDE.md Feature Implementation Checklist).
+                // identical per the project conventions Feature Implementation Checklist).
                 // CONSISTENCY(ooxml-element-order): in CT_BlipFillProperties
                 // srcRect must precede the fill-mode element (stretch/tile);
                 // PowerPoint silently ignores an out-of-order srcRect.

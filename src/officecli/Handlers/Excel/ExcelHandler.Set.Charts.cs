@@ -45,13 +45,26 @@ public partial class ExcelHandler
         // If series sub-path, prefix all properties with series{N}. for ChartSetter
         var chartProps = properties;
         var isSeriesPath = m.Groups[2].Success;
+        var seriesPrefix = "";
         if (isSeriesPath)
         {
             var seriesIdx = int.Parse(m.Groups[2].Value);
+            seriesPrefix = $"series{seriesIdx}.";
             chartProps = new Dictionary<string, string>();
             foreach (var (key, value) in properties)
-                chartProps[$"series{seriesIdx}.{key}"] = value;
+                chartProps[seriesPrefix + key] = value;
         }
+
+        // Unsupported keys must be reported under the CALLER's spelling: the
+        // internal series{N}. prefix made them miss the CLI's applied-props
+        // subtraction, so a rejected key still showed up in the "Updated ..."
+        // success line while an UNSUPPORTED warning named a key the user
+        // never typed.
+        List<string> UnprefixSeries(List<string> unsup) => seriesPrefix.Length == 0
+            ? unsup
+            : unsup.Select(u => u.StartsWith(seriesPrefix, StringComparison.OrdinalIgnoreCase)
+                ? u[seriesPrefix.Length..]
+                : u).ToList();
 
         // Chart-level position/size Set — TwoCellAnchor mutation. Skip for series
         // sub-paths (series don't have their own position). Accepts x/y/width/height
@@ -79,12 +92,12 @@ public partial class ExcelHandler
         {
             var unsup = ChartHelper.SetChartProperties(chartInfo.StandardPart, chartProps);
             chartInfo.StandardPart.ChartSpace?.Save();
-            return unsup;
+            return UnprefixSeries(unsup);
         }
         else if (chartInfo.ExtendedPart != null)
         {
             // cx:chart — delegates to ChartExBuilder.SetChartProperties.
-            return ChartExBuilder.SetChartProperties(chartInfo.ExtendedPart, chartProps);
+            return UnprefixSeries(ChartExBuilder.SetChartProperties(chartInfo.ExtendedPart, chartProps));
         }
         else
         {

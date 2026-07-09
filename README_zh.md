@@ -216,6 +216,9 @@ irm https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.ps1 | iex
 # Homebrew（macOS / Linux）
 brew install officecli
 
+# Scoop（Windows）
+scoop install officecli
+
 # npm（全平台 — 安装时自动拉取对应平台的原生二进制）
 npm install -g @officecli/officecli
 ```

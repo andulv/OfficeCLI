@@ -246,7 +246,7 @@ public partial class PowerPointHandler
         // Handles background and name props. Falls through for shape-nested paths.
         {
             // CONSISTENCY(master-layout-path-aliases): accept the short forms
-            // `/master[N]` and `/layout[N]` documented in Handlers/Pptx/CLAUDE.md
+            // `/master[N]` and `/layout[N]` documented in the PPTX handler conventions
             // alongside the long forms `/slidemaster[N]` and `/slidelayout[N]`.
             // Long form is what Get/Add emit; short form is accepted-only on input.
             var masterBgMatch = Regex.Match(path, @"^/(?:slidemaster|master)\[(\d+)\](?:/(?:slidelayout|layout)\[(\d+)\])?$", RegexOptions.IgnoreCase);

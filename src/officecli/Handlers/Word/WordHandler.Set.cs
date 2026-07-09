@@ -959,7 +959,7 @@ public partial class WordHandler
             // OOXML stores border size in eighth-of-a-point units. Accept bare
             // integer (already in eighths) plus unit-qualified lengths
             // ('1pt', '0.5cm', '0.05in') for parity with other Word length
-            // inputs (CONSISTENCY: spacing-units, root CLAUDE.md "Spacing
+            // inputs (CONSISTENCY: spacing-units, the project conventions "Spacing
             // input is lenient").
             var sz = parts[1].Trim();
             if (uint.TryParse(sz, out size))

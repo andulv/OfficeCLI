@@ -72,7 +72,7 @@ internal static partial class PivotTableHelper
             if (names.Count > 0)
                 // R4-1: canonical key matches input ('rows=' on Add/Set).
                 // Legacy 'rowFields' output key removed in favor of single
-                // canonical key per CLAUDE.md "Canonical DocumentNode.Format Rules".
+                // canonical key per the project conventions "Canonical DocumentNode.Format Rules".
                 node.Format["rows"] = string.Join(",", names);
         }
 
@@ -94,7 +94,7 @@ internal static partial class PivotTableHelper
             if (names.Count > 0)
                 // R2-3: canonical key matches input ('filters=' on Add/Set).
                 // Legacy 'filterFields' output key removed in favor of single
-                // canonical key per CLAUDE.md "Canonical DocumentNode.Format Rules".
+                // canonical key per the project conventions "Canonical DocumentNode.Format Rules".
                 node.Format["filters"] = string.Join(",", names);
         }
 
@@ -219,7 +219,7 @@ internal static partial class PivotTableHelper
         // R11-3: Grand totals readback. Both attributes default to true in
         // OOXML, so emit "true" when absent (default) and reflect explicit
         // false. Canonical key matches Add/Set input ('rowGrandTotals' /
-        // 'colGrandTotals') per CLAUDE.md canonical Format rules.
+        // 'colGrandTotals') per the project conventions canonical Format rules.
         node.Format["rowGrandTotals"] = (pivotDef.RowGrandTotals?.Value ?? true) ? "true" : "false";
         node.Format["colGrandTotals"] = (pivotDef.ColumnGrandTotals?.Value ?? true) ? "true" : "false";
 

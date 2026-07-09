@@ -376,7 +376,7 @@ public partial class PowerPointHandler
                     // emitter's single-run collapse merges that back into the
                     // paragraph set bag, producing {direction:rtl, rtl:true}
                     // and violating "Get returns the canonical key only"
-                    // (root CLAUDE.md). The textbox-column-flow side effect
+                    // (the project conventions). The textbox-column-flow side effect
                     // (<a:bodyPr rtlCol="1"/>) belongs to shape-level Set,
                     // not paragraph-level. Run-level rtl remains reachable
                     // via /paragraph[K]/run[R] direction=rtl.

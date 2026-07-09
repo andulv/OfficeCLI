@@ -25,8 +25,11 @@ internal sealed class FormatHandlerProxy : IDocumentHandler
 
     // ----- Semantic layer (text views) -----------------------------------
 
-    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
-        => SendViewString("text", startLine, endLine, maxLines, cols);
+    public string ViewAsText(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
+    {
+        ViewRangeGuard.RejectTextRange(range, "this format");
+        return SendViewString("text", startLine, endLine, maxLines, cols);
+    }
 
     public string ViewAsAnnotated(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
         => SendViewString("annotated", startLine, endLine, maxLines, cols);
@@ -39,8 +42,11 @@ internal sealed class FormatHandlerProxy : IDocumentHandler
 
     public JsonNode ViewAsStatsJson() => SendViewJson("stats");
     public JsonNode ViewAsOutlineJson() => SendViewJson("outline");
-    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null)
-        => SendViewJson("text", startLine, endLine, maxLines, cols);
+    public JsonNode ViewAsTextJson(int? startLine = null, int? endLine = null, int? maxLines = null, HashSet<string>? cols = null, string? range = null)
+    {
+        ViewRangeGuard.RejectTextRange(range, "this format");
+        return SendViewJson("text", startLine, endLine, maxLines, cols);
+    }
 
     public List<DocumentIssue> ViewAsIssues(string? issueType = null, int? limit = null)
     {

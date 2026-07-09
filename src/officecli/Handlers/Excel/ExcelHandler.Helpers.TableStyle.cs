@@ -51,7 +51,10 @@ public partial class ExcelHandler
             // reference. Violations pass schema validation but real Excel
             // refuses the whole file (0x800A03EC) — reject up front, same
             // rule set as the namedrange validator.
-            if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[A-Za-z_\\][A-Za-z0-9._\\]*$"))
+            // "Letter" is any Unicode letter (\p{L}) — Excel accepts CJK/
+            // Cyrillic table names (same identifier grammar as defined
+            // names, whose validator was widened the same way).
+            if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[\p{L}_\\][\p{L}\p{N}._\\]*$"))
                 throw new ArgumentException(
                     $"Table name '{name}' is not a valid Excel name: use letters, digits, '.' or '_' only, starting with a letter or '_' (no spaces). Excel refuses to open files with other table names.");
             if (LooksLikeCellReference(name)

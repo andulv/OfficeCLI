@@ -96,7 +96,7 @@ internal static partial class PivotTableHelper
     //   value, valuefield, valuefields       → values
     //   columngrandtotals                    → colgrandtotals
     //
-    // CONSISTENCY(compatibility-aliases): matches CLAUDE.md rule that Add/Set
+    // CONSISTENCY(compatibility-aliases): matches the project conventions rule that Add/Set
     // may accept legacy aliases so old scripts (e.g. Round 3's rowFields key)
     // keep round-tripping. Get continues to emit only the canonical form.
     private static readonly Dictionary<string, string> _pivotKeyAliases =

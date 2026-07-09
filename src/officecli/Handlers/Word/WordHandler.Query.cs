@@ -340,7 +340,7 @@ public partial class WordHandler
                 {
                     // CONSISTENCY(canonical-keys): only emit canonical "lvlText";
                     // legacy "text" alias dropped from Get output to honor root
-                    // CLAUDE.md "Canonical DocumentNode.Format Rules". Set still
+                    // the project conventions "Canonical DocumentNode.Format Rules". Set still
                     // accepts both keys via case "text" or "lvltext".
                     lNode.Format["lvlText"] = lvl.LevelText.Val.Value;
                 }
@@ -3479,7 +3479,7 @@ public partial class WordHandler
         // from the theme slot, and our own Add writes val="auto" alongside
         // w:themeColor. Surfacing "auto;themeColor=accent1" breaks the canon
         // rule that scheme colors pass through as the bare scheme name (root
-        // CLAUDE.md). Only the pure-theme form collapses; an explicit hex val
+        // the project conventions). Only the pure-theme form collapses; an explicit hex val
         // (BUG-DUMP-R44-1) or a shade/tint modifier still needs the full tail.
         if (string.Equals(color.Val?.Value, "auto", StringComparison.OrdinalIgnoreCase)
             && color.ThemeColor?.HasValue == true

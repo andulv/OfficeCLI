@@ -23,6 +23,7 @@ static partial class CommandBuilder
         var pageOpt = new Option<string?>("--page") { Description = "Page filter (e.g. 1, 2-5, 1,3,5). html mode: default=all. screenshot mode: default=1 (use --page 1-N to capture more, or --grid N for a whole-doc thumbnail contact sheet)." };
         var browserOpt = new Option<bool>("--browser") { Description = "Open output in browser (html / svg modes)" };
         var outOpt = new Option<string?>("--out", "-o") { Description = "Output file path (html, screenshot, pdf modes; defaults to stdout for html, a temp file for screenshot)" };
+        var clipOpt = new Option<string?>("--range") { Description = "Restrict output to a region. Screenshot mode: an xlsx cell range ('Sheet1!A1:C3' or '/Sheet1/A1:C3') or any element data-path ('/slide[1]/shape[@id=N]', '/body/table[1]'); the PNG is cropped to the target's bounding box. Text mode (xlsx only): a cell range or single cell — emits just those rows/cells, saving context on large sheets. Not the character-offset `range=` prop of `set` (that one formats a text span like 3:7)." };
         var screenshotWidthOpt = new Option<int>("--screenshot-width") { Description = "Screenshot viewport width (default 1600)", DefaultValueFactory = _ => 1600 };
         var screenshotHeightOpt = new Option<int>("--screenshot-height") { Description = "Screenshot viewport height (default 1200)", DefaultValueFactory = _ => 1200 };
         var gridOpt = new Option<string?>("--grid")
@@ -45,6 +46,7 @@ static partial class CommandBuilder
         viewCommand.Add(pageOpt);
         viewCommand.Add(browserOpt);
         viewCommand.Add(outOpt);
+        viewCommand.Add(clipOpt);
         viewCommand.Add(screenshotWidthOpt);
         viewCommand.Add(screenshotHeightOpt);
         viewCommand.Add(gridOpt);
@@ -65,6 +67,7 @@ static partial class CommandBuilder
             var pageFilter = result.GetValue(pageOpt);
             var browser = result.GetValue(browserOpt);
             var outArg = result.GetValue(outOpt);
+            var clipArg = result.GetValue(clipOpt);
             var screenshotWidth = result.GetValue(screenshotWidthOpt);
             var screenshotHeight = result.GetValue(screenshotHeightOpt);
             // --grid has three states: absent → off (0), present with no value
@@ -124,6 +127,7 @@ static partial class CommandBuilder
                 if (pageFilter != null) req.Args["page"] = pageFilter;
                 if (browser) req.Args["browser"] = "true";
                 if (outArg != null) req.Args["out"] = outArg;
+                if (clipArg != null) req.Args["range"] = clipArg;
                 req.Args["screenshot-width"] = screenshotWidth.ToString();
                 req.Args["screenshot-height"] = screenshotHeight.ToString();
                 if (gridCols != 0) req.Args["grid"] = gridCols.ToString(); // -1 = auto
@@ -219,9 +223,19 @@ static partial class CommandBuilder
                 // `.sheet-content { display:none }` + `.active` on sheet 0.
                 string? html = null;
                 byte[]? directPng = null;
+                // --clip captures a data-path-addressed region out of the HTML
+                // preview, so the native/direct-PNG backends (whole pages only)
+                // are bypassed. pptx: the clip's slide ordinal selects the page
+                // when --page wasn't given; docx: all pages render so the target
+                // can sit anywhere (--page still narrows explicitly).
+                if (clipArg != null)
+                    renderMode = "html";
                 if (handler is OfficeCli.Handlers.PowerPointHandler pptHandler)
                 {
                     var effectiveFilter = pageFilter;
+                    if (clipArg != null && string.IsNullOrEmpty(effectiveFilter)
+                        && System.Text.RegularExpressions.Regex.Match(clipArg, @"^/slide\[(\d+)\]") is { Success: true } slideM)
+                        effectiveFilter = slideM.Groups[1].Value;
                     if (string.IsNullOrEmpty(effectiveFilter) && start is null && end is null && gridCols == 0)
                         effectiveFilter = "1";
                     var (pStart, pEnd) = ParsePptHtmlPage(effectiveFilter, start, end, pptHandler);
@@ -358,10 +372,16 @@ static partial class CommandBuilder
                 }
                 else if (handler is OfficeCli.Handlers.WordHandler wordHandler)
                 {
-                    var effectiveFilter = string.IsNullOrEmpty(pageFilter) ? "1" : pageFilter;
+                    // --clip: render every page (filter stays null) unless the
+                    // caller narrowed with --page — the target may be anywhere.
+                    var effectiveFilter = clipArg != null
+                        ? pageFilter
+                        : (string.IsNullOrEmpty(pageFilter) ? "1" : pageFilter);
                     if (renderMode != "html" && OperatingSystem.IsWindows())
                     {
-                        try { directPng = OfficeCli.Core.WordPdfBackend.Render(file.FullName, effectiveFilter); }
+                        // effectiveFilter is only null under --range, which forces
+                        // renderMode=html — this native branch is then unreachable.
+                        try { directPng = OfficeCli.Core.WordPdfBackend.Render(file.FullName, effectiveFilter!); }
                         catch { directPng = null; }
                     }
                     if (renderMode == "native" && directPng == null)
@@ -433,8 +453,20 @@ static partial class CommandBuilder
                     // SECURITY: random token in temp filename — same rationale as the html/--browser path.
                     var tmpHtml = Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(file.Name)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
                     File.WriteAllText(tmpHtml, html!);
-                    var r = OfficeCli.Core.HtmlScreenshot.Capture(tmpHtml, pngPath, screenshotWidth, screenshotHeight);
+                    var r = clipArg != null
+                        ? OfficeCli.Core.HtmlScreenshot.CaptureClipped(tmpHtml, pngPath,
+                            OfficeCli.Core.HtmlScreenshot.ResolveClipDataPaths(clipArg))
+                        : OfficeCli.Core.HtmlScreenshot.Capture(tmpHtml, pngPath, screenshotWidth, screenshotHeight);
                     try { File.Delete(tmpHtml); } catch { /* ignore */ }
+                    if (!r.Ok && r.Error == "clip_target_not_found")
+                    {
+                        throw new OfficeCli.Core.CliException(
+                            $"--range target '{clipArg}' matched no rendered element.")
+                        {
+                            Code = "range_target_not_found",
+                            Suggestion = "Use a data-path the HTML preview emits (xlsx: 'Sheet1!A1:C3' within the sheet's used area; pptx: '/slide[N]/shape[K]'; docx: '/body/table[N]' or '/body/p[N]'). `query` lists element paths.",
+                        };
+                    }
                     if (!r.Ok)
                     {
                         throw new OfficeCli.Core.CliException(
@@ -596,7 +628,7 @@ static partial class CommandBuilder
                 else if (modeKey is "outline" or "o")
                     Console.WriteLine(OutputFormatter.WrapEnvelope(handler.ViewAsOutlineJson().ToJsonString(OutputFormatter.PublicJsonOptions)));
                 else if (modeKey is "text" or "t")
-                    Console.WriteLine(OutputFormatter.WrapEnvelope(handler.ViewAsTextJson(start, end, maxLines, cols).ToJsonString(OutputFormatter.PublicJsonOptions)));
+                    Console.WriteLine(OutputFormatter.WrapEnvelope(handler.ViewAsTextJson(start, end, maxLines, cols, clipArg).ToJsonString(OutputFormatter.PublicJsonOptions)));
                 else if (modeKey is "annotated" or "a")
                     Console.WriteLine(OutputFormatter.WrapEnvelope(
                         OutputFormatter.FormatView(mode, handler.ViewAsAnnotated(start, end, maxLines, cols), OutputFormat.Json)));
@@ -633,7 +665,7 @@ static partial class CommandBuilder
             {
                 var output = mode.ToLowerInvariant() switch
                 {
-                    "text" or "t" => handler.ViewAsText(start, end, maxLines, cols),
+                    "text" or "t" => handler.ViewAsText(start, end, maxLines, cols, clipArg),
                     "annotated" or "a" => handler.ViewAsAnnotated(start, end, maxLines, cols),
                     "outline" or "o" => handler.ViewAsOutline(),
                     "stats" or "s" => withPagesValue.HasValue
