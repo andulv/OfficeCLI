@@ -34,6 +34,13 @@ static partial class CommandBuilder
             var file = result.GetValue(watchFileArg)!;
             var port = result.GetValue(watchPortOpt);
 
+            var existingPort = WatchServer.GetExistingWatchPort(file.FullName);
+            if (existingPort.HasValue)
+            {
+                var url = existingPort.Value > 0 ? $" at http://localhost:{existingPort.Value}" : "";
+                throw new InvalidOperationException($"Another watch process is already running{url} for {file.FullName}");
+            }
+
             // Render initial HTML: ask the resident process if one is running,
             // otherwise open the file directly as a fallback.
             string? initialHtml = null;
