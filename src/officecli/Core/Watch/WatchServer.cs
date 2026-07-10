@@ -125,7 +125,7 @@ internal class WatchServer : IDisposable
         _pipeName = GetWatchPipeName(_filePath);
         _port = port;
         _idleTimeout = idleTimeout ?? ResolveIdleTimeout();
-        _tcpListener = new TcpListener(IPAddress.Loopback, _port);
+        _tcpListener = new TcpListener(IPAddress.Any, _port);
         if (!string.IsNullOrEmpty(initialHtml))
             _currentHtml = initialHtml;
     }
