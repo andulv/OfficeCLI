@@ -479,9 +479,22 @@ public class ResidentServer : IDisposable
                 if (xlsx != null) { xlsx.SweepBudgetOverride = null; xlsx.SweepYieldRequested = null; }
             }
             sw.Stop();
-            _dirty = false;
             RecordSaveDuration(sw.Elapsed);
-            LogStderr($"Autosaved {Path.GetFileName(_filePath)} (idle flush, resident still running).");
+            // A sweep interrupted by a command leaves formula caches partially
+            // refreshed on disk. Keeping _dirty=true makes the next idle window
+            // save again — that re-runs the sweep (the handler's Modified gate
+            // stays open for the whole session), so the file converges to fully
+            // swept once an idle window survives uninterrupted. Budget-exhausted
+            // sweeps do NOT retry (fullCalcOnLoad already covers them).
+            if (xlsx?.LastSweepTruncatedByYield == true)
+            {
+                LogStderr($"Autosaved {Path.GetFileName(_filePath)} (formula sweep yielded to a command; will re-sweep next idle window).");
+            }
+            else
+            {
+                _dirty = false;
+                LogStderr($"Autosaved {Path.GetFileName(_filePath)} (idle flush, resident still running).");
+            }
         }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { /* shutdown disposed _mainCts/_commandLock under us */ }

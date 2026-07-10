@@ -110,8 +110,22 @@ public partial class ExcelHandler
     public Func<bool>? SweepYieldRequested { get; set; }
     public TimeSpan? SweepBudgetOverride { get; set; }
 
+    /// <summary>
+    /// True when the most recent sweep stopped because <see cref="SweepYieldRequested"/>
+    /// fired (NOT because the budget ran out). A yield means a command interrupted an
+    /// otherwise-viable background sweep — the host should keep the document flagged
+    /// dirty so the next idle window re-runs the sweep to completion. Budget
+    /// exhaustion deliberately does NOT set this: retrying a sweep the budget cannot
+    /// fit would burn a full budget every idle cycle for nothing; fullCalcOnLoad is
+    /// the terminal answer there.
+    /// </summary>
+    public bool LastSweepTruncatedByYield { get; private set; }
+
     private void RefreshStaleFormulaCaches()
     {
+        // Reset BEFORE any early return — a stale true from a previous save would
+        // make the host retry forever on an already-clean document.
+        LastSweepTruncatedByYield = false;
         if (_doc.WorkbookPart == null) return;
         // Run whenever this session changed anything. `import` marks worksheets
         // dirty without flipping Modified, and it is the classic trigger — data
@@ -139,7 +153,13 @@ public partial class ExcelHandler
                 if (budgetExhausted) break;
                 foreach (var cell in row.Elements<Cell>())
                 {
-                    if (sweepClock.Elapsed > budget || yieldRequested?.Invoke() == true)
+                    if (yieldRequested?.Invoke() == true)
+                    {
+                        budgetExhausted = true;
+                        LastSweepTruncatedByYield = true;
+                        break;
+                    }
+                    if (sweepClock.Elapsed > budget)
                     {
                         budgetExhausted = true;
                         break;

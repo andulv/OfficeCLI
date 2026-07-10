@@ -173,6 +173,25 @@ public partial class ExcelHandler
                                 }
                                 if (changed) chartPart.ChartSpace.Save();
                             }
+                            // CONSISTENCY(sheet-rename-refs): chartEx series
+                            // formulas (<cx:f>SheetName!$A$1:$B$2</cx:f>) carry
+                            // the same sheet-qualified text as classic <c:f>
+                            // and hit the same "external links" failure when
+                            // left pointing at the old name.
+                            foreach (var extChartPart in anyWsPart.DrawingsPart.ExtendedChartParts)
+                            {
+                                if (extChartPart.ChartSpace == null) continue;
+                                bool changed = false;
+                                foreach (var f in extChartPart.ChartSpace.Descendants<DocumentFormat.OpenXml.Office2016.Drawing.ChartDrawing.Formula>())
+                                {
+                                    if (f.Text != null && f.Text.Contains(oldRef, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        f.Text = f.Text.Replace(oldRef, newRef, StringComparison.OrdinalIgnoreCase);
+                                        changed = true;
+                                    }
+                                }
+                                if (changed) extChartPart.ChartSpace.Save();
+                            }
                         }
 
                         // CONSISTENCY(sheet-rename-refs): three more places
