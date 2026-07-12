@@ -1,3 +1,5 @@
 # Build outputs
 **/bin/
 **/obj/
+data/versions.json
+data/v9.5.0/index.json
