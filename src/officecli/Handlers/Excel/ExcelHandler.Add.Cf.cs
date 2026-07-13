@@ -449,6 +449,7 @@ public partial class ExcelHandler
         // real Excel refuse the file (0x800A03EC) while schema validation
         // stays green. Same guard cell formulas already get.
         ValidateNoR1C1Reference(fcfFormula);
+        ValidateFormulaLength(fcfFormula, "conditional-format formula");
 
         // Build DifferentialFormat (dxf) for the formatting.
         // A dxf Font may carry: b, i, u, strike, sz, rFont, color.

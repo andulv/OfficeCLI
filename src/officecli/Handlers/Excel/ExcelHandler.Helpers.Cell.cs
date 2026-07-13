@@ -57,6 +57,13 @@ public partial class ExcelHandler
             }
         }
 
+        // Boolean cells store 0/1 in <v> per the OOXML spec, but Excel displays
+        // (and users expect) TRUE/FALSE. Decode it here so .Text matches what
+        // Excel renders — the write side already accepts TRUE/FALSE, and the
+        // dump emitter reads the raw 0/1 separately, so this is display-only.
+        if (cell.DataType?.Value == CellValues.Boolean)
+            return value == "1" ? "TRUE" : "FALSE";
+
         // Formula cells: if there's a cached value, return it.
         // If not, try to evaluate; otherwise emit a sentinel so callers can
         // distinguish "formula not evaluated" from "cell contains the literal
@@ -98,7 +105,7 @@ public partial class ExcelHandler
             var (numFmtId, formatCode) = ExcelDataFormatter.GetCellFormat(cell, _doc.WorkbookPart);
             if (numFmtId > 0)
             {
-                var is1904 = _doc.WorkbookPart?.Workbook?.WorkbookProperties?.Date1904?.Value == true;
+                var is1904 = IsWorkbookDate1904();
                 var formatted = ExcelDataFormatter.TryFormat(numVal, numFmtId, formatCode, is1904);
                 if (formatted != null) return formatted;
             }
@@ -106,6 +113,14 @@ public partial class ExcelHandler
 
         return value;
     }
+
+    /// <summary>
+    /// True when the workbook uses the 1904 date system (Date1904=true). The
+    /// stored serial for a date differs from the 1900 system by 1462 days, so
+    /// every date write and read must consult this flag to stay consistent.
+    /// </summary>
+    private bool IsWorkbookDate1904()
+        => _doc.WorkbookPart?.Workbook?.WorkbookProperties?.Date1904?.Value == true;
 
     // Underlying stored value for COMPARISON, as opposed to GetCellDisplayValue's
     // formatted string. A percentage cell compares as 0.5 (not "50%") and a date

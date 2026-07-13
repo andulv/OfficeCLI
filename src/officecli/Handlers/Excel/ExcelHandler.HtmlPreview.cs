@@ -2743,9 +2743,12 @@ public partial class ExcelHandler
 
         if (string.IsNullOrEmpty(rawValue)) return rawValue;
 
-        // Boolean: convert 1/0 to TRUE/FALSE
+        // Boolean: GetCellDisplayValue already decodes 1/0 to TRUE/FALSE.
+        // Return it directly (accepting a raw 1/0 too, for safety) rather than
+        // re-decoding — re-testing == "1" against the already-decoded "TRUE"
+        // wrongly yielded FALSE.
         if (cell.DataType?.Value == CellValues.Boolean)
-            return rawValue == "1" ? "TRUE" : "FALSE";
+            return rawValue is "1" or "TRUE" ? "TRUE" : "FALSE";
 
         // Only format numeric values (not strings, shared strings, etc.)
         if (cell.DataType?.Value == CellValues.SharedString ||

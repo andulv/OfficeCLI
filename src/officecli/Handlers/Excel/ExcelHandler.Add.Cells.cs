@@ -460,7 +460,23 @@ public partial class ExcelHandler
                     "value must be true/false, yes/no, or 1/0. Use type=string to keep the literal text.");
         }
 
+        // Atomicity: FindOrCreateCell materializes a <c> stub if the cell did
+        // not exist. A validation throw further down (bad textRotation, bad
+        // color, bad merge ref, ...) must not leave that stub — or the value
+        // already written into it — persisted while the command reports
+        // Error/exit 1. Capture pre-existence, then roll the new cell back on
+        // any throw. Mirrors the Set-side rollback (ExcelHandler.Set.cs).
+        var cellPreExisted = cellSheetData.Elements<Row>()
+            .SelectMany(r => r.Elements<Cell>())
+            .Any(c => string.Equals(c.CellReference?.Value, cellRef, StringComparison.OrdinalIgnoreCase));
+
         var cell = FindOrCreateCell(cellSheetData, cellRef);
+        // Clone for rollback of a pre-existing cell (restore original state);
+        // a newly created cell is removed instead (see catch below).
+        var cellBackup = cell.CloneNode(true);
+
+        try
+        {
 
         // CONSISTENCY(cell-value-alias): Set accepts "text" as alias for
         // "value" (see WordHandler.Set cell text handling); mirror that here.
@@ -564,7 +580,7 @@ public partial class ExcelHandler
                     && inferredDate >= new System.DateTime(1900, 1, 1))
                 {
                     cell.CellValue = new CellValue(
-                        ExcelDataFormatter.ToExcelSerial(inferredDate).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                        ExcelDataFormatter.ToExcelSerial(inferredDate, IsWorkbookDate1904()).ToString(System.Globalization.CultureInfo.InvariantCulture));
                     cell.DataType = null;
                 }
                 else if (!double.TryParse(safeValue, out var dbl) || !double.IsFinite(dbl))
@@ -675,6 +691,23 @@ public partial class ExcelHandler
                             $"Cannot store '{cell.CellValue?.Text}' as boolean; value must be true/false, yes/no, or 1/0. " +
                             "Use type=string to keep the literal text.");
                 }
+                // A type=number cell stores its value in <v> with no t=
+                // attribute, so a non-numeric value produces spec-invalid
+                // numeric content (<v>notanumber</v>) that makes real Excel
+                // refuse the whole file (0x800A03EC) while schema validation
+                // stays green. Reject up front, mirroring the boolean/date
+                // guards above.
+                if (cellType.ToLowerInvariant() is "number" or "num")
+                {
+                    var numText = cell.CellValue?.Text?.Trim();
+                    if (!string.IsNullOrEmpty(numText)
+                        && (!double.TryParse(numText, System.Globalization.NumberStyles.Any,
+                                System.Globalization.CultureInfo.InvariantCulture, out var numDbl)
+                            || !double.IsFinite(numDbl)))
+                        throw new ArgumentException(
+                            $"Cannot store '{cell.CellValue?.Text}' as number; value must be a finite numeric literal. " +
+                            "Use type=string to keep the literal text.");
+                }
                 // CONSISTENCY(cell-type-parity): mirror Set's value auto-detect
                 // path (ExcelHandler.Set.cs lines 1025-1033) — parse the cell
                 // value as an ISO date and write it back as an OADate double so
@@ -694,7 +727,7 @@ public partial class ExcelHandler
                                 $"Cannot store '{dateText}' as date; Excel does not support dates before 1900-01-01 " +
                                 $"(serial epoch is 1899-12-30). Use type=string to keep the literal text.");
                         cell.CellValue = new CellValue(
-                            ExcelDataFormatter.ToExcelSerial(dt).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                            ExcelDataFormatter.ToExcelSerial(dt, IsWorkbookDate1904()).ToString(System.Globalization.CultureInfo.InvariantCulture));
                     }
                     else if (!string.IsNullOrEmpty(dateText))
                     {
@@ -935,6 +968,32 @@ public partial class ExcelHandler
         DeleteCalcChainIfPresent();
         SaveWorksheet(cellWorksheet);
         return $"/{cellSheetName}/{cellRef}";
+        }
+        catch
+        {
+            if (cellPreExisted)
+            {
+                // Restore the pre-existing cell to its original state so a
+                // failed Add makes no partial change (mirrors Set-side rollback).
+                cell.Parent?.ReplaceChild(cellBackup, cell);
+            }
+            else
+            {
+                // Newly created by this Add — remove the stub (and its now-empty
+                // row) so a failed create leaves no ghost cell/value behind.
+                var newRow = cell.Parent as Row;
+                cell.Remove();
+                if (newRow != null && !newRow.Elements<Cell>().Any())
+                {
+                    var sd = newRow.Parent as SheetData;
+                    var rIdx = newRow.RowIndex?.Value;
+                    newRow.Remove();
+                    if (sd != null && rIdx.HasValue)
+                        _rowIndex?.GetValueOrDefault(sd)?.Remove(rIdx.Value);
+                }
+            }
+            throw;
+        }
     }
 
     private string AddCol(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
@@ -1140,7 +1199,20 @@ public partial class ExcelHandler
         }
         if (runSsi == null)
         {
+            // Converting a plain-string / inline-string / numeric cell to rich
+            // text: preserve the cell's existing content as the first unstyled
+            // run instead of silently discarding it. Without this, adding the
+            // first run to a cell that already had a value threw the value away
+            // (e.g. value="Hello World" + add run "Hi" → cell became just "Hi").
+            string? runExistingText = runCell.DataType?.Value == CellValues.InlineString
+                ? runCell.InlineString?.InnerText
+                : runCell.CellValue?.Text;
+
             runSsi = new SharedStringItem();
+            if (!string.IsNullOrEmpty(runExistingText))
+                runSsi.AppendChild(new Run(
+                    new Text(runExistingText) { Space = SpaceProcessingModeValues.Preserve }));
+            runCell.RemoveAllChildren<InlineString>();
             runSst.AppendChild(runSsi);
             var newSstIdx = runSst.Elements<SharedStringItem>().Count() - 1;
             runCell.CellValue = new CellValue(newSstIdx.ToString());
@@ -1389,7 +1461,16 @@ public partial class ExcelHandler
             }
         }
 
-        foreach (var (runText, pd) in gatheredRuns)
+        // Drop empty-text runs that carry formatting props: real Excel refuses
+        // the whole workbook (0x800A03EC) when a formatting-only empty <r> is
+        // not the last run in the <si>. They render nothing, so dropping is
+        // lossless; keep one if removing all would leave an empty <si>.
+        var effectiveRuns = gatheredRuns
+            .Where(r => !(string.IsNullOrEmpty(r.text) && r.props.Count > 0)).ToList();
+        if (effectiveRuns.Count == 0 && gatheredRuns.Count > 0)
+            effectiveRuns.Add(gatheredRuns[^1]);
+
+        foreach (var (runText, pd) in effectiveRuns)
         {
             var run = new Run();
             var rp = new RunProperties();

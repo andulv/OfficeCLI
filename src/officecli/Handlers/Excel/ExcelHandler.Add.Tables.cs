@@ -1319,7 +1319,12 @@ public partial class ExcelHandler
         if (!hasHeader)
             table.HeaderRowCount = 0;
 
-        table.AppendChild(new AutoFilter { Reference = rangeRef });
+        // An <autoFilter> is only valid on a table WITH a header row — the
+        // filter dropdowns attach to header cells. Adding it to a header-less
+        // table (headerRowCount=0) makes real Excel refuse the file
+        // (0x800A03EC) even though schema validation passes.
+        if (hasHeader)
+            table.AppendChild(new AutoFilter { Reference = rangeRef });
 
         // CONSISTENCY(autofilter-table-dup): Excel rejects a worksheet that
         // carries both a sheet-level <autoFilter> AND a <tableParts> reference

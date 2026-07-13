@@ -191,6 +191,26 @@ public partial class ExcelHandler
                 // refused the file (0x800A03EC).
                 case "sqref" or "ref":
                     var dvNormRef = ValidateSqref(value, "validation ref");
+                    // Mirror AddValidation's R27-3 overlap guard: a validation
+                    // moved onto cells already covered by another validation is
+                    // silently inert in Excel (first wins). Reject rather than
+                    // persist a dead rule.
+                    var dvContainer = dv.Parent as DataValidations;
+                    if (dvContainer != null)
+                    {
+                        var movedRanges = dvNormRef.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        foreach (var sibling in dvContainer.Elements<DataValidation>())
+                        {
+                            if (ReferenceEquals(sibling, dv)) continue;
+                            var sibRanges = (sibling.SequenceOfReferences?.InnerText ?? "")
+                                .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                            foreach (var mr in movedRanges)
+                                foreach (var sr in sibRanges)
+                                    if (RangesOverlap(mr, sr))
+                                        throw new ArgumentException(
+                                            $"DataValidation ref '{mr}' overlaps existing validation ref '{sr}'; Excel ignores stacked validations on the same cells. Use a non-overlapping range.");
+                        }
+                    }
                     dv.SequenceOfReferences = new ListValue<StringValue>(
                         dvNormRef.Split(' ').Select(s => new StringValue(s)));
                     break;
@@ -363,8 +383,14 @@ public partial class ExcelHandler
         {
             switch (key.ToLowerInvariant())
             {
-                case "name": table.Name = value; break;
-                case "displayname": table.DisplayName = value; break;
+                case "name":
+                    ValidateTableIdentifierUnique(value, table, isDisplayName: false);
+                    table.Name = value;
+                    break;
+                case "displayname":
+                    ValidateTableIdentifierUnique(value, table, isDisplayName: true);
+                    table.DisplayName = value;
+                    break;
                 case "headerrow":
                 {
                     // A table autoFilter filters BY the header row; Excel
@@ -374,6 +400,13 @@ public partial class ExcelHandler
                     // must be handled here, not caught downstream.
                     var headerOn = IsTruthy(value);
                     table.HeaderRowCount = headerOn ? 1u : 0u;
+                    // Turning the header ON: the first row's cells must carry
+                    // text EXACTLY matching each <tableColumn name>. Add's create
+                    // path stamps them; the Set toggle did not, so a numeric
+                    // first row (10, 20) stayed mismatched from Column1/Column2
+                    // and real Excel refused the file (0x800A03EC). Stamp here.
+                    if (headerOn)
+                        StampTableHeaderCells(worksheet, table);
                     var existingAf = table.GetFirstChild<AutoFilter>();
                     if (!headerOn)
                     {
@@ -422,7 +455,16 @@ public partial class ExcelHandler
                         else if (!totalRowEnabled && prevTotalsCount > 0)
                         {
                             // Shrink only if there is at least one data row left.
-                            if (eRow - 1 >= sRow) eRow -= 1;
+                            if (eRow - 1 >= sRow)
+                            {
+                                // Clear the now-orphaned totals-row cells (the
+                                // "Total" label + SUBTOTAL formulas). Add builds
+                                // them but the toggle-off previously only shrank
+                                // the ref, leaving a stray plain-text total row
+                                // visible below the table in real Excel.
+                                ClearTableRowCells(worksheet, sCol, eCol, eRow);
+                                eRow -= 1;
+                            }
                         }
                         var newTblRef = $"{sCol}{sRow}:{eCol}{eRow}";
                         table.Reference = newTblRef;
@@ -460,7 +502,7 @@ public partial class ExcelHandler
                     });
                     break;
                 }
-                case "ref":
+                case "ref" or "range":
                 {
                     var newRef = value.ToUpperInvariant();
                     // Grow/shrink <x:tableColumns> to match the new column count.
@@ -505,6 +547,14 @@ public partial class ExcelHandler
                     table.Reference = newRef;
                     var af = table.GetFirstChild<AutoFilter>();
                     if (af != null) af.Reference = newRef;
+                    // Growing the ref column-wise adds tableColumns above, but a
+                    // header table also needs a header CELL under each new
+                    // column whose text matches the column name — without it
+                    // real Excel refuses the file (0x800A03EC). Stamp the header
+                    // row (no-op for cells already matching). Header-less tables
+                    // have no header row, so skip.
+                    if ((table.HeaderRowCount?.Value ?? 1) != 0)
+                        StampTableHeaderCells(worksheet, table);
                     break;
                 }
                 case "showrowstripes" or "bandedrows" or "bandrows":
@@ -576,6 +626,115 @@ public partial class ExcelHandler
 
         tableParts[PathIndex.ToArrayIndex(tableIdx)].Table!.Save();
         return tblUnsupported;
+    }
+
+    /// <summary>
+    /// Reject a Set that renames a table to a name/displayName already used by
+    /// ANOTHER table or a workbook defined name. Mirrors AddTable's
+    /// CONSISTENCY(table-name-unique) guard — Excel requires both to be unique
+    /// workbook-wide and refuses the file (0x800A03EC) on a collision; the Set
+    /// path previously assigned the name with no check.
+    /// </summary>
+    private void ValidateTableIdentifierUnique(string candidate, Table self, bool isDisplayName)
+    {
+        foreach (var existing in _doc.WorkbookPart!.WorksheetParts
+            .SelectMany(wp => wp.TableDefinitionParts)
+            .Select(tdp => tdp.Table)
+            .Where(t => t != null && !ReferenceEquals(t, self))!)
+        {
+            if (string.Equals(existing!.Name?.Value, candidate, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(existing.DisplayName?.Value, candidate, StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException(
+                    $"Table {(isDisplayName ? "displayName" : "name")} '{candidate}' already exists in workbook; choose a different {(isDisplayName ? "displayName" : "name")}.");
+        }
+        var definedNames = _doc.WorkbookPart.Workbook?.DefinedNames;
+        if (definedNames != null)
+        {
+            foreach (var dn in definedNames.Elements<DefinedName>())
+            {
+                if (dn.Name?.Value is { } dnName
+                    && string.Equals(dnName, candidate, StringComparison.OrdinalIgnoreCase))
+                    throw new ArgumentException(
+                        $"Table {(isDisplayName ? "displayName" : "name")} '{candidate}' collides with the workbook defined name '{dnName}'; choose a different name.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stamp a table's header-row (first-row) cells with inline-string text
+    /// EXACTLY matching each &lt;tableColumn name&gt;. Excel requires this match;
+    /// a numeric or mismatched header cell makes it refuse the file
+    /// (0x800A03EC). Mirrors the create-time stamping in AddTable so the
+    /// Set headerRow=true toggle produces a valid header row.
+    /// </summary>
+    // Remove the cells in columns [startColName..endColName] on the given row,
+    // and drop the row itself if nothing else is left. Used to clear a table's
+    // orphaned totals row when totalRow is toggled off, mirroring how the header
+    // toggle-off removes the stale AutoFilter.
+    private void ClearTableRowCells(WorksheetPart worksheet, string startColName, string endColName, int rowIndex)
+    {
+        var sheetData = GetSheet(worksheet).GetFirstChild<SheetData>();
+        var row = sheetData?.Elements<Row>().FirstOrDefault(r => r.RowIndex?.Value == (uint)rowIndex);
+        if (row == null) return;
+        int startIdx = ColumnNameToIndex(startColName);
+        int endIdx = ColumnNameToIndex(endColName);
+        foreach (var cell in row.Elements<Cell>().ToList())
+        {
+            var colName = System.Text.RegularExpressions.Regex.Match(
+                cell.CellReference?.Value ?? "", @"^[A-Z]+").Value;
+            if (string.IsNullOrEmpty(colName)) continue;
+            var colIdx = ColumnNameToIndex(colName);
+            if (colIdx >= startIdx && colIdx <= endIdx)
+                cell.Remove();
+        }
+        if (!row.Elements<Cell>().Any())
+            row.Remove();
+    }
+
+    private void StampTableHeaderCells(WorksheetPart worksheet, Table table)
+    {
+        if (table.Reference?.Value is not { } refStr) return;
+        var first = refStr.Split(':')[0];
+        var (startColName, startRow) = ParseCellReference(first);
+        int startColIdx = ColumnNameToIndex(startColName);
+        var colNames = (table.GetFirstChild<TableColumns>()?.Elements<TableColumn>()
+            .Select(c => c.Name?.Value ?? "").ToList()) ?? new List<string>();
+        if (colNames.Count == 0) return;
+
+        var sheetData = GetSheet(worksheet).GetFirstChild<SheetData>()
+            ?? GetSheet(worksheet).AppendChild(new SheetData());
+        var hdrRow = sheetData.Elements<Row>().FirstOrDefault(r => r.RowIndex?.Value == (uint)startRow);
+        if (hdrRow == null)
+        {
+            hdrRow = new Row { RowIndex = (uint)startRow };
+            var insertAfter = sheetData.Elements<Row>()
+                .Where(r => r.RowIndex?.Value < (uint)startRow).LastOrDefault();
+            if (insertAfter != null) insertAfter.InsertAfterSelf(hdrRow);
+            else sheetData.PrependChild(hdrRow);
+        }
+        for (int i = 0; i < colNames.Count; i++)
+        {
+            var cellRefStr = $"{IndexToColumnName(startColIdx + i)}{startRow}";
+            var headerCell = hdrRow.Elements<Cell>()
+                .FirstOrDefault(c => c.CellReference?.Value == cellRefStr);
+            if (headerCell == null)
+            {
+                headerCell = new Cell { CellReference = cellRefStr };
+                var insertBefore = hdrRow.Elements<Cell>()
+                    .FirstOrDefault(c => ColumnNameToIndex(
+                        System.Text.RegularExpressions.Regex.Match(
+                            c.CellReference?.Value ?? "", @"^[A-Z]+").Value) > startColIdx + i);
+                if (insertBefore != null) insertBefore.InsertBeforeSelf(headerCell);
+                else hdrRow.AppendChild(headerCell);
+            }
+            if (!string.Equals(GetCellDisplayValue(headerCell), colNames[i], StringComparison.Ordinal))
+            {
+                headerCell.DataType = CellValues.InlineString;
+                headerCell.CellValue = null;
+                headerCell.CellFormula = null;
+                headerCell.InlineString = new InlineString(new Text(colNames[i]));
+            }
+        }
     }
 
     private List<string> SetCommentByPath(Match m, WorksheetPart worksheet, string sheetName, Dictionary<string, string> properties)

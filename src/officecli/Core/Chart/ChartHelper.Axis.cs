@@ -224,10 +224,35 @@ internal static partial class ChartHelper
             switch (lower)
             {
                 case "title":
+                case "axistitle":
+                case "vtitle":
                     // Map role → existing axis-title keys already handled by SetChartProperties.
-                    // category/series → cattitle; value/value2 → axistitle.
+                    // category/series → cattitle; value → axistitle (primary value axis).
+                    // The common alias `axisTitle` (and `vtitle`) must route here
+                    // too — otherwise it falls through to the default and always
+                    // targets the PRIMARY value axis, clobbering it for role=value2.
                     if (normalizedRole is "category" or "series")
                         translated["cattitle"] = value;
+                    // CONSISTENCY(chart/axis-role-write): the legacy `axistitle`
+                    // key always targets the PRIMARY value axis. For role=value2
+                    // that would overwrite the primary axis's title and leave the
+                    // secondary untouched — write directly to the resolved
+                    // secondary axis instead (mirrors min/max/crosses below).
+                    else if (normalizedRole == "value2" && targetAxis is OpenXmlCompositeElement titleAx2)
+                    {
+                        titleAx2.RemoveAllChildren<C.Title>();
+                        if (!value.Equals("none", StringComparison.OrdinalIgnoreCase))
+                        {
+                            ParseHelpers.ValidateXmlText(value, "axisTitle");
+                            var insertAfter = (OpenXmlElement?)titleAx2.GetFirstChild<C.MinorGridlines>()
+                                ?? (OpenXmlElement?)titleAx2.GetFirstChild<C.MajorGridlines>()
+                                ?? titleAx2.GetFirstChild<C.AxisPosition>();
+                            var newTitle = BuildChartTitle(value);
+                            if (insertAfter != null) titleAx2.InsertAfter(newTitle, insertAfter);
+                            else titleAx2.AppendChild(newTitle);
+                        }
+                        directlyHandled.Add(key);
+                    }
                     else
                         translated["axistitle"] = value;
                     break;
@@ -246,10 +271,16 @@ internal static partial class ChartHelper
                         var scaling = minAx2.GetFirstChild<C.Scaling>();
                         if (scaling != null)
                         {
+                            var minV = ParseHelpers.SafeParseDouble(value, "min");
+                            // A log-scaled axis cannot have min <= 0 (Excel
+                            // refuses the file, 0x800A03EC).
+                            if (minV <= 0 && scaling.GetFirstChild<C.LogBase>() != null)
+                                throw new ArgumentException(
+                                    $"min={value} is invalid on a log-scaled axis: a logarithmic axis minimum must be greater than 0.");
                             scaling.RemoveAllChildren<C.MinAxisValue>();
                             // CT_Scaling order: logBase, orientation, max, min —
                             // min is last, so append is always valid.
-                            scaling.AppendChild(new C.MinAxisValue { Val = ParseHelpers.SafeParseDouble(value, "min") });
+                            scaling.AppendChild(new C.MinAxisValue { Val = minV });
                         }
                         directlyHandled.Add(key);
                     }
@@ -462,6 +493,12 @@ internal static partial class ChartHelper
                                     throw new ArgumentException($"Invalid logBase '{value}': must be in the OOXML range [2, 1000] (ST_LogBase).");
                                 newLogBase = logVal;
                             }
+                            // A log scale requires axis min > 0 (Excel refuses
+                            // the file, 0x800A03EC).
+                            if (newLogBase != null
+                                && scaling.GetFirstChild<C.MinAxisValue>()?.Val?.Value is { } curMin && curMin <= 0)
+                                throw new ArgumentException(
+                                    $"logBase cannot be enabled while the axis minimum ({curMin}) is <= 0: a logarithmic axis minimum must be greater than 0.");
                             scaling.RemoveAllChildren<C.LogBase>();
                             if (newLogBase != null)
                                 scaling.PrependChild(new C.LogBase { Val = newLogBase.Value });

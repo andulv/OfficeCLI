@@ -194,6 +194,21 @@ public partial class ExcelHandler
         var cache = numRef.NumberingCache;
         if (cache == null) return false;
         var changed = false;
+        // Drop phantom points beyond the (possibly shrunk) reference range —
+        // a row delete that shrinks valuesRef leaves stale trailing points
+        // that duplicate the last value in the live file. Remove any point
+        // whose index is past the new range, and sync PointCount.
+        foreach (var stale in cache.Elements<C.NumericPoint>()
+                     .Where(p => (int)(p.Index?.Value ?? 0u) >= values.Count).ToList())
+        {
+            stale.Remove();
+            changed = true;
+        }
+        if (cache.PointCount != null && cache.PointCount.Val?.Value != (uint)values.Count)
+        {
+            cache.PointCount.Val = (uint)values.Count;
+            changed = true;
+        }
         foreach (var pt in cache.Elements<C.NumericPoint>())
         {
             var idx = (int)(pt.Index?.Value ?? 0u);
@@ -224,6 +239,19 @@ public partial class ExcelHandler
         var cache = strRef.StringCache;
         if (cache == null) return false;
         var changed = false;
+        // Drop phantom points beyond the shrunk reference range (see numeric
+        // cache above) and sync PointCount.
+        foreach (var stale in cache.Elements<C.StringPoint>()
+                     .Where(p => (int)(p.Index?.Value ?? 0u) >= values.Count).ToList())
+        {
+            stale.Remove();
+            changed = true;
+        }
+        if (cache.PointCount != null && cache.PointCount.Val?.Value != (uint)values.Count)
+        {
+            cache.PointCount.Val = (uint)values.Count;
+            changed = true;
+        }
         foreach (var pt in cache.Elements<C.StringPoint>())
         {
             var idx = (int)(pt.Index?.Value ?? 0u);

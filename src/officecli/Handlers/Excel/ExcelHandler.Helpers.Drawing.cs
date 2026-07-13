@@ -314,7 +314,7 @@ public partial class ExcelHandler
         gradFill.AppendChild(gsLst);
         gradFill.AppendChild(new Drawing.LinearGradientFill
         {
-            Angle = anglePart * 60000,
+            Angle = ParseHelpers.GradientAngleToOoxmlUnits(anglePart),
             Scaled = true
         });
         return gradFill;
@@ -370,6 +370,26 @@ public partial class ExcelHandler
             // this the key was write-only and dump silently dropped it.
             if (!string.IsNullOrEmpty(nvProps.Title?.Value))
                 node.Format["title"] = nvProps.Title.Value;
+            // P8 readback — Add writes a picture hyperlink as <a:hlinkClick>
+            // under cNvPr (external via a DrawingsPart relationship, or
+            // internal via @location). Without this the hyperlink was
+            // write-only and dropped on Get/dump.
+            var picHlink = nvProps.GetFirstChild<Drawing.HyperlinkOnClick>();
+            if (picHlink != null)
+            {
+                if (!string.IsNullOrEmpty(picHlink.Id?.Value))
+                {
+                    var rel = worksheetPart.DrawingsPart?.HyperlinkRelationships
+                        .FirstOrDefault(r => r.Id == picHlink.Id.Value);
+                    if (rel != null) node.Format["hyperlink"] = rel.Uri.ToString();
+                }
+                else
+                {
+                    var loc = picHlink.GetAttributes()
+                        .FirstOrDefault(a => a.LocalName == "location").Value;
+                    if (!string.IsNullOrEmpty(loc)) node.Format["hyperlink"] = "#" + loc;
+                }
+            }
         }
 
         ReadAnchorPosition(anchor, node);
@@ -1368,6 +1388,26 @@ public partial class ExcelHandler
         if (col0 < 0 || col0 > MaxCol0 || row0 < 0 || row0 > MaxRow0)
             throw new ArgumentException(
                 $"Anchor cell '{original}' is outside Excel's grid (A1..XFD1048576).");
+    }
+
+    /// <summary>
+    /// Clamp a TwoCellAnchor span computed from x/y/width/height (column/row
+    /// units) to Excel's grid. The FROM marker must be a real cell
+    /// (A1..XFD1048576) and still throws if outside it. The TO marker is the
+    /// exclusive right/bottom edge, so it may legitimately sit one past the last
+    /// cell (col 16384 / row 1048576) — a picture/shape placed near XFD simply
+    /// ends at the grid edge, which is what real Excel does. A width/height that
+    /// walks the TO marker further than that (e.g. x=1,width=16384 → toCol 16385)
+    /// was silently persisted and made Excel refuse the file (0x800A03EC), so the
+    /// TO marker is clamped to the ceiling here rather than written out of range.
+    /// Returns the clamped (toCol, toRow).
+    /// </summary>
+    internal static (int toCol, int toRow) ClampAnchorSpan(int fromCol, int fromRow, int toCol, int toRow, string original)
+    {
+        ValidateAnchorCell(fromCol, fromRow, original);
+        const int MaxToCol = 16384;     // exclusive right edge of XFD
+        const int MaxToRow = 1048576;   // exclusive bottom edge of the last row
+        return (Math.Clamp(toCol, fromCol, MaxToCol), Math.Clamp(toRow, fromRow, MaxToRow));
     }
 
     /// <summary>

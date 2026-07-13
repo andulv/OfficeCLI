@@ -635,6 +635,14 @@ internal class ExcelStyleManager
 
     private static uint GetOrCreateNumFmt(Stylesheet stylesheet, string formatCode)
     {
+        // XML-illegal control characters in the format code slip past every
+        // grammar check below and only blow up at close-time serialization —
+        // the resident then fails to save with "data may be lost" and the whole
+        // edit is silently discarded. Reject them up front, exactly as cell
+        // values / hyperlinks / comment text already do, so bad input fails at
+        // Add/Set time with a clear message instead of losing the user's work.
+        OfficeCli.Core.ParseHelpers.ValidateXmlText(formatCode, "number format");
+
         // Resolve friendly keyword aliases (currency, scientific, ...) to real
         // Excel codes before any validation runs.
         if (NumFmtKeywordAliases.TryGetValue(formatCode.Trim(), out var aliased))

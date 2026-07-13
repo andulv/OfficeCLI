@@ -76,6 +76,21 @@ public partial class ExcelHandler
         var oleSrc = OfficeCli.Core.OleHelper.RequireSource(properties);
         OfficeCli.Core.OleHelper.WarnOnUnknownOleProps(properties);
 
+        // Embedding the workbook into itself: the source is open/locked by this
+        // resident session, so the read yields 0 bytes and produces an empty
+        // OLE payload real Excel refuses (0x800A03EC). Reject up front.
+        try
+        {
+            if (!string.IsNullOrEmpty(oleSrc) && !string.IsNullOrEmpty(_filePath)
+                && string.Equals(Path.GetFullPath(oleSrc), Path.GetFullPath(_filePath),
+                    StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException(
+                    "Cannot embed a workbook into itself: the source file is the workbook being edited. "
+                    + "Embed a different file, or make a copy of the source first.");
+        }
+        catch (ArgumentException) { throw; }
+        catch { /* path canonicalization failed — fall through to normal read */ }
+
         // CONSISTENCY(excel-ole-display): Excel OLE does not have a
         // DrawAspect concept — worksheet objects are always shown as
         // icons via objectPr/anchor, so 'display' would be a no-op.
@@ -162,6 +177,8 @@ public partial class ExcelHandler
             oleToRow = ay + (int)wholeRows;
             oleToColOff = remCols;
             oleToRowOff = remRows;
+            (oleToCol, oleToRow) = ClampAnchorSpan(oleFromCol, oleFromRow, oleToCol, oleToRow,
+                $"x={ax},y={ay},width/height");
         }
 
         // 5. Ensure the legacy VmlDrawingPart exists and carry an
@@ -464,6 +481,8 @@ public partial class ExcelHandler
                     twoToColOff = picRemCols;
                     twoToRowOff = picRemRows;
                 }
+                (twoToCol, twoToRow) = ClampAnchorSpan(twoFromCol, twoFromRow, twoToCol, twoToRow,
+                    $"picture anchor (to col {twoToCol}, row {twoToRow})");
                 anchor = new XDR.TwoCellAnchor(
                     new XDR.FromMarker(
                         new XDR.ColumnId(twoFromCol.ToString()),
@@ -608,6 +627,16 @@ public partial class ExcelHandler
         else
         {
             (sx, sy, sw, sh) = ParseAnchorBounds(properties, "1", "1", "5", "3");
+        }
+        // Clamp the derived TwoCellAnchor span to Excel's grid so an
+        // x/y/width/height that walks the TO marker past the ceiling ends at the
+        // grid edge (what real Excel does) instead of being written out of range
+        // into a file Excel refuses to open. FROM out of grid still throws.
+        {
+            var (shpToCol, shpToRow) = ClampAnchorSpan(sx, sy, sx + sw, sy + sh,
+                shpAnchorStr ?? $"x={sx},y={sy},width={sw},height={sh}");
+            sw = shpToCol - sx;
+            sh = shpToRow - sy;
         }
         var shpText = properties.GetValueOrDefault("text", "") ?? "";
         OfficeCli.Core.ParseHelpers.ValidateXmlText(shpText, "shape text");

@@ -315,6 +315,18 @@ internal static partial class ChartHelper
                 var totColor = properties.GetValueOrDefault("totalColor");
                 var wfChartSpace = BuildWaterfallChart(title, wfCategories, wfValues,
                     incColor, decColor, totColor, properties);
+                // BuildWaterfallChart builds its own chart with a default
+                // legend and never consumed the `legend` prop, so legend= was
+                // reported unsupported on a waterfall Add (every other type
+                // accepts it). Drop the default legend and re-apply from the
+                // prop (position, or none) — remove-first avoids a duplicate
+                // <c:legend> that would make Excel refuse the file.
+                var wfChart = wfChartSpace.GetFirstChild<C.Chart>();
+                if (wfChart != null)
+                {
+                    wfChart.RemoveAllChildren<C.Legend>();
+                    ApplyLegendFromProps(wfChart, properties);
+                }
                 return wfChartSpace;
             }
             case "combo":
@@ -393,29 +405,7 @@ internal static partial class ChartHelper
 
         chart.AppendChild(plotArea);
 
-        var showLegend = properties.GetValueOrDefault("legend", "true");
-        // CONSISTENCY(legend-hide-alias / R34-1): accept hide=true / hidden=true
-        // as aliases for legend=none so users with a "hide it" mental model
-        // don't reach for legend=hidden (which is now rejected).
-        if ((properties.TryGetValue("hide", out var hideVal) && ParseHelpers.IsTruthy(hideVal)) ||
-            (properties.TryGetValue("hidden", out var hiddenVal) && ParseHelpers.IsTruthy(hiddenVal)))
-        {
-            showLegend = "none";
-        }
-        // Bare "true" keeps the documented default of bottom.
-        if (showLegend.Equals("true", StringComparison.OrdinalIgnoreCase))
-            showLegend = "bottom";
-        if (!showLegend.Equals("false", StringComparison.OrdinalIgnoreCase) &&
-            !showLegend.Equals("none", StringComparison.OrdinalIgnoreCase))
-        {
-            // CONSISTENCY(strict-enums / R34-1): shared helper rejects
-            // unknown positions with the documented valid set.
-            var legendPos = ParseLegendPosition(showLegend);
-            chart.AppendChild(new C.Legend(
-                new C.LegendPosition { Val = legendPos },
-                new C.Overlay { Val = false }
-            ));
-        }
+        ApplyLegendFromProps(chart, properties);
 
         chart.AppendChild(new C.PlotVisibleOnly { Val = true });
         chart.AppendChild(new C.DisplayBlanksAs { Val = C.DisplayBlanksAsValues.Gap });
@@ -826,6 +816,39 @@ internal static partial class ChartHelper
     /// Check if a property key should be deferred from BuildChartSpace to SetChartProperties.
     /// Matches exact keys in <see cref="DeferredAddKeys"/> plus dynamic prefix patterns.
     /// </summary>
+    /// <summary>
+    /// Apply the `legend` prop (position, or none via legend=none/false or
+    /// hide/hidden) to a chart, inserting the &lt;c:legend&gt; at the correct
+    /// CT_Chart position (after plotArea, before plotVisibleOnly/dispBlanksAs).
+    /// Shared by the generic build path and the waterfall path (which builds
+    /// its own chart and otherwise never consumed `legend`, so legend= was
+    /// reported unsupported on waterfall Add).
+    /// </summary>
+    internal static void ApplyLegendFromProps(C.Chart chart, Dictionary<string, string> properties)
+    {
+        var showLegend = properties.GetValueOrDefault("legend", "true");
+        // CONSISTENCY(legend-hide-alias / R34-1): hide/hidden == legend=none.
+        if ((properties.TryGetValue("hide", out var hideVal) && ParseHelpers.IsTruthy(hideVal)) ||
+            (properties.TryGetValue("hidden", out var hiddenVal) && ParseHelpers.IsTruthy(hiddenVal)))
+            showLegend = "none";
+        if (showLegend.Equals("true", StringComparison.OrdinalIgnoreCase))
+            showLegend = "bottom";
+        if (showLegend.Equals("false", StringComparison.OrdinalIgnoreCase)
+            || showLegend.Equals("none", StringComparison.OrdinalIgnoreCase))
+            return;
+        var legendPos = ParseLegendPosition(showLegend);
+        var legend = new C.Legend(
+            new C.LegendPosition { Val = legendPos },
+            new C.Overlay { Val = false });
+        // Schema order: legend precedes plotVisibleOnly/dispBlanksAs. On the
+        // generic path those don't exist yet (append == correct); on a
+        // pre-built chart (waterfall) insert before them.
+        var anchor = (OpenXmlElement?)chart.GetFirstChild<C.PlotVisibleOnly>()
+            ?? chart.GetFirstChild<C.DisplayBlanksAs>();
+        if (anchor != null) chart.InsertBefore(legend, anchor);
+        else chart.AppendChild(legend);
+    }
+
     internal static bool IsDeferredKey(string key)
     {
         if (DeferredAddKeys.Contains(key)) return true;
@@ -1545,7 +1568,7 @@ internal static partial class ChartHelper
                 gsLst.AppendChild(gs);
             }
             gradFill.AppendChild(gsLst);
-            gradFill.AppendChild(new Drawing.LinearGradientFill { Angle = anglePart * 60000, Scaled = scaledFlag });
+            gradFill.AppendChild(new Drawing.LinearGradientFill { Angle = ParseHelpers.GradientAngleToOoxmlUnits(anglePart), Scaled = scaledFlag });
             return gradFill;
         }
 

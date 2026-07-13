@@ -206,14 +206,91 @@ public partial class ExcelHandler
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Reject a formula in which any single function call has more than 255
+    /// arguments — Excel's hard per-function limit. Over it, the file is
+    /// schema-valid but real Excel refuses to open it (0x800A03EC). Counts
+    /// top-level commas per parenthesis nesting level (a comma is attributed to
+    /// its innermost enclosing "()"); string literals are skipped, and "{}"
+    /// array-constant commas are not function args. 255 args (254 commas) is
+    /// fine; 256 args (255 commas) throws.
+    /// </summary>
+    internal static void ValidateFormulaArgCount(string formula)
+    {
+        if (string.IsNullOrEmpty(formula)) return;
+        var f = formula.TrimStart('=');
+        var commaStack = new Stack<int>();
+        bool inStr = false;
+        int arrayDepth = 0;
+        for (int i = 0; i < f.Length; i++)
+        {
+            char c = f[i];
+            if (c == '"')
+            {
+                if (inStr && i + 1 < f.Length && f[i + 1] == '"') { i++; continue; }
+                inStr = !inStr;
+                continue;
+            }
+            if (inStr) continue;
+            switch (c)
+            {
+                case '{': arrayDepth++; break;
+                case '}': if (arrayDepth > 0) arrayDepth--; break;
+                case '(': commaStack.Push(0); break;
+                case ')':
+                    if (commaStack.Count > 0)
+                    {
+                        var commas = commaStack.Pop();
+                        // args = commas + 1; reject 256+ args (>=255 commas).
+                        if (commas >= 255)
+                            throw new ArgumentException(
+                                $"Formula has a function call with {commas + 1} arguments; Excel's limit is 255 per function. "
+                                + "Split the call or reference a range instead.");
+                    }
+                    break;
+                case ',':
+                    if (arrayDepth == 0 && commaStack.Count > 0)
+                        commaStack.Push(commaStack.Pop() + 1);
+                    break;
+            }
+        }
+    }
+
+    // Excel's hard ceiling on the character length of a formula / defined-name
+    // refersTo / conditional-format expression. Content beyond this is silently
+    // accepted, persisted, and makes real Excel refuse the file (0x800A03EC).
+    internal const int MaxFormulaLength = 8192;
+
+    /// <summary>
+    /// Reject a formula whose length exceeds Excel's 8192-character ceiling.
+    /// Shared by cell formulas, defined-name refs, and conditional-format
+    /// expressions so the limit is enforced identically everywhere.
+    /// </summary>
+    internal static void ValidateFormulaLength(string? formula, string context = "formula")
+    {
+        if (formula == null) return;
+        var content = formula.TrimStart('=');
+        if (content.Length > MaxFormulaLength)
+            throw new ArgumentException(
+                $"{context} is {content.Length} characters; Excel's limit is {MaxFormulaLength} per formula. " +
+                "A longer expression makes Excel refuse to open the file.");
+    }
+
     internal static void ValidateFormulaCellRefs(string formula)
     {
         if (string.IsNullOrEmpty(formula)) return;
         var trimmed = formula.TrimStart('=');
         var stripped = StripFormulaStringLiterals(trimmed);
 
+        // Formula-length ceiling (8192) — checked before the ref scan so an
+        // oversized expression fails with a clear message instead of Excel's
+        // 0x800A03EC after the fact.
+        ValidateFormulaLength(formula);
         // R1C1-style references make real Excel refuse the file.
         ValidateNoR1C1Reference(formula);
+        // Excel caps a function call at 255 arguments; a 256-arg call passes
+        // schema validation but makes real Excel refuse the file (0x800A03EC).
+        ValidateFormulaArgCount(formula);
         // Match A1-style refs: optional $ + 1-3 letters + optional $ + 1-8 digits.
         // (Excel's row ceiling 1048576 is 7-digit, but 8-digit numbers like
         // A10000000 must still be caught so they're rejected with the clean
@@ -310,6 +387,16 @@ public partial class ExcelHandler
                 return value;
             if (value.Contains(','))
                 return $"\"{value}\"";
+            // A bare unquoted value is valid as a list source if it's a legal
+            // defined-name reference (name token) OR a formula (contains '(',
+            // e.g. INDIRECT(B2)/OFFSET(...)). Anything else — e.g. "hello
+            // world" — is neither a name, a ref, nor a quoted literal, so Excel
+            // refuses the file (0x800A03EC); treat it as a literal single-item
+            // list and quote it. Formulas must NOT be quoted (that would turn
+            // them into a literal string and also block ref shifting).
+            if (!value.Contains('(')
+                && !System.Text.RegularExpressions.Regex.IsMatch(value, @"^[A-Za-z_\\][A-Za-z0-9_.]*$"))
+                return $"\"{value}\"";
             return value;
         }
         if (type == DataValidationValues.Time)
@@ -341,6 +428,18 @@ public partial class ExcelHandler
             if (value.StartsWith("="))
                 return value.Substring(1);
         }
+        // For non-list numeric/date/text types, formula1/formula2 must be a
+        // number, date/time (handled above), cell/range ref, or a formula — a
+        // bare value containing whitespace (e.g. "hello world") is invalid
+        // OOXML formula syntax and makes real Excel refuse the file
+        // (0x800A03EC). Reject it up front. (Quoted literals and refs pass.)
+        if (type != DataValidationValues.Custom
+            && value.Any(char.IsWhiteSpace)
+            && !value.StartsWith("\"") && !value.StartsWith("=")
+            && !value.Contains('!') && !value.Contains('('))
+            throw new ArgumentException(
+                $"validation formula '{value}' is not valid for this validation type: " +
+                "expected a number, date, cell reference, or formula (a bare value with spaces is not valid formula syntax).");
         return value;
     }
 
@@ -528,6 +627,8 @@ public partial class ExcelHandler
         // patterns that pass schema validation but make real Excel refuse
         // the file: doubled/trailing '!' ("乱码!!!") and stray '#' outside
         // the known error literals ("乱码###").
+        // Formula-length ceiling (8192) applies to defined-name bodies too.
+        ValidateFormulaLength(refText, "defined-name ref");
         var body = (refText ?? "").TrimStart('=').Trim();
         if (body.Length == 0) return;
         if (body.Contains('"')) return; // string literals — leave to Excel

@@ -61,6 +61,28 @@ public partial class ExcelHandler
         }
     }
 
+    /// <summary>
+    /// Remove every &lt;hyperlink&gt; on <paramref name="cellRef"/> AND delete the
+    /// external relationship each referenced — unless another surviving
+    /// hyperlink still uses the same rId. Without the rel cleanup, repointing
+    /// or clearing a cell link leaves an orphan External relationship in
+    /// .rels on every edit (a per-file leak invisible to Get).
+    /// </summary>
+    private static void RemoveCellHyperlinksAndRels(WorksheetPart worksheet, Hyperlinks hyperlinksEl, string cellRef)
+    {
+        var toRemove = hyperlinksEl.Elements<Hyperlink>()
+            .Where(h => h.Reference?.Value?.Equals(cellRef, StringComparison.OrdinalIgnoreCase) == true)
+            .ToList();
+        var removedIds = toRemove.Select(h => h.Id?.Value).Where(id => !string.IsNullOrEmpty(id)).ToList();
+        foreach (var h in toRemove) h.Remove();
+        foreach (var id in removedIds.Distinct())
+        {
+            // Skip if a surviving hyperlink still references this rId.
+            if (hyperlinksEl.Elements<Hyperlink>().Any(h => h.Id?.Value == id)) continue;
+            try { worksheet.DeleteReferenceRelationship(id!); } catch { /* already gone */ }
+        }
+    }
+
     /// <summary>Apply cell properties without saving — caller is responsible for SaveWorksheet.</summary>
     private List<string> ApplyCellProperties(Cell cell, WorksheetPart worksheet, Dictionary<string, string> properties)
         => ApplyCellProperties(cell, cell.CellReference?.Value ?? "", worksheet, properties);
@@ -70,6 +92,20 @@ public partial class ExcelHandler
         // Separate content props from style props
         var styleProps = new Dictionary<string, string>();
         var unsupported = new List<string>();
+
+        // clear=true must run BEFORE value/formula/type in this same Set call —
+        // otherwise dictionary iteration order decides the outcome and
+        // `--prop value=99 --prop clear=true` silently wiped the new value
+        // (the schema documents clear as "erase old content, THEN apply new").
+        // Do it as a pre-pass; the in-loop `case "clear"` is now a consumed
+        // no-op so it can't re-clear after the value lands.
+        if (properties.TryGetValue("clear", out var clearVal) && IsTruthy(clearVal))
+        {
+            cell.CellValue = null;
+            cell.CellFormula = null;
+            cell.RemoveAllChildren<InlineString>();
+            cell.DataType = null;
+        }
 
         foreach (var (key, value) in properties)
         {
@@ -217,7 +253,7 @@ public partial class ExcelHandler
                                 throw new ArgumentException(
                                     $"Cannot store '{cellValue}' as date; Excel does not support dates before 1900-01-01 " +
                                     $"(serial epoch is 1899-12-30). Use type=string to keep the literal text.");
-                            cell.CellValue = new CellValue(ExcelDataFormatter.ToExcelSerial(dt).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                            cell.CellValue = new CellValue(ExcelDataFormatter.ToExcelSerial(dt, IsWorkbookDate1904()).ToString(System.Globalization.CultureInfo.InvariantCulture));
                             cell.DataType = null;
                             if (!properties.ContainsKey("numberformat") && !properties.ContainsKey("numfmt") && !properties.ContainsKey("format"))
                                 styleProps["numberformat"] = "yyyy-mm-dd";
@@ -373,14 +409,9 @@ public partial class ExcelHandler
                         styleProps["numberformat"] = "m/d/yy";
                     break;
                 case "clear":
-                    // Per schemas/help/xlsx/cell.json: clear erases value/formula
-                    // before applying new content. StyleIndex (font/alignment/
-                    // border/numfmt) is independent state and must survive clear,
-                    // matching `set`'s overall merge semantics.
-                    cell.CellValue = null;
-                    cell.CellFormula = null;
-                    cell.RemoveAllChildren<InlineString>();
-                    cell.DataType = null;
+                    // Handled by the pre-pass above (runs before value/formula
+                    // regardless of --prop order). No-op here so it stays a
+                    // consumed key and never re-clears an applied value.
                     break;
                 case "arrayformula":
                 {
@@ -427,9 +458,8 @@ public partial class ExcelHandler
                     var hyperlinksEl = ws.GetFirstChild<Hyperlinks>();
                     if (string.IsNullOrEmpty(value) || value.Equals("none", StringComparison.OrdinalIgnoreCase))
                     {
-                        hyperlinksEl?.Elements<Hyperlink>()
-                            .Where(h => h.Reference?.Value?.Equals(cellRef, StringComparison.OrdinalIgnoreCase) == true)
-                            .ToList().ForEach(h => h.Remove());
+                        if (hyperlinksEl != null)
+                            RemoveCellHyperlinksAndRels(worksheet, hyperlinksEl, cellRef);
                         if (hyperlinksEl != null && !hyperlinksEl.HasChildren)
                             hyperlinksEl.Remove();
                         // Symmetric to H3 above: when removing a hyperlink,
@@ -470,9 +500,10 @@ public partial class ExcelHandler
                             hyperlinksEl = new Hyperlinks();
                             ws.AppendChild(hyperlinksEl);
                         }
-                        hyperlinksEl.Elements<Hyperlink>()
-                            .Where(h => h.Reference?.Value?.Equals(cellRef, StringComparison.OrdinalIgnoreCase) == true)
-                            .ToList().ForEach(h => h.Remove());
+                        // Replacing the link: drop the old <hyperlink> AND its
+                        // external relationship (else the .rels accumulates an
+                        // orphan target per repoint — a per-file leak).
+                        RemoveCellHyperlinksAndRels(worksheet, hyperlinksEl, cellRef);
                         // H2: optional tooltip/screenTip from sibling props.
                         var setHlTip = properties.GetValueOrDefault("tooltip")
                             ?? properties.GetValueOrDefault("screenTip")

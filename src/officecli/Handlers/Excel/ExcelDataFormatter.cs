@@ -83,6 +83,18 @@ internal static class ExcelDataFormatter
     }
 
     /// <summary>
+    /// Convert a DateTime to an Excel serial for the workbook's active date
+    /// system. In a 1904-system workbook (Date1904=true) the stored serial must
+    /// be 1462 days smaller than the 1900-system serial — this is the exact
+    /// inverse of the read-side +1462 shift in <see cref="TryFormat"/>. Writing
+    /// the 1900 serial into a 1904 workbook made Get read the date back 4 years
+    /// later. Callers that turn a date string into a cell value must pass the
+    /// workbook flag so the write and read sides agree.
+    /// </summary>
+    public static double ToExcelSerial(DateTime dt, bool date1904)
+        => date1904 ? ToExcelSerial(dt) - 1462 : ToExcelSerial(dt);
+
+    /// <summary>
     /// Shared date-format-code detector for Get and the HTML preview (which
     /// previously kept a forked contains-check that misclassified Y0.00 as a
     /// date). A format mixing date tokens with digit placeholders is not a

@@ -110,7 +110,13 @@ internal static partial class PivotTableHelper
                 var dfName = df.Name?.Value ?? "";
                 var dfFunc = df.Subtotal?.InnerText ?? "sum";
                 var dfField = df.Field?.Value ?? 0;
+                // dataField{N} keeps its documented name:func:fieldIdx shape
+                // (Set values= and existing Get consumers depend on it). But
+                // also expose the RESOLVED source field name so the dump batch
+                // emitter can build a replayable values= — a bare index breaks
+                // replay when field positions differ in the rebuilt cache.
                 node.Format[$"dataField{i + 1}"] = $"{dfName}:{dfFunc}:{dfField}";
+                node.Format[$"dataField{i + 1}.srcField"] = ResolveFieldName((uint)dfField);
                 // CONSISTENCY(canonical-format-key): showDataAs round-trips
                 // through its own structured Format key rather than being
                 // packed into the dataField{N} colon string. Existing
@@ -189,6 +195,28 @@ internal static partial class PivotTableHelper
                             break;
                         }
                     }
+                    if (repeatLabels) break;
+                }
+            }
+            // Fallback: AddTable writes the per-field x14:pivotField
+            // fillDownLabels="1" ext on outer row fields (not the
+            // definition-level fillDownLabelsDefault that Set writes), so a
+            // pivot created with repeatLabels=true would otherwise read back
+            // as absent — a round-trip gap. Surface it from either place.
+            if (!repeatLabels && pivotDef.PivotFields != null)
+            {
+                foreach (var pf in pivotDef.PivotFields.Elements<PivotField>())
+                {
+                    var pfExtLst = pf.GetFirstChild<PivotFieldExtensionList>();
+                    if (pfExtLst == null) continue;
+                    foreach (var ext in pfExtLst.Elements<PivotFieldExtension>())
+                        foreach (var child in ext.ChildElements)
+                        {
+                            if (child.LocalName != "pivotField") continue;
+                            var a = child.GetAttributes()
+                                .FirstOrDefault(x => x.LocalName == "fillDownLabels");
+                            if (a.Value == "1") { repeatLabels = true; break; }
+                        }
                     if (repeatLabels) break;
                 }
             }

@@ -66,8 +66,9 @@
     },
     "zoom": {
       "type": "number",
-      "description": "sheetView zoom percentage (10-400). Emitted only when non-default (≠100).",
-      "add": false, "set": false, "get": true,
+      "description": "sheetView zoom percentage (10-400; out-of-range throws). Alias: zoomscale. Emitted only when non-default (≠100).",
+      "add": false, "set": true, "get": true,
+      "examples": ["--prop zoom=150"],
       "readback": "zoom percentage 10-400",
       "enforcement": "report"
     },

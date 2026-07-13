@@ -1091,6 +1091,18 @@ public partial class ExcelHandler
             }
         }
 
+        // An explicit protect=false wins over a password= in the SAME call.
+        // The password case (re)creates a SheetProtection with sheet=true to
+        // hold the hash, which would otherwise resurrect protection the caller
+        // just asked to turn off (order-dependently) — e.g.
+        // `--prop protect=false --prop password=none` left the sheet protected.
+        // Re-assert the removal here so the explicit flag is authoritative.
+        if (properties.TryGetValue("protect", out var protectFinal)
+            && !ParseHelpers.IsTruthy(protectFinal))
+        {
+            ws.GetFirstChild<SheetProtection>()?.Remove();
+        }
+
         SaveWorksheet(worksheet);
         return unsupported;
     }

@@ -326,7 +326,12 @@ public partial class ExcelHandler
         var sortKeys = new List<(int ColIndex, bool Descending)>();
         foreach (var spec in sortSpec.Split(',', StringSplitOptions.RemoveEmptyEntries))
         {
-            var tokens = spec.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            // Accept both the space form ("A desc") and the colon form
+            // ("A:desc") — the latter is exactly what Get surfaces for a sort
+            // state, so dump→replay of the canonical readback works. ':' is
+            // never otherwise valid in a sort key, so treating it as a
+            // separator is unambiguous.
+            var tokens = spec.Trim().Split(new[] { ' ', '\t', ':' }, StringSplitOptions.RemoveEmptyEntries);
             if (tokens.Length == 0) continue;
             // Reject trailing junk like "A asc B" instead of silently dropping the tail.
             if (tokens.Length > 2)

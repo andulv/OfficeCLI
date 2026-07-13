@@ -1003,8 +1003,15 @@ internal static partial class ChartHelper
                     var valAxis = plotArea2?.GetFirstChild<C.ValueAxis>();
                     var scaling = valAxis?.GetFirstChild<C.Scaling>();
                     if (scaling == null) { unsupported.Add(key); break; }
+                    var minVal = ParseHelpers.SafeParseDouble(value, "axismin");
+                    // A log-scaled axis cannot have min <= 0 — real Excel refuses
+                    // the file (0x800A03EC). Validate the combined state before
+                    // mutating.
+                    if (minVal <= 0 && scaling.GetFirstChild<C.LogBase>() != null)
+                        throw new ArgumentException(
+                            $"axisMin={value} is invalid on a log-scaled axis: a logarithmic axis minimum must be greater than 0.");
                     scaling.RemoveAllChildren<C.MinAxisValue>();
-                    scaling.AppendChild(new C.MinAxisValue { Val = ParseHelpers.SafeParseDouble(value, "axismin") });
+                    scaling.AppendChild(new C.MinAxisValue { Val = minVal });
                     break;
                 }
 
@@ -2048,6 +2055,13 @@ internal static partial class ChartHelper
                             throw new ArgumentException($"Invalid logBase '{value}': must be in the OOXML range [2, 1000] (ST_LogBase).");
                         newLogBase = logVal;
                     }
+                    // Enabling a log scale on an axis whose min is <= 0 makes
+                    // real Excel refuse the file (0x800A03EC). Validate before
+                    // mutating (the reverse of the axisMin guard above).
+                    if (newLogBase != null
+                        && scaling.GetFirstChild<C.MinAxisValue>()?.Val?.Value is { } curMin && curMin <= 0)
+                        throw new ArgumentException(
+                            $"logBase cannot be enabled while the axis minimum ({curMin}) is <= 0: a logarithmic axis minimum must be greater than 0.");
                     scaling.RemoveAllChildren<C.LogBase>();
                     if (newLogBase != null)
                         scaling.PrependChild(new C.LogBase { Val = newLogBase.Value });
@@ -4096,7 +4110,7 @@ internal static partial class ChartHelper
         gradFill.AppendChild(gsLst);
         gradFill.AppendChild(new Drawing.LinearGradientFill
         {
-            Angle = anglePart * 60000, // degrees to 60000ths
+            Angle = ParseHelpers.GradientAngleToOoxmlUnits(anglePart), // degrees to 60000ths, normalized mod 360 (overflow-proof)
             Scaled = scaledFlag
         });
 

@@ -1,10 +1,12 @@
 // Copyright 2026 OfficeCLI (https://OfficeCLI.AI)
 // SPDX-License-Identifier: Apache-2.0
 
+using System.Linq;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
 using OfficeCli.Core;
+using ThreadedCmt = DocumentFormat.OpenXml.Office2019.Excel.ThreadedComments;
 
 namespace OfficeCli.Handlers;
 
@@ -792,6 +794,19 @@ public partial class ExcelHandler
                 result.Add(($"extLst ext {uri}",
                     $"worksheet extension {uri} is not round-tripped by dump; its content will be missing after replay"));
             }
+        }
+
+        // Threaded comments (Excel 365) live in a relationship-linked
+        // WorksheetThreadedCommentsPart, not in the worksheet XML, so the
+        // child/extLst scans above never see them. The batch emitter only
+        // transcribes the legacy comments part, so any threaded comment is
+        // silently lost on replay — surface it here.
+        var threadedCount = worksheet.WorksheetThreadedCommentsParts
+            .Sum(p => p.ThreadedComments?.Elements<ThreadedCmt.ThreadedComment>().Count() ?? 0);
+        if (threadedCount > 0)
+        {
+            result.Add(("threadedComments",
+                $"{threadedCount} threaded comment(s) are not round-tripped by dump; they will be missing after replay"));
         }
         return result;
     }

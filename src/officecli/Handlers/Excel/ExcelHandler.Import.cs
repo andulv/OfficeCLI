@@ -146,7 +146,7 @@ public partial class ExcelHandler
                     cell.CellValue = null;
                     cell.DataType = null;
                 }
-                if (SetCellValueWithTypeDetection(cell, fields[c]))
+                if (SetCellValueWithTypeDetection(cell, fields[c], IsWorkbookDate1904()))
                 {
                     // Date cell — apply a date number format so it shows as a
                     // date, not the raw serial. Mirrors Set/Add (numFmt yyyy-mm-dd).
@@ -247,7 +247,7 @@ public partial class ExcelHandler
     /// </summary>
     /// <returns>true when the value was stored as a DATE (serial number needing
     /// a date number format); false for every other type.</returns>
-    private static bool SetCellValueWithTypeDetection(Cell cell, string value)
+    private static bool SetCellValueWithTypeDetection(Cell cell, string value, bool date1904)
     {
         // Empty
         if (string.IsNullOrEmpty(value))
@@ -294,7 +294,7 @@ public partial class ExcelHandler
         if (TryParseIsoDate(value, out var dateVal))
         {
             // Excel stores dates as OLE Automation date numbers
-            cell.CellValue = new CellValue(ExcelDataFormatter.ToExcelSerial(dateVal).ToString(CultureInfo.InvariantCulture));
+            cell.CellValue = new CellValue(ExcelDataFormatter.ToExcelSerial(dateVal, date1904).ToString(CultureInfo.InvariantCulture));
             cell.DataType = null; // numeric
             return true; // caller applies a date number format
         }

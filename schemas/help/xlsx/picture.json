@@ -60,9 +60,11 @@
       "description": "Rotation in degrees (positive = clockwise). Stored OOXML-internal as 60000ths of a degree on Transform2D @rot.",
       "add": true,
       "set": true,
+      "get": true,
       "examples": [
         "--prop rotation=45"
       ],
+      "readback": "rotation in degrees (rounded)",
       "enforcement": "report"
     },
     "flip": {
@@ -70,10 +72,12 @@
       "description": "Compact flip token: 'h' / 'v' / 'both' / 'hv' / 'vh' / 'horizontal' / 'vertical'.",
       "add": true,
       "set": true,
+      "get": true,
       "examples": [
         "--prop flip=h",
         "--prop flip=both"
       ],
+      "readback": "h / v / both",
       "enforcement": "report"
     },
     "flipH": {

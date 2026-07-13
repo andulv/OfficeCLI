@@ -77,7 +77,7 @@
       "type": "enum",
       "values": ["stop", "warning", "information"],
       "description": "severity of error popup. Default: stop. Aliases: warn=warning, info=information.",
-      "add": true, "set": false, "get": true,
+      "add": true, "set": true, "get": true,
       "examples": ["--prop errorStyle=warning"],
       "readback": "stop|warning|information",
       "enforcement": "report"
@@ -85,7 +85,7 @@
     "inCellDropdown": {
       "type": "bool",
       "description": "show in-cell dropdown arrow for type=list. Default: true. Inverse of OOXML showDropDown.",
-      "add": true, "set": false, "get": true,
+      "add": true, "set": true, "get": true,
       "examples": ["--prop inCellDropdown=false"],
       "readback": "true/false",
       "enforcement": "report"
@@ -93,7 +93,7 @@
     "showDropDown": {
       "type": "bool",
       "description": "raw OOXML showDropDown flag (INVERTED: true = HIDE arrow). Prefer inCellDropdown for clarity.",
-      "add": true, "set": false, "get": false,
+      "add": true, "set": true, "get": false,
       "examples": ["--prop showDropDown=true"],
       "readback": "raw OOXML flag",
       "enforcement": "report"

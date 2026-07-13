@@ -302,10 +302,14 @@
     },
     "workbook.date1904": {
       "type": "bool",
+      "aliases": ["date1904"],
       "add": false,
-      "set": false,
+      "set": true,
       "get": true,
-      "description": "WorkbookProperties Date1904 flag — true means dates use the 1904 epoch (Mac legacy).",
+      "description": "WorkbookProperties Date1904 flag — true means dates use the 1904 epoch (Mac legacy). This is the attribute that actually controls the workbook date system; set it to toggle the epoch.",
+      "examples": [
+        "--prop workbook.date1904=true"
+      ],
       "readback": "true|false",
       "enforcement": "report"
     },
@@ -315,7 +319,7 @@
       "add": false,
       "set": true,
       "get": true,
-      "description": "WorkbookProperties DateCompatibility flag — controls 1900 vs 1904 date system compatibility.",
+      "description": "WorkbookProperties DateCompatibility flag (a distinct OOXML attribute, NOT the 1904-epoch toggle — use workbook.date1904 to change the date system).",
       "examples": [
         "--prop workbook.dateCompatibility=true"
       ],

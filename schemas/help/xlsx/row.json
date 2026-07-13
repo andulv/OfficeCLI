@@ -87,10 +87,10 @@
     },
     "collapsed": {
       "type": "bool",
-      "description": "collapse row group. Currently Set-only.",
-      "add": false, "set": true, "get": false,
+      "description": "collapsed row-group flag; omitted from Get when not collapsed.",
+      "add": false, "set": true, "get": true,
       "examples": ["--prop collapsed=true"],
-      "readback": "not surfaced by Get",
+      "readback": "true when the row group is collapsed",
       "enforcement": "report"
     },
     "customHeight": { "type":"bool", "add":false, "set":false, "get":true, "description":"true when the row carries an explicit height (Row @customHeight). Get-only flag.", "readback":"true when row has a custom height", "enforcement":"report" }

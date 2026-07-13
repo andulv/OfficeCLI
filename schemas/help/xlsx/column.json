@@ -51,10 +51,10 @@
     },
     "collapsed": {
       "type": "bool",
-      "description": "collapse column group. Currently Set-only.",
-      "add": false, "set": true, "get": false,
+      "description": "collapsed column-group flag; omitted from Get when not collapsed.",
+      "add": false, "set": true, "get": true,
       "examples": ["--prop collapsed=true"],
-      "readback": "not surfaced by Get",
+      "readback": "true when the column group is collapsed",
       "enforcement": "report"
     },
     "numberformat": {

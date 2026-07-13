@@ -231,6 +231,7 @@ internal static partial class PivotTableHelper
         for (int i = 0; i < headers.Length; i++)
         {
             var pf = new PivotField { ShowAll = false };
+            bool needsFillDownExt = false; // repeatItemLabels ext, appended after <items>
             // Layout-dependent per-field attributes.
             // Compact: compact=default(true), outline=default(true)
             // Outline: compact=false, outline=default(true)
@@ -301,18 +302,12 @@ internal static partial class PivotTableHelper
                         // emit. Earlier officecli wrote 'repeatItemLabels'
                         // directly, which is NOT a valid x14:pivotField
                         // attribute and the validator rightly rejected it.
-                        const string x14Ns = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
-                        var pfExt = new PivotFieldExtension
-                        {
-                            Uri = "{2946ED86-A175-432a-8AC1-64E0C546D7DE}"
-                        };
-                        var x14Pf = new OpenXmlUnknownElement("x14", "pivotField", x14Ns);
-                        x14Pf.SetAttribute(new OpenXmlAttribute("fillDownLabels", "", "1"));
-                        x14Pf.AddNamespaceDeclaration("x14", x14Ns);
-                        pfExt.AppendChild(x14Pf);
-                        var pfExtLst = pf.GetFirstChild<PivotFieldExtensionList>()
-                            ?? pf.AppendChild(new PivotFieldExtensionList());
-                        pfExtLst.AppendChild(pfExt);
+                        // Defer the actual extLst append until AFTER <items>
+                        // is populated below — CT_PivotField requires child
+                        // order items → autoSortScope → extLst, and appending
+                        // it here (before items) produces XML real Excel
+                        // refuses to open (0x800A03EC).
+                        needsFillDownExt = true;
                     }
                 }
             }
@@ -360,6 +355,23 @@ internal static partial class PivotTableHelper
                 pf.InsertBlankRow = true;
 
             _ = isNumeric; // kept for readability; consumed only by data fields above
+
+            // fillDownLabels (repeatItemLabels) x14 ext MUST be the last child
+            // of the pivotField — appended here, after <items> and any
+            // subtotal attrs, so CT_PivotField's items→autoSortScope→extLst
+            // order holds (out-of-order extLst → 0x800A03EC in real Excel).
+            if (needsFillDownExt)
+            {
+                const string x14Ns = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+                var pfExt = new PivotFieldExtension { Uri = "{2946ED86-A175-432a-8AC1-64E0C546D7DE}" };
+                var x14Pf = new OpenXmlUnknownElement("x14", "pivotField", x14Ns);
+                x14Pf.SetAttribute(new OpenXmlAttribute("fillDownLabels", "", "1"));
+                x14Pf.AddNamespaceDeclaration("x14", x14Ns);
+                pfExt.AppendChild(x14Pf);
+                var pfExtLst = pf.GetFirstChild<PivotFieldExtensionList>()
+                    ?? pf.AppendChild(new PivotFieldExtensionList());
+                pfExtLst.AppendChild(pfExt);
+            }
 
             pivotFields.AppendChild(pf);
         }
