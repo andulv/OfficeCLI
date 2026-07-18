@@ -634,7 +634,7 @@ public partial class WordHandler
         // position; they are only schema-valid inside a table STYLE's tblPr
         // (CT_TblPrStyle). Inserting them bare therefore always validates as
         // "invalid child element 'tblStyleRowBandSize'", no matter the order.
-        // wml-aware consumers (Word, LibreOffice — whose DOCX export writes
+        // wml-aware consumers (Word and other editors — whose DOCX export writes
         // them document-side at the CT_TblPrBase rank-4/5 slot) DO honor the
         // elements, so we keep them document-side but wrap them in an
         // mc:AlternateContent guard with Requires="w": every wordprocessingml

@@ -1738,6 +1738,35 @@ public partial class WordHandler
         var body = _doc.MainDocumentPart?.Document?.Body;
         if (body == null) return results;
 
+        // '*' full-document listing: TOP-LEVEL body blocks in document order.
+        // Word has no native '*' element, so before this alias the selector
+        // silently matched nothing — and under `query --compact` that
+        // produced the worst possible shape for an agent: a zero-line listing
+        // with a non-zero denominator ('total: 0 of 26 elements'), read as
+        // "the document is empty". Mirrors pptx '*' (all top-level frames).
+        // Deliberately NOT 'paragraph, table': the paragraph selector descends
+        // into table cells, which under --compact double-counts every cell
+        // paragraph next to the folded [table RxC] line and breaks the
+        // N == M read-completeness identity. Top-level-only keeps N == M.
+        if (selector.Trim() == "*")
+        {
+            var topParas = new Queue<DocumentNode>(QueryDispatch("paragraph")
+                .Where(n => System.Text.RegularExpressions.Regex.IsMatch(n.Path, @"^/body/p\[")));
+            var topTables = new Queue<DocumentNode>(QueryDispatch("table")
+                .Where(n => n.Path.StartsWith("/body/tbl[", StringComparison.OrdinalIgnoreCase)));
+            // Merge by walking body children so paragraphs and tables interleave
+            // in document order; anything either queue holds that the walk did
+            // not consume (defensive) is appended, never dropped.
+            foreach (var child in body.Elements())
+            {
+                if (child is Paragraph && topParas.Count > 0) results.Add(topParas.Dequeue());
+                else if (child is Table && topTables.Count > 0) results.Add(topTables.Dequeue());
+            }
+            results.AddRange(topParas);
+            results.AddRange(topTables);
+            return results;
+        }
+
         // BUG-R18-01: scoped OLE selector `/body/ole`, `/header[N]/ole`,
         // `/footer[N]/ole` (and `object`/`embed` aliases) was not recognized
         // by ParseSingleSelector — it truncated at the first `[`, so the

@@ -1310,12 +1310,17 @@ public partial class ExcelHandler
             rowBreaks = new RowBreaks();
             rbWs.AppendChild(rowBreaks);
         }
-        rowBreaks.AppendChild(new Break
-        {
-            Id = rbRowIdx,
-            Max = 16383u,
-            ManualPageBreak = true
-        });
+        // Optional restricted column span (min/max) — mirrors the Set path so a
+        // dump-emitted `add rowbreak row=N min=.. max=..` reproduces a
+        // non-full-width break. Defaults to full width (max 16383) when absent.
+        var rbBreak = new Break { Id = rbRowIdx, Max = 16383u, ManualPageBreak = true };
+        if (properties.TryGetValue("min", out var rbMinS) && uint.TryParse(rbMinS, out var rbMin))
+            rbBreak.Min = rbMin;
+        if (properties.TryGetValue("max", out var rbMaxS) && uint.TryParse(rbMaxS, out var rbMax))
+            rbBreak.Max = rbMax;
+        if (properties.TryGetValue("manual", out var rbMan))
+            rbBreak.ManualPageBreak = IsTruthy(rbMan);
+        rowBreaks.AppendChild(rbBreak);
         rowBreaks.Count = (uint)rowBreaks.Elements<Break>().Count();
         rowBreaks.ManualBreakCount = rowBreaks.Count;
         SaveWorksheet(rbWorksheet);
@@ -1353,12 +1358,15 @@ public partial class ExcelHandler
             colBreaks = new ColumnBreaks();
             cbWs.AppendChild(colBreaks);
         }
-        colBreaks.AppendChild(new Break
-        {
-            Id = cbColIdx,
-            Max = 1048575u,
-            ManualPageBreak = true
-        });
+        // Optional restricted row span (min/max) — mirrors the Set path.
+        var cbBreak = new Break { Id = cbColIdx, Max = 1048575u, ManualPageBreak = true };
+        if (properties.TryGetValue("min", out var cbMinS) && uint.TryParse(cbMinS, out var cbMin))
+            cbBreak.Min = cbMin;
+        if (properties.TryGetValue("max", out var cbMaxS) && uint.TryParse(cbMaxS, out var cbMax))
+            cbBreak.Max = cbMax;
+        if (properties.TryGetValue("manual", out var cbMan))
+            cbBreak.ManualPageBreak = IsTruthy(cbMan);
+        colBreaks.AppendChild(cbBreak);
         colBreaks.Count = (uint)colBreaks.Elements<Break>().Count();
         colBreaks.ManualBreakCount = colBreaks.Count;
         SaveWorksheet(cbWorksheet);

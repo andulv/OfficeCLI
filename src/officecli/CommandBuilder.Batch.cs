@@ -72,7 +72,7 @@ static partial class CommandBuilder
             }
             catch (Exception ex)
             {
-                results.Add(new BatchResult { Index = bi, Success = false, Item = item, Error = ex.Message });
+                results.Add(new BatchResult { Index = bi, Success = false, Item = item, Error = ex.Message, Code = OfficeCli.Core.OutputFormatter.InferErrorCode(ex) });
                 if (stopOnError) break;
             }
             // BUG-BT2: per-item unrecognized-LaTeX diagnostics. The handler
@@ -129,13 +129,21 @@ static partial class CommandBuilder
         // "everything succeeded". `--stop-on-error` opts back into the
         // strict abort-on-first-failure flow for callers who depend on it.
         var batchForceOpt = new Option<bool>("--force") { Description = "Deprecated alias for the default continue-on-error mode (kept for compatibility)" };
-        var batchStopOpt = new Option<bool>("--stop-on-error") { Description = "Abort the batch as soon as any command fails (default: continue and report per-item errors)" };
+        var batchStopOpt = new Option<bool>("--stop-on-error") { Description = "Abort the batch as soon as any command fails (with --best-effort: earlier items stay applied; default atomic mode: nothing is applied either way)" };
+        // Atomic-by-default: a partially-applied batch is the dirtiest possible
+        // outcome for a programmatic caller (the document sits in a state the
+        // caller never asked for, and the failure verdict disagrees with what
+        // landed on disk). Default = all-or-nothing; --best-effort restores the
+        // old apply-what-succeeds semantics for callers that want partial
+        // progress (e.g. lossy replays of dumps with known-unsupported items).
+        var batchBestEffortOpt = new Option<bool>("--best-effort") { Description = "Apply the items that succeed even when others fail (pre-atomic legacy semantics). Default: any failure rolls back the whole batch" };
         var batchCommand = new Command("batch", BatchHelpDescription);
         batchCommand.Add(batchFileArg);
         batchCommand.Add(batchInputOpt);
         batchCommand.Add(batchCommandsOpt);
         batchCommand.Add(batchForceOpt);
         batchCommand.Add(batchStopOpt);
+        batchCommand.Add(batchBestEffortOpt);
         batchCommand.Add(jsonOption);
 
         batchCommand.SetAction(result => { var json = result.GetValue(jsonOption); return SafeRun(() =>
@@ -149,6 +157,7 @@ static partial class CommandBuilder
             // error switch.
             var stopOnError = result.GetValue(batchStopOpt);
             var forceFlag = result.GetValue(batchForceOpt);
+            var bestEffort = result.GetValue(batchBestEffortOpt);
 
             string jsonText;
             // BUG-R7-09 (F-6): previously --commands/--input/stdin were
@@ -373,7 +382,8 @@ static partial class CommandBuilder
                     {
                         ["batchJson"] = jsonText,
                         ["force"] = force.ToString(),
-                        ["stopOnError"] = stopOnError.ToString()
+                        ["stopOnError"] = stopOnError.ToString(),
+                        ["bestEffort"] = bestEffort.ToString()
                     }
                 };
                 // CONSISTENCY(resident-two-step): long connectTimeoutMs so the
@@ -400,26 +410,178 @@ static partial class CommandBuilder
             // re-serialize that dominates large replays. Save-once is the
             // documented intent of this path; per-op Save was redundant given
             // the Dispose-time flush.
-            using var handler = DocumentHandlerFactory.Open(file.FullName, editable: true);
-            // Protection gate against the just-opened in-memory DOM (one check
-            // for the whole batch; no second file open).
-            if (!force && file.Extension.Equals(".docx", StringComparison.OrdinalIgnoreCase))
+            //
+            // Atomic default: run the batch against a same-directory temp COPY
+            // and promote it over the original only when every item succeeded.
+            // The original file is never opened for write, so no SDK
+            // buffering/autosave subtlety can leak a partial state onto it —
+            // and a crash mid-save corrupts only the temp. --best-effort keeps
+            // the legacy run-in-place semantics; all-read-only batches skip the
+            // copy (nothing to protect).
+            var atomic = !bestEffort && items.Any(it => !ReadOnlyBatchVerbs.Contains(it.Command ?? ""));
+            // Resolve a symlink up front so the final promote replaces the
+            // TARGET file; a plain rename would overwrite the link itself.
+            string targetPath;
+            try { targetPath = new FileInfo(file.FullName).ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? file.FullName; }
+            catch { targetPath = file.FullName; }
+            string? tmpPath = null;
+            var workPath = targetPath;
+            if (atomic)
             {
-                var protBlock = GetBatchProtectionBlock(handler, items);
-                if (protBlock != null)
+                var tmpDir = System.IO.Path.GetDirectoryName(targetPath) ?? ".";
+                var tmpStem = TruncateStemForTempName(System.IO.Path.GetFileNameWithoutExtension(targetPath));
+                var tmpExt = System.IO.Path.GetExtension(targetPath);
+                // Sweep orphaned temp copies from earlier crashed batches
+                // (kill -9 mid-run can't self-clean). Only THIS document's
+                // pattern is considered, and a candidate must pass TWO gates:
+                // an exclusive open (a running batch holds its temp open, so
+                // live temps are never touched) AND an age floor — the
+                // exclusive-open probe alone has TOCTOU windows against a
+                // concurrent batch on the same document (after its File.Copy
+                // but before its handler opens; after its dispose but before
+                // its File.Replace) where the temp is closed yet very much
+                // alive. Real crash orphans are minutes-to-days old; anything
+                // younger is presumed live and left for a later sweep.
+                try
                 {
-                    if (json)
-                        Console.WriteLine(OfficeCli.Core.OutputFormatter.WrapEnvelopeError(protBlock, new List<OfficeCli.Core.CliWarning>()));
-                    else
-                        Console.Error.WriteLine($"ERROR: {protBlock}");
-                    return 1;
+                    var ageFloor = DateTime.UtcNow - TimeSpan.FromMinutes(15);
+                    // Two patterns: promoted temps (batch-) and staging names
+                    // (batchprep-, see below) a crash may leave behind.
+                    foreach (var pattern in new[] { $".{tmpStem}.batch-*{tmpExt}", $".{tmpStem}.batchprep-*{tmpExt}" })
+                        foreach (var orphan in System.IO.Directory.GetFiles(tmpDir, pattern))
+                        {
+                            try
+                            {
+                                // Age gate on the NEWER of creation time and
+                                // mtime. File.Copy preserves the source's
+                                // mtime (possibly hours old) but the copy's
+                                // birthtime is the copy moment — so a live
+                                // temp/staging file is young by construction
+                                // on macOS/Windows, with no stamp-ordering
+                                // window to race. (On filesystems without
+                                // birthtime, CreationTimeUtc falls back to a
+                                // stat time and the explicit stamp below
+                                // still narrows the window to copy→stamp.)
+                                var bornOrWritten = System.IO.File.GetCreationTimeUtc(orphan);
+                                var lastWrite = System.IO.File.GetLastWriteTimeUtc(orphan);
+                                if (bornOrWritten > ageFloor || lastWrite > ageFloor) continue;
+                                using (new System.IO.FileStream(orphan, System.IO.FileMode.Open,
+                                    System.IO.FileAccess.ReadWrite, System.IO.FileShare.None)) { }
+                                System.IO.File.Delete(orphan);
+                            }
+                            catch (Exception delEx)
+                            {
+                                // In use (concurrent batch) is normal; an
+                                // UNDELETABLE aged orphan (e.g. macOS uchg
+                                // flag cloned from a locked document) would
+                                // otherwise accumulate one hidden file per
+                                // retry with no signal — say so once.
+                                if (delEx is not System.IO.IOException)
+                                    Console.Error.WriteLine($"warning: could not remove stale batch temp '{orphan}': {delEx.Message}");
+                            }
+                        }
+                }
+                catch { /* directory unreadable — sweep is best-effort */ }
+                // Keep the original extension LAST — DocumentHandlerFactory
+                // dispatches by extension, so `.tmp` would be rejected.
+                //
+                // STREAM-copy under a staging name, rename into place. Not
+                // File.Copy: that preserves the source's mtime (hours old on
+                // an idle document), and on macOS setting an mtime below the
+                // birthtime drags the birthtime down with it — no timestamp
+                // gate survives that. A streamed copy is born with a fresh
+                // mtime, holds an exclusive handle for the whole write (the
+                // sweep's open-probe bounces off), and inherits neither BSD
+                // file flags (uchg) nor the source's timestamps. From handle
+                // close to rename the file is protected by its fresh mtime.
+                var guid = Guid.NewGuid().ToString("N");
+                var prepPath = System.IO.Path.Combine(tmpDir, $".{tmpStem}.batchprep-{guid}{tmpExt}");
+                tmpPath = System.IO.Path.Combine(tmpDir, $".{tmpStem}.batch-{guid}{tmpExt}");
+                using (var src = new System.IO.FileStream(targetPath, System.IO.FileMode.Open,
+                    System.IO.FileAccess.Read, System.IO.FileShare.Read))
+                using (var dst = new System.IO.FileStream(prepPath, System.IO.FileMode.CreateNew,
+                    System.IO.FileAccess.ReadWrite, System.IO.FileShare.None))
+                {
+                    src.CopyTo(dst);
+                }
+                // The final promote is a rename, which would hand the document
+                // the temp's default permissions — carry the original mode
+                // over. (Windows File.Replace preserves the destination's ACL
+                // by itself.)
+                if (!OperatingSystem.IsWindows())
+                    try { System.IO.File.SetUnixFileMode(prepPath, System.IO.File.GetUnixFileMode(targetPath)); }
+                    catch { /* best-effort */ }
+                System.IO.File.Move(prepPath, tmpPath);
+                workPath = tmpPath;
+            }
+            List<BatchResult> batchResults;
+            var batchUnrecognizedLatex = new List<string>();
+            bool batchSuccessLocal;
+            try
+            {
+                using var handler = DocumentHandlerFactory.Open(workPath, editable: true);
+                // Protection gate against the just-opened in-memory DOM (one check
+                // for the whole batch; no second file open).
+                if (!force && file.Extension.Equals(".docx", StringComparison.OrdinalIgnoreCase))
+                {
+                    var protBlock = GetBatchProtectionBlock(handler, items);
+                    if (protBlock != null)
+                    {
+                        if (json)
+                            Console.WriteLine(OfficeCli.Core.OutputFormatter.WrapEnvelopeError(protBlock, new List<OfficeCli.Core.CliWarning>()));
+                        else
+                            Console.Error.WriteLine($"ERROR: {protBlock}");
+                        if (tmpPath != null)
+                            try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
+                        return 1;
+                    }
+                }
+                // DeferSave + replay loop, shared with the MCP batch surface. The
+                // handler's using-Dispose performs the single FinalizeDeferredIds +
+                // Save flush.
+                batchResults = RunNonResidentBatch(handler, items, stopOnError, json, batchUnrecognizedLatex);
+                batchSuccessLocal = batchResults.Count == 0 || !batchResults.Any(r => !r.Success);
+                // Watch preview: only when the document actually changes — the
+                // atomic rollback leaves the file exactly as the preview
+                // already shows it, so a refresh would be a lie (and a waste).
+                if (batchResults.Any(r => r.Success) && (batchSuccessLocal || !atomic))
+                    NotifyWatch(handler, file.FullName, null);
+            }
+            catch
+            {
+                // Exception escaping the replay (mapped to an error envelope by
+                // SafeRun): never leave the temp copy behind, never promote it.
+                if (tmpPath != null)
+                    try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
+                throw;
+            }
+            // The using-Dispose above fully serialized the (temp) document;
+            // promote it over the original only on an all-green batch.
+            if (tmpPath != null)
+            {
+                if (batchSuccessLocal)
+                {
+                    // Same-volume atomic swap; the temp copy carries the fully
+                    // saved post-batch document. A failing swap (target made
+                    // read-only / deleted underneath us / fs quirk) surfaces as
+                    // a command error BEFORE any success output — the original
+                    // is untouched, so the verdict stays truthful — but the
+                    // temp copy must not leak on that path.
+                    try
+                    {
+                        System.IO.File.Replace(tmpPath, targetPath, destinationBackupFileName: null);
+                    }
+                    catch
+                    {
+                        try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
+                        throw;
+                    }
+                }
+                else
+                {
+                    try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
                 }
             }
-            // DeferSave + replay loop, shared with the MCP batch surface. The
-            // handler's using-Dispose performs the single FinalizeDeferredIds +
-            // Save flush.
-            var batchUnrecognizedLatex = new List<string>();
-            var batchResults = RunNonResidentBatch(handler, items, stopOnError, json, batchUnrecognizedLatex);
             // BUG-R6-02: in --json mode the non-resident path emitted the raw
             // {"results":...,"summary":...} body while the resident path
             // wrapped it in {"success":..., "data":{...}} (resident server
@@ -450,21 +612,21 @@ static partial class CommandBuilder
                     Suggestion = "Check the command spelling; see https://katex.org/docs/supported.html for supported syntax.",
                 });
             }
+            var rolledBack = atomic && !batchSuccess;
             if (json)
             {
                 using var sw = new System.IO.StringWriter();
-                PrintBatchResults(batchResults, json, items.Count, sw);
+                PrintBatchResults(batchResults, json, items.Count, sw, atomicRolledBack: rolledBack);
                 var inner = sw.ToString().TrimEnd('\n', '\r');
                 Console.WriteLine(OfficeCli.Core.OutputFormatter.WrapEnvelope(inner, batchWarnings, success: batchSuccess));
             }
             else
             {
-                PrintBatchResults(batchResults, json, items.Count);
+                PrintBatchResults(batchResults, json, items.Count, atomicRolledBack: rolledBack);
                 foreach (var w in batchWarnings)
                     Console.Error.WriteLine($"  WARNING: {w.Message}");
             }
-            if (batchResults.Any(r => r.Success))
-                NotifyWatch(handler, file.FullName, null);
+            // (watch notify happened inside the handler scope above)
             // Exit precedence: a failed item (exit 1) outranks an
             // unrecognized-LaTeX-only warning (exit 2 mirrors single-shot).
             if (!batchSuccess) return 1;
@@ -478,4 +640,42 @@ static partial class CommandBuilder
     // StreamReader's detect-encoding; Console.In feeds raw chars.
     private static string StripBom(string s)
         => !string.IsNullOrEmpty(s) && s[0] == '﻿' ? s.Substring(1) : s;
+
+    /// <summary>
+    /// The atomic temp name adds ~45 bytes of affixes around the document's
+    /// stem; a stem near the 255-byte filename limit would push the temp name
+    /// over it, making `batch` fail on a file that plain `set` handles.
+    /// Truncate the stem (UTF-8-byte budget, at a char boundary) for the temp
+    /// name AND the orphan-sweep pattern — both must derive identically or a
+    /// crashed batch's orphan would never match its own document's sweep.
+    /// Collision risk from truncation is absorbed by the per-temp GUID.
+    /// </summary>
+    private static string TruncateStemForTempName(string stem)
+    {
+        const int maxStemBytes = 180;
+        if (System.Text.Encoding.UTF8.GetByteCount(stem) <= maxStemBytes) return stem;
+        var bytes = 0;
+        var end = 0;
+        while (end < stem.Length)
+        {
+            // Walk whole code points so a surrogate pair is never split
+            // (a lone surrogate cannot round-trip through a UTF-8 filename).
+            var step = char.IsHighSurrogate(stem[end]) && end + 1 < stem.Length ? 2 : 1;
+            var b = System.Text.Encoding.UTF8.GetByteCount(stem.AsSpan(end, step));
+            if (bytes + b > maxStemBytes) break;
+            bytes += b;
+            end += step;
+        }
+        return stem[..end];
+    }
+
+    // Batch verbs that never mutate the DOM. Single source of truth for both
+    // the non-resident atomic-copy decision above and the resident server's
+    // watch-notify / atomic decisions (ResidentServer.ExecuteBatch). Any verb
+    // NOT listed here (including unknown / future ones) fails open to
+    // "mutating", so a new verb is never silently treated as read-only.
+    internal static readonly HashSet<string> ReadOnlyBatchVerbs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "get", "query", "view", "validate", "dump", "raw"
+    };
 }

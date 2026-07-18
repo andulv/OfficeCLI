@@ -101,11 +101,18 @@ internal static partial class ChartHelper
         // producing a chart where the real bars are compressed to a thin sliver on the left.
         if (refValue > 1.0 && IsPercentStackedChart(plotArea))
         {
-            Console.Error.WriteLine(
-                $"Warning: referenceLine value {refValue.ToString("G", System.Globalization.CultureInfo.InvariantCulture)} "
+            var refMsg =
+                $"referenceLine value {refValue.ToString("G", System.Globalization.CultureInfo.InvariantCulture)} "
                 + "on a percent-stacked chart. The value axis is 0-1 (0%-100%); "
                 + $"did you mean {(refValue / 100.0).ToString("G", System.Globalization.CultureInfo.InvariantCulture)}? "
-                + "Excel will auto-scale the axis to fit, compressing the real bars.");
+                + "Excel will auto-scale the axis to fit, compressing the real bars.";
+            // CONSISTENCY(numfmt-warning): JSON mode → envelope warnings[];
+            // plain mode keeps the stderr line.
+            if (WarningContext.IsActive)
+                WarningContext.Add(refMsg, "referenceline_out_of_scale",
+                    $"Use {(refValue / 100.0).ToString("G", System.Globalization.CultureInfo.InvariantCulture)} for a 0-1 percent axis");
+            else
+                Console.Error.WriteLine($"Warning: {refMsg}");
         }
 
         // Find max data point count from existing series (after removing old ref lines)

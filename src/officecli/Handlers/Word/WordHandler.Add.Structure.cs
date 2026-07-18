@@ -1272,7 +1272,7 @@ public partial class WordHandler
             {
                 // Two distinct styles (the styleId collision is already caught
                 // above, so this explicit styleId is unique) sharing a display
-                // name is a real-world artifact — LibreOffice / document merges
+                // name is a real-world artifact — third-party editors / document merges
                 // produce e.g. styleId "Subtitle1" + "Subtitle10" both named
                 // "Subtitle1". Word keys its Styles pane by name, so the
                 // duplicate collides in the UI, but NOTHING in the document

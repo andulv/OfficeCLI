@@ -956,20 +956,30 @@ public partial class WordHandler
                 else if (IsExplicitFalseAddOverride(bold))
                     rProps.Bold = new Bold { Val = OnOffValue.FromBoolean(false) };
             }
-            if ((properties.TryGetValue("bold.cs", out var boldCs)
-                    || properties.TryGetValue("font.bold.cs", out boldCs))
-                && IsTruthy(boldCs))
-                rProps.BoldComplexScript = new BoldComplexScript();
+            if (properties.TryGetValue("bold.cs", out var boldCs)
+                || properties.TryGetValue("font.bold.cs", out boldCs))
+            {
+                // Mirror the r-level path (BUG-DUMP-BCS-FALSE): an explicit
+                // OFF must land on the generated run too, not only on the
+                // paragraph-mark rPr — an on-only gate dropped the override
+                // and the run re-inherited the style's bold.
+                if (IsTruthy(boldCs)) rProps.BoldComplexScript = new BoldComplexScript();
+                else if (IsExplicitFalseAddOverride(boldCs))
+                    rProps.BoldComplexScript = new BoldComplexScript { Val = OnOffValue.FromBoolean(false) };
+            }
             if (properties.TryGetValue("italic", out var pItalic) || properties.TryGetValue("font.italic", out pItalic))
             {
                 if (IsTruthy(pItalic)) rProps.Italic = new Italic();
                 else if (IsExplicitFalseAddOverride(pItalic))
                     rProps.Italic = new Italic { Val = OnOffValue.FromBoolean(false) };
             }
-            if ((properties.TryGetValue("italic.cs", out var italicCs)
-                    || properties.TryGetValue("font.italic.cs", out italicCs))
-                && IsTruthy(italicCs))
-                rProps.ItalicComplexScript = new ItalicComplexScript();
+            if (properties.TryGetValue("italic.cs", out var italicCs)
+                || properties.TryGetValue("font.italic.cs", out italicCs))
+            {
+                if (IsTruthy(italicCs)) rProps.ItalicComplexScript = new ItalicComplexScript();
+                else if (IsExplicitFalseAddOverride(italicCs))
+                    rProps.ItalicComplexScript = new ItalicComplexScript { Val = OnOffValue.FromBoolean(false) };
+            }
             if (properties.TryGetValue("size.cs", out var sizeCs)
                 || properties.TryGetValue("font.size.cs", out sizeCs))
             {

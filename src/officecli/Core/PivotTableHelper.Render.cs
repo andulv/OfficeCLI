@@ -174,9 +174,10 @@ internal static partial class PivotTableHelper
             // re-adds values cleanly.
             if (valueFields.Count == 0)
             {
-                Console.Error.WriteLine(
-                    "WARNING: pivot has no value fields; skipping cell render. " +
-                    "Add a value field to materialize the table.");
+                WarnRenderAdvisory(
+                    "pivot has no value fields; skipping cell render. " +
+                    "Add a value field to materialize the table.",
+                    "pivot_render_skipped");
                 return;
             }
             RenderGeneralPivot(targetSheet, position, headers, columnData,
@@ -210,10 +211,11 @@ internal static partial class PivotTableHelper
         bool rowsOnly = rowFieldIndices.Count == 1 && colFieldIndices.Count == 0 && valueFields.Count >= 1;
         if (!rowsOnly && (rowFieldIndices.Count != 1 || colFieldIndices.Count != 1 || valueFields.Count < 1))
         {
-            Console.Error.WriteLine(
-                "WARNING: pivot rendering currently supports 1×0×K, 1×1×K, 2×1×1, or 1×2×1 field combinations. " +
+            WarnRenderAdvisory(
+                "pivot rendering currently supports 1×0×K, 1×1×K, 2×1×1, or 1×2×1 field combinations. " +
                 "The file will open but the pivot will appear empty. " +
-                "Use Excel's Refresh button to populate it manually.");
+                "Use Excel's Refresh button to populate it manually.",
+                "pivot_render_skipped");
             return;
         }
 
@@ -534,12 +536,13 @@ internal static partial class PivotTableHelper
             }
             else
             {
-                Console.Error.WriteLine(
-                    $"WARNING: pivot at {position} has {filterFieldIndices.Count} page filter(s) " +
+                WarnRenderAdvisory(
+                    $"pivot at {position} has {filterFieldIndices.Count} page filter(s) " +
                     $"but only {anchorRow - 1} row(s) of headroom above. " +
                     "Filter cells will not be visible in the host sheet, but the filter dropdowns " +
                     "will still appear in Excel's pivot UI. Move the pivot to a lower anchor row " +
-                    $"(at least row {requiredHeadroom + 1}) to render the filter cells.");
+                    $"(at least row {requiredHeadroom + 1}) to render the filter cells.",
+                    "pivot_filter_cells_skipped");
             }
         }
 
@@ -2662,4 +2665,14 @@ internal static partial class PivotTableHelper
         return cell;
     }
 
+    // CONSISTENCY(numfmt-warning): JSON mode queues the advisory for the
+    // envelope's warnings[]; plain mode keeps the stderr line (which the
+    // resident server lifts via BuildWarnings).
+    private static void WarnRenderAdvisory(string message, string code)
+    {
+        if (WarningContext.IsActive)
+            WarningContext.Add(message, code);
+        else
+            Console.Error.WriteLine($"WARNING: {message}");
+    }
 }

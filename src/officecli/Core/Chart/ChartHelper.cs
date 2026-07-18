@@ -138,7 +138,26 @@ internal static partial class ChartHelper
         var parts = cellPart.Split(':');
         for (int i = 0; i < parts.Length; i++)
             parts[i] = AddAbsoluteMarkers(parts[i]);
-        return sheetPart + string.Join(":", parts);
+        return QuoteSheetPart(sheetPart) + string.Join(":", parts);
+    }
+
+    /// <summary>
+    /// Quotes the sheet-name portion of a chart formula prefix (the part ending
+    /// with '!') when the name requires it — a leading digit, a space, a hyphen,
+    /// or any other non-word character. Unquoted references to such sheets break
+    /// in WPS and are non-compliant with the OOXML reference syntax. Reuses the
+    /// workbook-wide <see cref="ModernFunctionQualifier.QuoteSheetNameForRef"/>
+    /// so chart refs match cell formulas, print areas, and defined names; plain
+    /// names (Sheet1, 测试) stay unquoted. Already-quoted prefixes pass through.
+    /// </summary>
+    private static string QuoteSheetPart(string sheetPartWithBang)
+    {
+        if (string.IsNullOrEmpty(sheetPartWithBang) || sheetPartWithBang[^1] != '!')
+            return sheetPartWithBang;
+        var name = sheetPartWithBang[..^1];
+        if (name.Length == 0) return sheetPartWithBang;
+        if (name.Length >= 2 && name[0] == '\'' && name[^1] == '\'') return sheetPartWithBang;
+        return ModernFunctionQualifier.QuoteSheetNameForRef(name) + "!";
     }
 
     /// <summary>
@@ -167,7 +186,7 @@ internal static partial class ChartHelper
         for (int i = 0; i < parts.Length; i++)
             parts[i] = AddAbsoluteMarkers(parts[i]);
 
-        return sheetPart + string.Join(":", parts);
+        return QuoteSheetPart(sheetPart) + string.Join(":", parts);
     }
 
     private static string AddAbsoluteMarkers(string cellRef)

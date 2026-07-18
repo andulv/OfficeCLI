@@ -6252,7 +6252,7 @@ public partial class WordHandler
                 node.Format["revision.id"] = rowDelId.ToString();
         }
         var rh = trPr.GetFirstChild<TableRowHeight>();
-        // BUG-DUMP-R34-FLOATHEIGHT: LibreOffice writes a NON-INTEGER trHeight
+        // BUG-DUMP-R34-FLOATHEIGHT: some editors write a NON-INTEGER trHeight
         // (w:val="1821.8200000000002"). The SDK types @w:val as UInt16, so
         // touching rh.Val.Value parses the string and throws FormatException —
         // aborting the entire dump. Read the raw InnerText and parse tolerantly,

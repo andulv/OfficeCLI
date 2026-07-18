@@ -24,7 +24,20 @@ internal static class Installer
     /// on Windows). External registrations (MCP, etc.) should record this path
     /// rather than <see cref="Environment.ProcessPath"/> so the command survives
     /// upgrades — self-install overwrites this file in place.</summary>
-    internal static string InstalledBinaryPath => TargetPath;
+    internal static string InstalledBinaryPath
+    {
+        get
+        {
+            // If we're running from a directory already on PATH, that location IS
+            // the install — we don't duplicate into the canonical dir (see
+            // InstallBinary). Record the reachable path so external registrations
+            // (MCP, etc.) point at the file upgrades overwrite in place.
+            var src = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(src) && IsDirOnPath(Path.GetDirectoryName(src)))
+                return src;
+            return TargetPath;
+        }
+    }
 
     /// <summary>
     /// MCP targets and the skill aliases that overlap with them.
@@ -107,6 +120,18 @@ internal static class Installer
         // Already at target location — record version and skip the copy
         var pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         if (string.Equals(Path.GetFullPath(src), Path.GetFullPath(TargetPath), pathComparison))
+        {
+            RecordInstalledVersion();
+            return false;
+        }
+
+        // Already reachable on PATH from where it's running — a user-managed
+        // install (added to PATH manually, or by install.ps1 into a pre-existing
+        // on-PATH dir). Don't drop a second copy into the canonical dir; treat the
+        // on-PATH location as the install. Mirrors install.ps1, which upgrades an
+        // existing on-PATH copy in place rather than relocating it. Config and
+        // plugins live in ~/.officecli regardless, so nothing else moves.
+        if (IsDirOnPath(Path.GetDirectoryName(src)))
         {
             RecordInstalledVersion();
             return false;
@@ -199,9 +224,14 @@ internal static class Installer
             var src = Environment.ProcessPath;
             if (string.IsNullOrEmpty(src)) return;
 
-            // Already running from target — nothing to do (RecordInstalledVersion is handled by explicit `install`)
+            // Already reachable — running from the canonical dir, or from any
+            // directory that's already on PATH (a user-managed install). Either
+            // way officecli is invokable as a command, so don't bootstrap a
+            // duplicate copy into the canonical dir. (RecordInstalledVersion is
+            // handled by explicit `install`.)
             var pathComparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-            if (string.Equals(Path.GetFullPath(src), Path.GetFullPath(TargetPath), pathComparison))
+            if (string.Equals(Path.GetFullPath(src), Path.GetFullPath(TargetPath), pathComparison)
+                || IsDirOnPath(Path.GetDirectoryName(src)))
                 return;
 
             // Dev-build filter: framework-dependent / dotnet run binaries are <5MB
@@ -272,12 +302,23 @@ internal static class Installer
         catch { return null; }
     }
 
-    private static bool IsInPath()
+    private static bool IsInPath() => IsDirOnPath(BinDir);
+
+    /// <summary>True if <paramref name="dir"/> is one of the PATH entries
+    /// (case-insensitive on Windows), i.e. a binary living there is invokable by
+    /// bare command name.</summary>
+    private static bool IsDirOnPath(string? dir)
     {
+        if (string.IsNullOrEmpty(dir)) return false;
+        string full;
+        try { full = Path.GetFullPath(dir); }
+        catch { return false; }
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
         return pathEnv.Split(Path.PathSeparator).Any(p =>
         {
-            try { return Path.GetFullPath(p).Equals(Path.GetFullPath(BinDir), StringComparison.OrdinalIgnoreCase); }
+            if (string.IsNullOrWhiteSpace(p)) return false;
+            try { return Path.GetFullPath(p).Equals(full, comparison); }
             catch { return false; }
         });
     }

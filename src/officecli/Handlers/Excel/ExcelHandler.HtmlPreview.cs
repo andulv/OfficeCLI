@@ -3431,7 +3431,7 @@ public partial class ExcelHandler
         {
             var pctVal = value * 100;
             var decimals = CountDecimalPlaces(fmtCode);
-            return pctVal.ToString($"F{decimals}") + "%";
+            return RoundHalfAwayFromZero(pctVal, decimals).ToString($"F{decimals}") + "%";
         }
 
         // Fraction formats: "# ?/?", "# ??/??", "?/?" etc.
@@ -3634,7 +3634,7 @@ public partial class ExcelHandler
 
             var mantissa = value / Math.Pow(10, exp);
             var expStr = exp >= 0 ? $"+{exp.ToString().PadLeft(expDigits, '0')}" : $"-{Math.Abs(exp).ToString().PadLeft(expDigits, '0')}";
-            return $"{mantissa.ToString($"F{decimals}")}E{expStr}";
+            return $"{RoundHalfAwayFromZero(mantissa, decimals).ToString($"F{decimals}")}E{expStr}";
         }
 
         // Trailing comma scaling: each trailing comma divides value by 1000
@@ -3658,7 +3658,7 @@ public partial class ExcelHandler
             && (fmtCode.Contains('#') || fmtCode.Contains('0'))
             && fmtCode.Contains('-'))
         {
-            var digits = ((long)Math.Round(Math.Abs(value)))
+            var digits = ((long)RoundHalfAwayFromZero(Math.Abs(value), 0))
                 .ToString(System.Globalization.CultureInfo.InvariantCulture);
             var outChars = new List<char>();
             int di = digits.Length - 1;
@@ -3683,6 +3683,11 @@ public partial class ExcelHandler
         // Numeric with thousands separator and/or decimals
         bool hasThousands = fmtCode.Contains(',') && (fmtCode.Contains('#') || fmtCode.Contains('0'));
         var numDecimals = CountDecimalPlaces(fmtCode);
+
+        // .NET's N/F ToString and argless Math.Round round half-to-even; Excel
+        // number formats round half away from zero. Pre-round so the subsequent
+        // ToString has no midpoint left to (mis)resolve.
+        value = RoundHalfAwayFromZero(value, numDecimals);
 
         // Leading-zero placeholders in the integer portion (e.g. "00000" → pad
         // the integer part to 5 digits: 42 → "00042"). Excel zero-pads the
@@ -3734,6 +3739,23 @@ public partial class ExcelHandler
         if (digitCount < minDigits)
             intPart = intPart.PadLeft(intPart.Length + (minDigits - digitCount), '0');
         return (neg ? "-" : "") + intPart + rest;
+    }
+
+    // Excel number formats round half away from zero, unlike .NET's default
+    // half-to-even. Clamp the digit count to Math.Round's valid 0..15 range.
+    private static double RoundHalfAwayFromZero(double value, int decimals)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value)) return value;
+        int d = Math.Max(0, Math.Min(15, decimals));
+        // Round through decimal so a value like 9.995 (stored as 9.99499999…)
+        // rounds by its 15-significant-digit decimal form (→10.00), the way a
+        // user reading the number expects, not by the raw binary approximation.
+        if (Math.Abs(value) < 7.9e28)
+        {
+            try { return (double)Math.Round((decimal)value, d, MidpointRounding.AwayFromZero); }
+            catch { }
+        }
+        return Math.Round(value, d, MidpointRounding.AwayFromZero);
     }
 
     private static int CountDecimalPlaces(string fmtCode)

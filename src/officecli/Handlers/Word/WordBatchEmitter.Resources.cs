@@ -2092,7 +2092,7 @@ public static partial class WordBatchEmitter
         // 1-based document-order reference cursor (sourceNoteIdx) only equals the
         // Id when the part's user notes start at id 1 (the convention Word and
         // our own AddFootnote/AddEndnote use: separators at id -1/0, first user
-        // note at id 1). LibreOffice numbers endnote separators at id 0/1, so the
+        // note at id 1). Some editors number endnote separators at id 0/1, so the
         // first user endnote is id 2 and /endnote[1] resolves to the
         // continuationSeparator (empty body) — every endnote body was silently
         // dropped while the footnote path round-tripped by coincidence of id
@@ -2162,7 +2162,7 @@ public static partial class WordBatchEmitter
         // BUG-DUMP-R40-1: carry the note's first-paragraph pStyle. AddFootnote/
         // AddEndnote hardcode pStyle="FootnoteText"/"EndnoteText" on the
         // synthesized note paragraph, but the source note may reference a
-        // DIFFERENT style id (e.g. LibreOffice "style24" / "Endnote"). The old
+        // DIFFERENT style id (e.g. "style24" / "Endnote" from another editor). The old
         // emit dropped the source style, so the rebuilt note carried a DANGLING
         // pStyle="EndnoteText" (not present in the source styles.xml) and lost
         // the note's hanging indent / size / line-number suppression. Forward the
@@ -2588,7 +2588,7 @@ public static partial class WordBatchEmitter
     //
     // BUG-DUMP-ENDNOTE-ID: the ref-mark exclusion must reject only a *pure*
     // ref-mark run (the <w:*Ref/> with no body text). Word emits the ref mark
-    // and the note text in SEPARATE runs, but LibreOffice fuses them into a
+    // and the note text in SEPARATE runs, but some editors fuse them into a
     // single <w:r><w:*Ref/><w:t>body</w:t></w:r>. Rejecting any run that merely
     // *contains* the ref child dropped that fused run's entire body text — the
     // root of "endnote bodies silently dropped". Get's .Text already excludes
@@ -3482,7 +3482,7 @@ public static partial class WordBatchEmitter
             });
         }
         // Dedupe by styleId. A styleId is effectively a key — OOXML requires
-        // it unique — but real-world sources (LibreOffice / merged docs) carry
+        // it unique — but real-world sources (third-party editors / merged docs) carry
         // duplicates (e.g. 88 <w:style> elements, 58 unique ids). Word itself
         // tolerates this by keeping the FIRST occurrence and ignoring the rest
         // (it opens the file fine). Mirror that: emit each styleId once. Without

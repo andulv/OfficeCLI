@@ -404,6 +404,15 @@ internal partial class FormulaEvaluator
             if (ch == ',') { tokens.Add(new Token(TT.Comma, ",")); i++; continue; }
             if (ch == '&') { tokens.Add(new Token(TT.Op, "&")); i++; continue; }
 
+            // Error-constant literal embedded in a formula (e.g. IFERROR(#N/A, x)).
+            // Recognized here so the whole formula still tokenizes rather than
+            // failing on the '#'.
+            if (ch == '#')
+            {
+                var lit = MatchErrorLiteral(formula, i);
+                if (lit != null) { tokens.Add(new Token(TT.Error, lit)); i += lit.Length; continue; }
+            }
+
             // Array constant literal: {1,2,3} (row) or {1;2;3} (column) or
             // {1,2;3,4} (matrix). Per ECMA-376 §18.17.7.282 (array-constant),
             // comma separates columns, semicolon separates rows. Cells may be
@@ -491,8 +500,13 @@ internal partial class FormulaEvaluator
                 while (i < formula.Length && (char.IsLetterOrDigit(formula[i]) || formula[i] is '_' or '$' or '.')) i++;
                 var word = formula[start..i]; var stripped = StripDollar(word);
 
-                if (stripped.Equals("TRUE", StringComparison.OrdinalIgnoreCase)) { tokens.Add(new Token(TT.Bool, "TRUE")); continue; }
-                if (stripped.Equals("FALSE", StringComparison.OrdinalIgnoreCase)) { tokens.Add(new Token(TT.Bool, "FALSE")); continue; }
+                // TRUE / FALSE are boolean literals, but the TRUE() / FALSE()
+                // function forms are followed by '(' — let those fall through to
+                // the function-call path below rather than emitting a bool token
+                // that leaves a stray '()' the parser can't consume.
+                bool boolFollowedByParen = i < formula.Length && formula[i] == '(';
+                if (!boolFollowedByParen && stripped.Equals("TRUE", StringComparison.OrdinalIgnoreCase)) { tokens.Add(new Token(TT.Bool, "TRUE")); continue; }
+                if (!boolFollowedByParen && stripped.Equals("FALSE", StringComparison.OrdinalIgnoreCase)) { tokens.Add(new Token(TT.Bool, "FALSE")); continue; }
 
                 // Unquoted sheet reference: SheetName!CellRef or SheetName!Range
                 if (i < formula.Length && formula[i] == '!')
@@ -522,7 +536,12 @@ internal partial class FormulaEvaluator
                   { tokens.Add(new Token(TT.Range, $"{stripped}:{rhs}")); continue; }
                   throw new NotSupportedException($"Unknown: {stripped}:{rhs}"); }
 
-                if (i < formula.Length && formula[i] == '(' && !IsCellRef(stripped))
+                // A name immediately followed by '(' is always a function call — a cell
+                // reference is never followed by '('. Without this, a function whose name
+                // is shaped like a cell ref (e.g. LOG10 = column LOG + row 10, matching
+                // IsCellRef ^[A-Z]{1,3}\d+$) was misclassified as a ref and never evaluated.
+                // Mirrors the (?![\w(]) guard in FormulaRefShifter.CellRefPattern.
+                if (i < formula.Length && formula[i] == '(')
                 { tokens.Add(new Token(TT.Func, word.Replace(".", "_").ToUpperInvariant())); continue; }
 
                 if (IsCellRef(stripped)) { tokens.Add(new Token(TT.CellRef, stripped.ToUpperInvariant())); continue; }
@@ -712,7 +731,10 @@ internal partial class FormulaEvaluator
         var left = ParseAddSub(t, ref p); if (left == null) return null;
         while (p < t.Count && t[p].Type == TT.Op && t[p].Value == "&")
         { p++; var right = ParseAddSub(t, ref p); if (right == null) return null;
-          if (left.IsError) return left; if (right.IsError) return right;
+          // An error propagates, but the rest of the operator chain must still be
+          // consumed or the top-level "all tokens parsed" check fails and turns
+          // the error into a NOTEVAL. Keep the leftmost error and keep scanning.
+          if (left.IsError) continue; if (right.IsError) { left = right; continue; }
           left = FormulaResult.Str(left.AsString() + right.AsString()); }
         return left;
         }
@@ -724,7 +746,7 @@ internal partial class FormulaEvaluator
         var left = ParseMulDiv(t, ref p); if (left == null) return null;
         while (p < t.Count && t[p].Type == TT.Op && t[p].Value is "+" or "-")
         { var op = t[p].Value; p++; var r = ParseMulDiv(t, ref p); if (r == null) return null;
-          if (left.IsError) return left; if (r.IsError) return r;
+          if (left.IsError) continue; if (r.IsError) { left = r; continue; }
           left = ApplyBinaryOp(left, r, op == "+" ? (a, b) => a + b : (a, b) => a - b); }
         return left;
     }
@@ -734,12 +756,12 @@ internal partial class FormulaEvaluator
         var left = ParsePower(t, ref p); if (left == null) return null;
         while (p < t.Count && t[p].Type == TT.Op && t[p].Value is "*" or "/")
         { var op = t[p].Value; p++; var r = ParsePower(t, ref p); if (r == null) return null;
-          if (left.IsError) return left; if (r.IsError) return r;
+          if (left.IsError) continue; if (r.IsError) { left = r; continue; }
           if (op == "/")
           {
               // Scalar-only div-by-zero gate. For array divisors, any zero produces
               // +Inf rather than #DIV/0! — acceptable degradation; tighten if needed.
-              if (!HasArrayShape(r) && r.AsNumber() == 0) return FormulaResult.Error("#DIV/0!");
+              if (!HasArrayShape(r) && r.AsNumber() == 0) { left = FormulaResult.Error("#DIV/0!"); continue; }
               left = ApplyBinaryOp(left, r, (a, b) => b == 0 ? double.PositiveInfinity : a / b);
           }
           else
@@ -754,7 +776,7 @@ internal partial class FormulaEvaluator
         while (p < t.Count && t[p].Type == TT.Op && t[p].Value == "^")
         { p++; var e = ParseUnary(t, ref p); if (e == null) return null;
           if (b.IsError) return b; if (e.IsError) return e;
-          b = ApplyBinaryOp(b, e, Math.Pow); }
+          b = ApplyBinaryOp(b, e, ExcelPow); }
         return b;
     }
 
@@ -766,7 +788,16 @@ internal partial class FormulaEvaluator
     private static FormulaResult ApplyBinaryOp(FormulaResult left, FormulaResult right, Func<double, double, double> op)
     {
         var la = AsArrayLike(left); var ra = AsArrayLike(right);
-        if (la == null && ra == null) return FormulaResult.Number(op(left.AsNumber(), right.AsNumber()));
+        if (la == null && ra == null)
+        {
+            // A scalar text operand that is not numeric-looking (including the
+            // empty string) is not coercible for arithmetic — the whole
+            // expression is #VALUE!. Numbers, booleans, blank cells (→0) and
+            // numeric-looking text still coerce.
+            if (!TryCoerceArithmetic(left, out var lv) || !TryCoerceArithmetic(right, out var rv))
+                return FormulaResult.Error("#VALUE!");
+            return FormulaResult.Number(op(lv, rv));
+        }
         if (la != null && ra == null) { var rn = right.AsNumber(); var o = new double[la.Length]; for (int i = 0; i < la.Length; i++) o[i] = op(la[i], rn); return FormulaResult.Array(o); }
         if (la == null && ra != null) { var ln = left.AsNumber(); var o = new double[ra.Length]; for (int i = 0; i < ra.Length; i++) o[i] = op(ln, ra[i]); return FormulaResult.Array(o); }
         var n = Math.Min(la!.Length, ra!.Length); var oo = new double[n];
@@ -775,6 +806,18 @@ internal partial class FormulaEvaluator
     }
 
     private static bool HasArrayShape(FormulaResult r) => r.IsArray || r.IsRange;
+
+    // Scalar arithmetic coercion. Numbers, booleans and blank cells (→0) always
+    // coerce; text coerces only when numeric-looking. Non-numeric or empty text
+    // is not coercible and the caller must surface #VALUE!.
+    private static bool TryCoerceArithmetic(FormulaResult r, out double val)
+    {
+        if (r.IsBlank) { val = 0; return true; }
+        if (r.IsString)
+            return double.TryParse(r.StringValue, NumberStyles.Any, CultureInfo.InvariantCulture, out val);
+        val = r.AsNumber();
+        return true;
+    }
 
     // Parse the body of an array constant `{...}` (without the braces).
     // Rows are separated by ';', columns by ',' — per ECMA-376 §18.17.7.282.
@@ -832,7 +875,8 @@ internal partial class FormulaEvaluator
                 // via AsNumber to -FirstCell instead of producing an array.
                 if (HasArrayShape(v))
                     return FormulaResult.Array(AsArrayLike(v)!.Select(x => -x).ToArray());
-                return FormulaResult.Number(-v.AsNumber()); }
+                if (!TryCoerceArithmetic(v, out var uv)) return FormulaResult.Error("#VALUE!");
+                return FormulaResult.Number(-uv); }
             if (t[p].Value == "+") { p++; return ParseUnary(t, ref p); }
         }
         return ParsePostfix(t, ref p);
@@ -844,7 +888,7 @@ internal partial class FormulaEvaluator
         // Immediately-invoked LAMBDA: LAMBDA(x, x+1)(5).
         while (v.IsLambda && p < t.Count && t[p].Type == TT.LParen)
             v = InvokeLambda((Lambda)v.LambdaValue!, ParseCallArgs(t, ref p));
-        while (p < t.Count && t[p].Type == TT.Op && t[p].Value == "%") { p++; v = FormulaResult.Number(v.AsNumber() / 100.0); }
+        while (p < t.Count && t[p].Type == TT.Op && t[p].Value == "%") { p++; if (!TryCoerceArithmetic(v, out var pv)) return FormulaResult.Error("#VALUE!"); v = FormulaResult.Number(pv / 100.0); }
         return v;
     }
 
@@ -900,7 +944,7 @@ internal partial class FormulaEvaluator
                 // treats omitted args as 0 for numeric-arg functions like OFFSET.
                 if (p < t.Count && (t[p].Type == TT.Comma || t[p].Type == TT.RParen))
                 { args.Add(FormulaResult.Number(0)); }
-                else if (((argIdx == 0 && name is "OFFSET" or "ISREF" or "ISFORMULA" or "SHEET")
+                else if (((argIdx == 0 && name is "OFFSET" or "ISREF" or "ISFORMULA" or "SHEET" or "ROW" or "COLUMN")
                           || (argIdx == 1 && name is "CELL"))
                          && TryParseRefArg(t, ref p) is { } refArg)
                 { args.Add(refArg); }

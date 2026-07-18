@@ -110,6 +110,13 @@ public partial class PowerPointHandler
                     SetAdvanceClick(newSlidePart.Slide, IsTruthy(advClick));
                 if (properties.TryGetValue("hidden", out var hiddenVal) && IsTruthy(hiddenVal))
                     newSlidePart.Slide.Show = false;
+                // cSld@name — same target as Set's slide-level "name" case.
+                if (properties.TryGetValue("name", out var slideName) && !string.IsNullOrEmpty(slideName))
+                {
+                    XmlTextValidator.ValidateOrThrow(slideName, "name");
+                    var csd = newSlidePart.Slide.CommonSlideData;
+                    if (csd != null) csd.Name = slideName;
+                }
 
                 newSlidePart.Slide.Save();
 

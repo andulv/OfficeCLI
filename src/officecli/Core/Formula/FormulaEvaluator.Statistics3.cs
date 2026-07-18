@@ -6,7 +6,7 @@ namespace OfficeCli.Core;
 // W4d — statistical hypothesis tests (T.TEST / CHISQ.TEST / F.TEST / Z.TEST),
 // each returning a p-value through the W4 distribution CDFs (RegIncBeta for the
 // t/F tails, RegGammaP for chi-square, NormCdf for z). Verified against real
-// Microsoft Excel.
+// Excel.
 internal partial class FormulaEvaluator
 {
     private static double Mean(double[] v) => v.Length == 0 ? 0 : v.Average();

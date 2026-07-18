@@ -171,7 +171,7 @@ static partial class CommandBuilder
         var selectorArg = new Argument<string>("selector") { Description = "CSS-like selector (e.g. paragraph[style=Normal] > run[font!=Arial])" };
 
         var queryFindOpt = new Option<string?>("--find") { Description = "Filter results to elements containing this text (case-insensitive substring)" };
-        var queryCompactOpt = new Option<bool>("--compact") { Description = "One line per element in document order: path<TAB>[label]<TAB>\"text(truncated at 60, … mark)\"; empty text shows (empty); tables fold to [table RxC]. Final line is always 'total: N of M elements / K slides' (pptx) or 'total: N of M elements' (docx — never gains a container segment): N = element lines above (lineCount-1 == N proves you read everything), M = all top-level frames. Full-document listing: selector '*' (pptx) or 'paragraph, table' (docx) makes N == M. Labels are a closed set (pptx: title/placeholder/textbox/shape/picture/chart/connector/group/equation + 'table RxC'; docx: style name). This format is a stability contract: columns/labels may be added, never changed or reordered. pptx/docx only (xlsx: use 'view text --range'). Add columns with --fields." };
+        var queryCompactOpt = new Option<bool>("--compact") { Description = "One line per element in document order: path<TAB>[label]<TAB>\"text(truncated at 60, … mark)\"; empty text shows (empty); tables fold to [table RxC]. Final line is always 'total: N of M elements / K slides' (pptx) or 'total: N of M elements' (docx — never gains a container segment): N = element lines above (lineCount-1 == N proves you read everything), M = all top-level frames. Full-document listing: selector '*' lists all top-level frames/blocks in document order and makes N == M (docx '*' folds tables without descending into cell paragraphs; 'paragraph, table' descends). Labels are a closed set (pptx: title/placeholder/textbox/shape/picture/chart/connector/group/equation + 'table RxC'; docx: style name). This format is a stability contract: columns/labels may be added, never changed or reordered. pptx/docx only (xlsx: use 'view text --range'). Add columns with --fields." };
         var queryFieldsOpt = new Option<string?>("--fields") { Description = "Comma-separated Format keys appended as extra k=v columns in --compact output (e.g. x,y,width)" };
 
         var queryCommand = new Command("query", "Query document elements with CSS-like selectors");
@@ -302,6 +302,8 @@ static partial class CommandBuilder
     /// included) and is always the last line, exactly once. The docx total
     /// has NO container segment — that absence is itself frozen (appending
     /// one later would be a total-line change, which the contract forbids).
+    /// Full listing: '*' on both formats (docx aliases it to top-level
+    /// body blocks in document order — see WordHandler.QueryDispatch).
     ///
     /// Element lines are in document order: pptx sorts by slide index then
     /// z-order (multi-type selectors like '*' would otherwise group by type),

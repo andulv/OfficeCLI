@@ -690,8 +690,8 @@ public partial class WordHandler
         // value when the raw name would otherwise be rejected so the returned
         // path is round-trippable via `get`/`add --after`.
         // BUG-R3 (dump emits a name its own batch rejects): a name with an
-        // embedded double-quote (legal in OOXML w:name, e.g. LibreOffice's
-        // "Fast_math"_optimization) cannot be expressed as an attribute
+        // embedded double-quote (legal in OOXML w:name, e.g. a
+        // "Fast_math"_optimization name from some editors) cannot be expressed as an attribute
         // selector value in EITHER the bare or double-quoted form. The
         // bookmark itself is already in the document at this point; only the
         // navigable RETURN path can't carry the name. Fall back to a positional

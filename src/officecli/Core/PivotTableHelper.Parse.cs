@@ -19,9 +19,21 @@ internal static partial class PivotTableHelper
         if (result.Count == 0 && props.TryGetValue(key, out var value) && !string.IsNullOrEmpty(value))
         {
             var available = string.Join(", ", headers.Where(h => !string.IsNullOrEmpty(h)));
-            Console.Error.WriteLine($"WARNING: No matching fields for {key}={value}. Available: {available}");
+            WarnNoMatchingFields(key, value, available);
         }
         return result;
+    }
+
+    // CONSISTENCY(numfmt-warning): JSON mode queues the advisory for the
+    // envelope's warnings[]; plain mode keeps the stderr line (which the
+    // resident server lifts via BuildWarnings).
+    private static void WarnNoMatchingFields(string key, string value, string available)
+    {
+        var message = $"No matching fields for {key}={value}. Available: {available}";
+        if (WarningContext.IsActive)
+            WarningContext.Add(message, "no_matching_fields", $"Available: {available}");
+        else
+            Console.Error.WriteLine($"WARNING: {message}");
     }
 
     private static List<(int idx, string func, string showAs, string name)> ParseValueFieldsWithWarning(
@@ -31,7 +43,7 @@ internal static partial class PivotTableHelper
         if (result.Count == 0 && props.TryGetValue(key, out var value) && !string.IsNullOrEmpty(value))
         {
             var available = string.Join(", ", headers.Where(h => !string.IsNullOrEmpty(h)));
-            Console.Error.WriteLine($"WARNING: No matching fields for {key}={value}. Available: {available}");
+            WarnNoMatchingFields(key, value, available);
         }
         return result;
     }
@@ -174,11 +186,17 @@ internal static partial class PivotTableHelper
                 var trimmed = parts[p].Trim();
                 if (trimmed.StartsWith("name=", StringComparison.OrdinalIgnoreCase))
                 {
-                    customName = trimmed.Substring("name=".Length).Trim();
-                    var next = new string[parts.Length - 1];
+                    // The name consumes EVERYTHING from this segment to the end
+                    // of the spec, re-joined with ':' — display names routinely
+                    // contain literal colons (Excel's CJK default is
+                    // "求和项:<field>"), and dump always emits name= as the
+                    // final segment. Consuming only parts[p] left the name's
+                    // own colon tail behind as a bogus showAs token, making
+                    // every CJK-default-named data field unreplayable.
+                    var joined = string.Join(":", parts.Skip(p)).Trim();
+                    customName = joined.Substring("name=".Length).Trim();
+                    var next = new string[p];
                     Array.Copy(parts, 0, next, 0, p);
-                    if (p < parts.Length - 1)
-                        Array.Copy(parts, p + 1, next, p, parts.Length - p - 1);
                     parts = next;
                     break;
                 }

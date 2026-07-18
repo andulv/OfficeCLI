@@ -180,6 +180,30 @@ public partial class PowerPointHandler
         var paraRuns = para.Elements<Drawing.Run>().ToList();
         var unsupported = new List<string>();
 
+        // Every property case below vivifies <a:pPr> on demand before its own
+        // value validation. When a value is rejected on a paragraph that had
+        // no pPr, the freshly-created empty <a:pPr/> would otherwise survive
+        // the throw and get autosaved on Dispose — the error path must leave
+        // the document untouched. One guard here covers all 14 vivify sites.
+        var pPrExistedBefore = para.ParagraphProperties != null;
+        try
+        {
+            return SetParagraphOnShapeCore(slidePart, shape, para, paraIdx, paraRuns, unsupported, properties);
+        }
+        catch
+        {
+            var vivified = para.ParagraphProperties;
+            if (!pPrExistedBefore && vivified != null
+                && !vivified.HasChildren && !vivified.GetAttributes().Any())
+                vivified.Remove();
+            throw;
+        }
+    }
+
+    private List<string> SetParagraphOnShapeCore(SlidePart slidePart, Shape shape, Drawing.Paragraph para,
+        int paraIdx, List<Drawing.Run> paraRuns, List<string> unsupported, Dictionary<string, string> properties)
+    {
+
         // Empty (runless) paragraph carrying run-style props: route size / color
         // / font.* / bold / ... onto the paragraph's endParaRPr. Without a run the
         // default branch below calls SetRunOrShapeProperties with an empty run

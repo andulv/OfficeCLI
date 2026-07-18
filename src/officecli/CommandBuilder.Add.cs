@@ -56,6 +56,9 @@ static partial class CommandBuilder
 
         addCommand.SetAction(result => { var json = result.GetValue(jsonOption); return SafeRun(() =>
         {
+            // CONSISTENCY(numfmt-warning): see CommandBuilder.Set.cs — collect
+            // Core-layer advisory warnings for the JSON envelope.
+            if (json) OfficeCli.Core.WarningContext.Begin();
             var file = result.GetValue(addFileArg)!;
             var parentPath = MsysPathHint.Restore(result.GetValue(addParentPathArg)!)!;
             var type = result.GetValue(addTypeOpt);

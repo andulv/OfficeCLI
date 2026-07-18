@@ -20,9 +20,14 @@ namespace OfficeCli.Core;
 /// </summary>
 internal class WatchServer : IDisposable
 {
-    private readonly string _filePath;
-    private readonly string _pipeName;
-    private readonly int _port;
+    // _filePath/_pipeName are mutable because POST /api/switch retargets the
+    // server to a different document in place (port and SSE connections
+    // survive). All writes happen under _switchLock; reads are lock-free
+    // (reference assignment is atomic; a stale read is as benign as a request
+    // racing the switch).
+    private string _filePath;
+    private string _pipeName;
+    private int _port; // mutable: --port 0 binds an ephemeral port, resolved after Start()
     private readonly TcpListener _tcpListener;
     private readonly List<NetworkStream> _sseClients = new();
     private readonly object _sseLock = new();
@@ -44,6 +49,10 @@ internal class WatchServer : IDisposable
     // stress test) until something else kicked the TCP listener.
     private readonly object _shutdownLock = new();
     private Task? _shutdownTask;
+
+    // Serializes POST /api/switch so two concurrent switches can't interleave
+    // their pipe/marker/state swaps.
+    private readonly SemaphoreSlim _switchLock = new(1, 1);
 
     // Current selection — paths of elements selected in any connected browser.
     // Single shared list (last-write-wins): all browsers viewing the same file see
@@ -156,10 +165,16 @@ internal class WatchServer : IDisposable
     /// Check if another watch process is already running for this file.
     /// Returns the port number if running, or null if not.
     ///
-    /// Implementation: reads the on-disk marker file ({pid}\n{port}\n) and
-    /// validates the pid is still alive. Replaces the pre-1.0.51 pipe ping
-    /// probe, which cost ~100ms and falsely reported "not watching" when
-    /// the pipe server was momentarily busy with another connection.
+    /// Implementation: reads the on-disk marker file
+    /// ({pid}\n{port}\n{startTicksUtc}\n) and validates the pid is still
+    /// alive AND is the same process incarnation that wrote the marker
+    /// (start-time comparison — a bare pid check accepts an unrelated
+    /// process that got the crashed writer's pid recycled to it, which
+    /// made this report a dead watch as live forever). Legacy two-line
+    /// markers ({pid}\n{port}\n) fall back to the bare pid check.
+    /// Replaces the pre-1.0.51 pipe ping probe, which cost ~100ms and
+    /// falsely reported "not watching" when the pipe server was
+    /// momentarily busy with another connection.
     /// </summary>
     public static int? GetExistingWatchPort(string filePath)
     {
@@ -177,10 +192,15 @@ internal class WatchServer : IDisposable
             if (lines.Length < 2) return null;
             if (!int.TryParse(lines[0], out var pid)) return null;
             if (!int.TryParse(lines[1], out var port)) return null;
-            if (!IsProcessAlive(pid))
+            long? startTicksUtc = null;
+            if (lines.Length >= 3 && long.TryParse(lines[2], out var ticks))
+                startTicksUtc = ticks;
+            if (!IsProcessAlive(pid, startTicksUtc))
             {
-                // Stale marker — writer crashed or was killed without cleanup.
-                // Best-effort remove so the caller can start a fresh watch.
+                // Stale marker — writer crashed or was killed without cleanup
+                // (possibly with its pid since recycled to an unrelated
+                // process). Best-effort remove so the caller can start a
+                // fresh watch.
                 try { File.Delete(markerPath); } catch { }
                 return null;
             }
@@ -197,12 +217,29 @@ internal class WatchServer : IDisposable
         return GetExistingWatchPort(filePath).HasValue;
     }
 
-    private static bool IsProcessAlive(int pid)
+    private static bool IsProcessAlive(int pid, long? expectedStartTicksUtc)
     {
         try
         {
             using var p = System.Diagnostics.Process.GetProcessById(pid);
-            return !p.HasExited;
+            if (p.HasExited) return false;
+            if (expectedStartTicksUtc.HasValue)
+            {
+                try
+                {
+                    if (p.StartTime.ToUniversalTime().Ticks != expectedStartTicksUtc.Value)
+                        return false; // pid recycled by an unrelated process
+                }
+                catch
+                {
+                    // StartTime unreadable — typically the pid was recycled to
+                    // another user's process. Markers are 0600 files written by
+                    // the same user, so an unverifiable identity means a
+                    // recycled pid, not our watch: treat as dead.
+                    return false;
+                }
+            }
+            return true;
         }
         catch (ArgumentException) { return false; }
         catch (InvalidOperationException) { return false; }
@@ -222,8 +259,12 @@ internal class WatchServer : IDisposable
             // a dead writer was cleared by GetExistingWatchPort just above; if a
             // squatter still holds the name we simply skip the marker (IsWatching
             // then reports false — fail-safe, no clobber).
+            // Third line: this process's start time (UTC ticks), so the
+            // liveness check can tell "our writer" from "an unrelated process
+            // that got the pid recycled to it after our writer crashed".
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
             var bytes = Encoding.UTF8.GetBytes(
-                $"{System.Diagnostics.Process.GetCurrentProcess().Id}\n{_port}\n");
+                $"{self.Id}\n{_port}\n{self.StartTime.ToUniversalTime().Ticks}\n");
             var opts = new FileStreamOptions
             {
                 Mode = FileMode.CreateNew,
@@ -262,6 +303,12 @@ internal class WatchServer : IDisposable
         var token = linkedCts.Token;
 
         _tcpListener.Start();
+        // --port 0 asks the OS for an ephemeral port; resolve the real one
+        // before it reaches the marker file and the printed URL, otherwise
+        // both would say 0 and per-file discovery (mark/goto/unwatch,
+        // IsWatching) breaks.
+        if (_port == 0)
+            _port = ((IPEndPoint)_tcpListener.LocalEndpoint!).Port;
         WriteMarker();
         Console.WriteLine($"Watch: http://localhost:{_port}");
         Console.WriteLine($"Watching: {_filePath}");
@@ -477,8 +524,12 @@ internal class WatchServer : IDisposable
     {
         while (!token.IsCancellationRequested)
         {
+            // Re-read per iteration: /api/switch changes _pipeName and then
+            // kicks the pending WaitForConnectionAsync with a dummy connect,
+            // so the next iteration listens on the new document's pipe.
+            var pipeName = _pipeName;
             var server = new System.IO.Pipes.NamedPipeServerStream(
-                _pipeName, System.IO.Pipes.PipeDirection.InOut,
+                pipeName, System.IO.Pipes.PipeDirection.InOut,
                 System.IO.Pipes.NamedPipeServerStream.MaxAllowedServerInstances,
                 System.IO.Pipes.PipeTransmissionMode.Byte,
                 System.IO.Pipes.PipeOptions.Asynchronous);
@@ -1886,6 +1937,57 @@ internal class WatchServer : IDisposable
                 return;
             }
 
+            // GET /api/status — current document identity + version, so an SSE
+            // client that reconnects (or an embedder like the editor) can
+            // self-correct after missing a doc-switched event. Read-only; the
+            // host gate above is the only guard, same as GET / and /events.
+            if (requestLine.StartsWith("GET /api/status", StringComparison.Ordinal))
+            {
+                await HandleGetStatusAsync(stream, token);
+                client.Close();
+                return;
+            }
+
+            // POST /api/switch — retarget this server to another document in
+            // place (port and SSE connections survive; clients get a
+            // doc-switched event). See HandlePostSwitchAsync for semantics.
+            if (requestLine.StartsWith("POST /api/switch", StringComparison.Ordinal))
+            {
+                if (!IsOriginAllowed(headers))
+                {
+                    await WriteForbiddenAsync(stream, ForbiddenOriginMessage(headers), token);
+                    client.Close();
+                    return;
+                }
+                await HandlePostSwitchAsync(stream, headers, bodyPrefix, token);
+                client.Close();
+                return;
+            }
+
+            // Wrong verb on the endpoints above → 405, mirroring the
+            // /api/selection guard (BUG-TESTER-R503): an API client using the
+            // wrong method must not silently receive the HTML preview page.
+            if (requestLine.Contains(" /api/status"))
+            {
+                var msg405 = Encoding.UTF8.GetBytes("Method Not Allowed: /api/status only accepts GET");
+                var hdr405 = Encoding.UTF8.GetBytes(
+                    $"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {msg405.Length}\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(hdr405, token);
+                await stream.WriteAsync(msg405, token);
+                client.Close();
+                return;
+            }
+            if (requestLine.Contains(" /api/switch"))
+            {
+                var msg405 = Encoding.UTF8.GetBytes("Method Not Allowed: /api/switch only accepts POST");
+                var hdr405 = Encoding.UTF8.GetBytes(
+                    $"HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {msg405.Length}\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(hdr405, token);
+                await stream.WriteAsync(msg405, token);
+                client.Close();
+                return;
+            }
+
             // BUG-TESTER-R503: GET/PUT/etc on /api/selection must return 405,
             // not fall through to the HTML preview. Without this, an API
             // client that uses the wrong verb gets back a 200 HTML page and
@@ -2421,6 +2523,335 @@ internal class WatchServer : IDisposable
         catch (System.Exception ex)
         {
             await WriteCommEnvelopeAsync(stream, false, ex.Message, token);
+        }
+    }
+
+    /// <summary>Lowercase extension without the dot: pptx / docx / xlsx.</summary>
+    private static string FormatOf(string filePath)
+        => Path.GetExtension(filePath).TrimStart('.').ToLowerInvariant();
+
+    /// <summary>{"file":..,"name":..,"fmt":..,"version":N} for /api/status,
+    /// the /api/switch 200 body, and the doc-switched SSE event.</summary>
+    private string BuildStatusJson()
+    {
+        var file = _filePath;
+        var sb = new StringBuilder();
+        sb.Append("{\"file\":");
+        AppendJsonString(sb, file);
+        sb.Append(",\"name\":");
+        AppendJsonString(sb, Path.GetFileName(file));
+        sb.Append(",\"fmt\":");
+        AppendJsonString(sb, FormatOf(file));
+        sb.Append(",\"version\":").Append(_version);
+        sb.Append('}');
+        return sb.ToString();
+    }
+
+    private static async Task WriteJsonResponseAsync(NetworkStream stream, int statusCode, string reason, string json, CancellationToken token)
+    {
+        var body = Encoding.UTF8.GetBytes(json);
+        var header = Encoding.UTF8.GetBytes(
+            $"HTTP/1.1 {statusCode} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
+        await stream.WriteAsync(header, token);
+        await stream.WriteAsync(body, token);
+    }
+
+    private async Task HandleGetStatusAsync(NetworkStream stream, CancellationToken token)
+    {
+        _lastActivityTime = DateTime.UtcNow;
+        await WriteJsonResponseAsync(stream, 200, "OK", BuildStatusJson(), token);
+    }
+
+    /// <summary>
+    /// Handle POST /api/switch {"file": "/abs/path.docx"} — retarget this
+    /// server to another document IN PLACE: the port stays, live SSE
+    /// connections stay, clients get a doc-switched event (built-in preview
+    /// script reacts with location.reload; embedders reset their own state).
+    ///
+    /// Switch is atomic from the client's point of view: the new document's
+    /// HTML is fully rendered BEFORE any state is swapped, so on any failure
+    /// (bad request 400, missing file 404, already watched elsewhere 409,
+    /// render failure 500) the current document keeps serving untouched and
+    /// no connection is dropped. The 409 body includes the occupying watch's
+    /// port so an embedder can reuse that server instead of erroring.
+    ///
+    /// Rendering follows the same red line as /api/send / /api/batch: spawn
+    /// an officecli child process (`view file html --out tmp`) and take
+    /// its baked HTML — resident-first routing lives inside the CLI
+    /// (TryResident), and WatchServer itself never opens the document.
+    /// </summary>
+    private async Task HandlePostSwitchAsync(NetworkStream stream, Dictionary<string, string> headers, string bodyPrefix, CancellationToken token)
+    {
+        try
+        {
+            // Read body (same pattern as /api/send).
+            int contentLength = 0;
+            if (headers.TryGetValue("Content-Length", out var clStr) && int.TryParse(clStr, out var cl))
+                contentLength = cl;
+            if (contentLength > MaxSelectionBodyBytes) throw new InvalidDataException("body too large");
+
+            var body = bodyPrefix;
+            if (contentLength > body.Length)
+            {
+                var sb = new StringBuilder(body);
+                var buf = new byte[4096];
+                int have = Encoding.UTF8.GetByteCount(body);
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                cts.CancelAfter(PostBodyReadTimeout);
+                while (have < contentLength)
+                {
+                    var n = await stream.ReadAsync(buf, cts.Token);
+                    if (n == 0) break;
+                    sb.Append(Encoding.UTF8.GetString(buf, 0, n));
+                    have += n;
+                }
+                body = sb.ToString();
+            }
+
+            string? requested;
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(body);
+                requested = doc.RootElement.TryGetProperty("file", out var fileEl) ? fileEl.GetString() : null;
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                await WriteJsonResponseAsync(stream, 400, "Bad Request",
+                    "{\"error\":\"body must be JSON: {\\\"file\\\": \\\"/abs/path\\\"}\"}", token);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(requested))
+            {
+                await WriteJsonResponseAsync(stream, 400, "Bad Request",
+                    "{\"error\":\"missing required field: file\"}", token);
+                return;
+            }
+
+            var newPath = Path.GetFullPath(requested);
+            var fmt = FormatOf(newPath);
+            if (fmt is not ("pptx" or "docx" or "xlsx"))
+            {
+                await WriteJsonResponseAsync(stream, 400, "Bad Request",
+                    "{\"error\":\"unsupported file type — expected .pptx, .docx or .xlsx\"}", token);
+                return;
+            }
+            if (!File.Exists(newPath))
+            {
+                var sb404 = new StringBuilder("{\"error\":");
+                AppendJsonString(sb404, $"file not found: {newPath}");
+                sb404.Append('}');
+                await WriteJsonResponseAsync(stream, 404, "Not Found", sb404.ToString(), token);
+                return;
+            }
+
+            // Same-file no-op guard is intentionally NOT here: re-switching to
+            // the current file is a supported "force refresh + reset marks"
+            // gesture and takes the same path below (pipe/marker swap degrades
+            // to a no-op because the names come out identical).
+
+            // Target already held by ANOTHER live watch → 409 with its port so
+            // the caller can reuse that server. Same single-consumer constraint
+            // as the startup duplicate check in RunAsync: the per-file update
+            // pipe cannot have two listeners. This is a pre-render fast-fail
+            // only — the render below takes seconds, so the swap re-derives
+            // pipe identity under _switchLock instead of trusting this value.
+            if (GetWatchPipeName(newPath) != _pipeName)
+            {
+                var occupied = GetExistingWatchPort(newPath);
+                if (occupied.HasValue)
+                {
+                    await WriteJsonResponseAsync(stream, 409, "Conflict",
+                        $"{{\"error\":\"file is already watched by another process\",\"port\":{occupied.Value}}}", token);
+                    return;
+                }
+            }
+
+            // Render the new document BEFORE touching any state. Child process
+            // + --out tempfile: stdout noise (e.g. skill-refresh notices) can
+            // never corrupt the HTML, and stderr is drained to avoid pipe-full
+            // deadlock, same as /api/send.
+            var tmpOut = Path.Combine(Path.GetTempPath(), $"officecli_switch_{Guid.NewGuid():N}.html");
+            string html;
+            try
+            {
+                var exe = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
+                    ?? (OperatingSystem.IsWindows() ? "officecli.exe" : "officecli");
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = exe,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add("view");
+                psi.ArgumentList.Add(newPath);
+                psi.ArgumentList.Add("html"); // mode is positional: view <file> <mode>
+                psi.ArgumentList.Add("--out");
+                psi.ArgumentList.Add(tmpOut);
+
+                string renderErr = "";
+                int exitCode = -1;
+                using (var proc = System.Diagnostics.Process.Start(psi))
+                {
+                    if (proc != null)
+                    {
+                        using var renderCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        renderCts.CancelAfter(TimeSpan.FromSeconds(120));
+                        var drainErr = proc.StandardError.ReadToEndAsync(renderCts.Token);
+                        var drainOut = proc.StandardOutput.ReadToEndAsync(renderCts.Token);
+                        try
+                        {
+                            await proc.WaitForExitAsync(renderCts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            try { proc.Kill(entireProcessTree: true); } catch { }
+                            throw new InvalidOperationException("render timed out after 120s");
+                        }
+                        renderErr = await drainErr;
+                        _ = await drainOut;
+                        exitCode = proc.ExitCode;
+                    }
+                }
+                if (exitCode != 0 || !File.Exists(tmpOut))
+                {
+                    var reason = string.IsNullOrWhiteSpace(renderErr) ? $"render exited {exitCode}" : renderErr.Trim();
+                    throw new InvalidOperationException(reason);
+                }
+                html = await File.ReadAllTextAsync(tmpOut, token);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                var sb500 = new StringBuilder("{\"error\":");
+                AppendJsonString(sb500, $"failed to render {Path.GetFileName(newPath)}: {ex.Message}");
+                sb500.Append('}');
+                await WriteJsonResponseAsync(stream, 500, "Internal Server Error", sb500.ToString(), token);
+                return;
+            }
+            finally
+            {
+                try { if (File.Exists(tmpOut)) File.Delete(tmpOut); } catch { }
+            }
+
+            // HTML in hand — swap state. Serialized so concurrent switches
+            // can't interleave their pipe/marker swaps.
+            await _switchLock.WaitAsync(token);
+            try
+            {
+                // Re-derive pipe identity NOW, under the lock. The pre-render
+                // check ran seconds ago; a concurrent switch may have
+                // retargeted this server since. Acting on a stale latch split
+                // identity from content: a same-file force-refresh that lost
+                // the race skipped the _filePath/_pipeName update (gated) yet
+                // still overwrote _currentHtml (unconditional), leaving status
+                // reporting one document while GET / served another until the
+                // next switch.
+                var oldPipeName = _pipeName;
+                var newPipeName = GetWatchPipeName(newPath);
+                var pipeChanged = newPipeName != oldPipeName;
+                if (pipeChanged)
+                {
+                    DeleteMarker(); // old file's marker — call before _filePath changes
+                    _filePath = newPath;
+                    _pipeName = newPipeName;
+                    // Kick the pipe listener out of WaitForConnectionAsync on the
+                    // old name so its next iteration listens on the new one
+                    // (same dummy-connect trick as StopAsync — cancellation alone
+                    // is not reliable cross-platform).
+                    try
+                    {
+                        using var kick = new System.IO.Pipes.NamedPipeClientStream(
+                            ".", oldPipeName, System.IO.Pipes.PipeDirection.InOut);
+                        kick.Connect(500);
+                    }
+                    catch { }
+                    // Old pipe's Unix socket file is now stale (BUG-BT-003).
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        try
+                        {
+                            var sockPath = Path.Combine(Path.GetTempPath(), "CoreFxPipe_" + oldPipeName);
+                            if (File.Exists(sockPath)) File.Delete(sockPath);
+                        }
+                        catch { }
+                    }
+                    WriteMarker(); // new file's marker
+                }
+                else
+                {
+                    // Same pipe — still track the requested path verbatim.
+                    // Pipe names case-fold the path on Windows/macOS, so equal
+                    // names don't guarantee equal strings, and identity must
+                    // always match the content installed below.
+                    _filePath = newPath;
+                }
+
+                // Marks/selection are per-document positional state — never
+                // carried across a switch (paths from the old document are
+                // meaningless in the new one). Same-file re-switch also resets:
+                // "switch always resets marks" is the documented contract.
+                lock (_marksLock)
+                {
+                    _currentMarks.Clear();
+                    _marksVersion++;
+                }
+                lock (_selectionLock) { _currentSelection.Clear(); }
+
+                _version = 0;
+                _currentHtml = html;
+                _lastActivityTime = DateTime.UtcNow;
+                Console.WriteLine($"Watching: {_filePath}");
+            }
+            finally
+            {
+                _switchLock.Release();
+            }
+
+            // Notify SSE clients: named event (not "update") so legacy update
+            // handlers never mis-parse it. Built-in preview script reloads;
+            // embedders reset marks/selection/scroll and re-fetch.
+            BroadcastSseNamed("doc-switched", BuildStatusJson());
+
+            await WriteJsonResponseAsync(stream, 200, "OK", BuildStatusJson(), token);
+        }
+        catch (System.Exception ex)
+        {
+            try
+            {
+                var sbErr = new StringBuilder("{\"error\":");
+                AppendJsonString(sbErr, ex.Message);
+                sbErr.Append('}');
+                await WriteJsonResponseAsync(stream, 500, "Internal Server Error", sbErr.ToString(), token);
+            }
+            catch { /* client gone mid-error — nothing to do */ }
+        }
+    }
+
+    /// <summary>
+    /// Broadcast an SSE message under a custom event name. BroadcastSse
+    /// hardcodes "event: update" (the DOM-swap channel); doc-switched must be
+    /// a distinct event so pre-existing update listeners ignore it.
+    /// </summary>
+    private void BroadcastSseNamed(string eventName, string json)
+    {
+        lock (_sseLock)
+        {
+            var dead = new List<NetworkStream>();
+            foreach (var client in _sseClients)
+            {
+                try
+                {
+                    var data = Encoding.UTF8.GetBytes($"event: {eventName}\ndata: {json}\n\n");
+                    client.Write(data);
+                    client.Flush();
+                }
+                catch
+                {
+                    dead.Add(client);
+                }
+            }
+            foreach (var d in dead) _sseClients.Remove(d);
         }
     }
 

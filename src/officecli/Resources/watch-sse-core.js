@@ -304,6 +304,16 @@
         _callReapplyHook();
     }
 
+    // The server switched to a different document in place (POST /api/switch).
+    // The current DOM, per-format scripts (Word pagination etc.) and styles
+    // all belong to the old document, so a full page reload is the only
+    // correct reaction here — GET / re-serves the new document's HTML.
+    // Embedders (which strip or replace this script) handle doc-switched
+    // with their own state machine instead.
+    es.addEventListener('doc-switched', function() {
+        location.reload();
+    });
+
     // Main SSE listener for DOM-swap events
     es.addEventListener('update', function(e) {
         var msg = JSON.parse(e.data);

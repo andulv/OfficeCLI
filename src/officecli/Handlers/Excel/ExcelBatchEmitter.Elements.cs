@@ -462,6 +462,20 @@ public static partial class ExcelBatchEmitter
                 props.Remove("height");
             }
 
+            // A chart with zero series and no cached literals transcribes to
+            // props with neither `data` nor dotted seriesN.values refs — and
+            // `add chart` hard-requires data, so emitting the row would make
+            // the whole dump unreplayable (atomic batch: one bad item fails
+            // the file). Skip the empty frame with an explicit warning
+            // instead; every other carrier degrades the same way.
+            if (!props.ContainsKey("data")
+                && !props.Keys.Any(k => System.Text.RegularExpressions.Regex.IsMatch(k, @"^series\d+\.values$")))
+            {
+                warnings.Add(new UnsupportedWarning("chart", chart.Path ?? sheetPath,
+                    "chart has no series data (empty plot area) — frame dropped on dump; `add chart` requires data"));
+                continue;
+            }
+
             items.Add(new BatchItem { Command = "add", Parent = sheetPath, Type = "chart", Props = props });
         }
     }
@@ -578,6 +592,11 @@ public static partial class ExcelBatchEmitter
             CopyString(pic, "flip", props, "flip");
             CopyString(pic, "crop", props, "crop");
             CopyString(pic, "hyperlink", props, "hyperlink");
+            // Add-only accessibility/visual props now surfaced by Get; without
+            // these the dump silently dropped alt-text-exclusion (decorative)
+            // and transparency (opacity), which real Excel does not regenerate.
+            CopyValue(pic, "opacity", props, "opacity");
+            CopyValue(pic, "decorative", props, "decorative");
             items.Add(new BatchItem { Command = "add", Parent = sheetPath, Type = "picture", Props = props });
         }
     }
@@ -622,6 +641,15 @@ public static partial class ExcelBatchEmitter
             CopyValue(shp, "rotation", props, "rotation");
             CopyString(shp, "flip", props, "flip");
             CopyString(shp, "line", props, "line");
+            // Effect + text-inset props. Get surfaces them (shadow=#000000,
+            // glow=#4472C4-8, softEdge=5pt, margin=7.2pt) and Add re-consumes
+            // those exact forms, but the copy-list omitted them so dump dropped
+            // the shape's whole <a:effectLst> and text inset on round-trip.
+            CopyString(shp, "shadow", props, "shadow");
+            CopyString(shp, "glow", props, "glow");
+            CopyString(shp, "softEdge", props, "softEdge");
+            CopyString(shp, "reflection", props, "reflection");
+            CopyString(shp, "margin", props, "margin");
             items.Add(new BatchItem { Command = "add", Parent = sheetPath, Type = "shape", Props = props });
         }
     }

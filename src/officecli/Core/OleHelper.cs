@@ -167,8 +167,13 @@ internal static class OleHelper
         var isSelfEmbed = hostDocumentPath != null && IsSameFile(srcPath, hostDocumentPath);
         if (!isSelfEmbed && new FileInfo(srcPath).Length == 0)
         {
-            Console.Error.WriteLine(
-                $"Warning: OLE source file is empty (0 bytes): {srcPath}. Document will embed an empty payload.");
+            var emptyMsg = $"OLE source file is empty (0 bytes): {srcPath}. Document will embed an empty payload.";
+            // CONSISTENCY(numfmt-warning): JSON mode → envelope warnings[];
+            // plain mode keeps the stderr line.
+            if (WarningContext.IsActive)
+                WarningContext.Add(emptyMsg, "empty_ole_source");
+            else
+                Console.Error.WriteLine($"Warning: {emptyMsg}");
         }
 
         var kind = ClassifyKind(srcPath);
@@ -572,6 +577,9 @@ internal static class OleHelper
         foreach (var key in properties.Keys)
         {
             if (!KnownOleProps.Contains(key))
+                // stderr only — the generic unsupported-prop machinery already
+                // puts an unsupported_property warning in the JSON envelope;
+                // queueing here too would duplicate it.
                 Console.Error.WriteLine($"warning: unknown ole property '{key}' — ignored");
         }
     }

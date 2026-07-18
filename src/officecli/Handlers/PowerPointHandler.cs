@@ -1732,10 +1732,28 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
                 if (parentPartPath == "/presentation")
                 {
                     epHost = presentationPart;
+                    // A non-part (external/hyperlink) relationship can't be
+                    // re-homed by ChangeIdOfPart, and silently skipping here
+                    // would report success while dropping the binary part.
+                    // Fail loudly instead — under atomic batch the file is
+                    // rolled back untouched. Unreachable from a self-produced
+                    // dump (both carriers pin ids from the same source rels).
                     if (epHost.ExternalRelationships.Any(r => r.Id == epRid)
-                        || epHost.HyperlinkRelationships.Any(r => r.Id == epRid)
-                        || epHost.Parts.Any(p => p.RelationshipId == epRid))
+                        || epHost.HyperlinkRelationships.Any(r => r.Id == epRid))
+                        throw new ArgumentException(
+                            $"add-part extpart: rid '{epRid}' already exists as an external/hyperlink relationship on /presentation and cannot be re-homed. Use a different rid.");
+                    // Part-rel collision: on a rebuilt deck the scaffold's own
+                    // rels (master/slide/presProps…) occupy low rIds, so a
+                    // pinned source id like rId2 is usually TAKEN. Skipping
+                    // here (the old behavior) silently dropped the part while
+                    // still reporting success. Idempotent-skip only a genuine
+                    // re-run (same-rel-type ExtendedPart already present);
+                    // otherwise re-home the occupant so the pinned id is free.
+                    // Mirrors the slide/master/layout branch below.
+                    var epOcc = epHost.Parts.FirstOrDefault(p => p.RelationshipId == epRid);
+                    if (epOcc.OpenXmlPart is ExtendedPart occExt && occExt.RelationshipType == epRelType)
                         return (epRid, parentPartPath);
+                    ReHomeCollidingRel(epHost, epRid);
                     var epPresPart = epHost.AddExtendedPart(epRelType, epContentType, epExt, epRid);
                     using (var epStream = new MemoryStream(epBytes))
                         epPresPart.FeedData(epStream);
@@ -1772,13 +1790,25 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
                     throw new ArgumentException(
                         "add-part extpart: parent must be /presentation, /slide[N], /slideLayout[N], or /slideMaster[N]");
 
-                // External/hyperlink-rel collision: keep the idempotent skip (can't
-                // re-home a non-part relationship). Part collision (scaffold layout
-                // rel occupying rId3..rId5 on the master): re-home it so the pinned
-                // id is free — otherwise the extpart silently skips and the hdphoto
-                // r:embed dangles. Mirrors the add-part image collision path.
+                // External/hyperlink-rel collision: a non-part relationship
+                // can't be re-homed by ChangeIdOfPart, and the old idempotent
+                // skip reported success while dropping the binary part. Fail
+                // loudly instead (atomic batch rolls the file back).
+                // Unreachable from a self-produced dump — both carriers pin
+                // ids from the same source rels, so they never collide.
+                // Part collision (scaffold layout rel occupying rId3..rId5 on
+                // the master): re-home it so the pinned id is free — otherwise
+                // the extpart silently skips and the hdphoto r:embed dangles.
+                // Mirrors the add-part image collision path.
                 if (epHost.ExternalRelationships.Any(r => r.Id == epRid)
                     || epHost.HyperlinkRelationships.Any(r => r.Id == epRid))
+                    throw new ArgumentException(
+                        $"add-part extpart: rid '{epRid}' already exists as an external/hyperlink relationship on {parentPartPath} and cannot be re-homed. Use a different rid.");
+                // Genuine re-run (same-rel-type ExtendedPart already pinned on
+                // this rid): idempotent skip, same as the /presentation branch —
+                // re-homing our own part would duplicate it under a fresh id.
+                var epSlideOcc = epHost.Parts.FirstOrDefault(p => p.RelationshipId == epRid);
+                if (epSlideOcc.OpenXmlPart is ExtendedPart epSlideExt && epSlideExt.RelationshipType == epRelType)
                     return (epRid, parentPartPath);
                 ReHomeCollidingRel(epHost, epRid);
                 var epPart = epHost.AddExtendedPart(epRelType, epContentType, epExt, epRid);
@@ -2149,6 +2179,27 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
                 }
             }
         }
+        // Presentation-part host: every r:id inside presentation.xml resolves
+        // against the presentation part's rels (sldMasterIdLst / sldIdLst /
+        // notesMasterIdLst / custShow slide lists), so repoint any attribute
+        // still carrying the vacated id or the deck dangles on open.
+        else if (host is PresentationPart ppHost && ppHost.Presentation != null)
+        {
+            const string RelNs = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+            var changed = false;
+            foreach (var el in ppHost.Presentation.Descendants())
+            {
+                foreach (var attr in el.GetAttributes())
+                {
+                    if (attr.LocalName == "id" && attr.NamespaceUri == RelNs && attr.Value == pinnedRid)
+                    {
+                        el.SetAttribute(new OpenXmlAttribute(attr.Prefix, attr.LocalName, attr.NamespaceUri, newRid));
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) ppHost.Presentation.Save();
+        }
     }
 
     /// <summary>
@@ -2263,8 +2314,23 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
         _backingStream?.Flush();
     }
 
+    /// <summary>See <see cref="OfficeCli.Handlers.WordHandler.DiscardOnDispose"/> —
+    /// atomic-batch rollback: drop the in-memory DOM without serializing.</summary>
+    public bool DiscardOnDispose { get; set; }
+
     public void Dispose()
     {
+        if (DiscardOnDispose)
+        {
+            // Atomic-batch rollback: never serialize the poisoned DOM. Close
+            // the backing stream FIRST so the package's dispose-time autosave
+            // has nowhere to write. The on-disk file keeps the last flushed
+            // (pre-batch) state.
+            _backingStream?.Dispose();
+            _backingStream = null;
+            try { _doc.Dispose(); } catch { /* autosave hit the closed stream — intended */ }
+            return;
+        }
         // Save through the package (flush in-memory edits to the underlying
         // stream) before disposing. When we own the backing FileStream, the
         // package would otherwise leave the on-disk file in whatever state
