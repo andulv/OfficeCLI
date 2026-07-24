@@ -3400,12 +3400,16 @@ public partial class WordHandler
             // group. Mirrors the pptx group's rejection.
             if (newCx is <= 0) throw new ArgumentException($"Invalid width '{widthRaw}': width must be a positive size.");
             if (newCy is <= 0) throw new ArgumentException($"Invalid height '{heightRaw}': height must be a positive size.");
-            // Single dimension → scale the OTHER proportionally so the diagram
-            // stays aspect-correct (a lone width/height squashes the group). Both
-            // given → exact box (the caller's explicit choice).
-            if (newCx != null && newCy == null && preCx > 0)
+            // keepAspect=true + a single dimension → scale the OTHER
+            // proportionally so a diagram group stays aspect-correct (a lone
+            // width/height stretch squashes a flowchart). Default honors exactly
+            // the axes the caller passed, matching `set width` on a plain shape
+            // (GitHub #237 — the lock must be opt-in; mirrors the pptx group).
+            bool keepAspect = properties.Any(kv =>
+                kv.Key.Equals("keepAspect", StringComparison.OrdinalIgnoreCase) && IsTruthy(kv.Value));
+            if (keepAspect && newCx != null && newCy == null && preCx > 0)
                 newCy = (long)Math.Round(preCy * (newCx.Value / (double)preCx));
-            else if (newCy != null && newCx == null && preCy > 0)
+            else if (keepAspect && newCy != null && newCx == null && preCy > 0)
                 newCx = (long)Math.Round(preCx * (newCy.Value / (double)preCy));
 
             // The anchor wrapper carries the matching <wp:extent> for the whole group.
@@ -3451,7 +3455,7 @@ public partial class WordHandler
         }
 
         foreach (var k in properties.Keys)
-            if (k.ToLowerInvariant() is not ("width" or "height" or "x" or "y"))
+            if (k.ToLowerInvariant() is not ("width" or "height" or "x" or "y" or "keepaspect"))
                 unsupported.Add(k);
         SaveDoc();
         return unsupported;

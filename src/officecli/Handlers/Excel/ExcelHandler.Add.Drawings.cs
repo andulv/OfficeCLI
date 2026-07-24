@@ -278,9 +278,11 @@ public partial class ExcelHandler
         // in addition to bare integer cell counts.
         var (px, py, pwEmu, phEmu) = ParseAnchorBoundsEmu(properties, "0", "0", "5", "5");
         // P9: accept `altText=` as alias for `alt=`.
+        // CONSISTENCY(picture-alt): description completes the shared alias set.
         var alt = properties.GetValueOrDefault("alt")
             ?? properties.GetValueOrDefault("altText")
-            ?? properties.GetValueOrDefault("alttext", "");
+            ?? properties.GetValueOrDefault("alttext")
+            ?? properties.GetValueOrDefault("description", "");
 
         // Resolve the image bytes AND parse/validate the anchor BEFORE any
         // part is created: a bad data URI or anchor used to fail after the

@@ -61,7 +61,7 @@ public partial class WordHandler
             if (charOffset > rt.Start && charOffset < rt.End)
             {
                 var localOffset = charOffset - rt.Start;
-                SplitRunAtOffset(rt.Run, localOffset);
+                SplitRunAtOffset(rt.Run, rt.TextElement, localOffset);
                 break;
             }
         }
@@ -114,50 +114,49 @@ public partial class WordHandler
         return tail;
     }
 
-    private static Run SplitRunAtOffset(Run run, int charOffset)
+    private static Run SplitRunAtOffset(Run run, Text splitText, int charOffset)
     {
-        // Find the Text element containing the split point
-        int pos = 0;
-        foreach (var text in run.Elements<Text>().ToList())
+        // Split `run` at `charOffset` INSIDE `splitText` (text-local, the
+        // offset space every caller already computes from BuildRunTexts).
+        // The right half is a fresh run carrying only cloned run properties;
+        // the split text's right part plus EVERY subsequent child (w:t,
+        // w:tab, w:br, …) moves into it, in document order.
+        //
+        // The old implementation cloned the whole run and patched Text
+        // elements by index: non-Text children (tabs, breaks) ended up
+        // duplicated on BOTH sides (one tab became three across a two-cut
+        // range split), post-split Texts stayed on the left as residue, and
+        // it interpreted the offset as run-local while callers passed
+        // text-local — so a range set on a tab-carrying paragraph corrupted
+        // content and dropped the formatting.
+        var full = splitText.Text ?? "";
+        if (charOffset <= 0 || charOffset >= full.Length)
+            return run; // boundary — nothing to split (callers guard, keep old behavior)
+
+        var rightRun = new Run();
+        if (run.RunProperties != null)
+            rightRun.AppendChild((RunProperties)run.RunProperties.CloneNode(true));
+
+        splitText.Text = full[..charOffset];
+        splitText.Space = SpaceProcessingModeValues.Preserve;
+
+        var toMove = new List<OpenXmlElement>();
+        bool afterSplit = false;
+        foreach (var child in run.ChildElements)
         {
-            var len = text.Text?.Length ?? 0;
-            if (pos + len > charOffset && charOffset > pos)
-            {
-                var localOffset = charOffset - pos;
-                var leftText = text.Text![..localOffset];
-                var rightText = text.Text![localOffset..];
-
-                // Clone the run for the right side
-                var rightRun = (Run)run.CloneNode(true);
-                // Clear rsidR on cloned run
-                rightRun.RsidRunProperties = null;
-                rightRun.RsidRunAddition = null;
-
-                // Set left run text
-                text.Text = leftText;
-                text.Space = SpaceProcessingModeValues.Preserve;
-
-                // Set right run text — find corresponding Text in clone
-                var rightTexts = rightRun.Elements<Text>().ToList();
-                // The cloned run has same structure; find the matching Text node
-                int textIdx = run.Elements<Text>().ToList().IndexOf(text);
-                if (textIdx >= 0 && textIdx < rightTexts.Count)
-                {
-                    rightTexts[textIdx].Text = rightText;
-                    rightTexts[textIdx].Space = SpaceProcessingModeValues.Preserve;
-                    // Remove any Text elements before the split Text in right run
-                    for (int i = 0; i < textIdx; i++)
-                        rightTexts[i].Text = "";
-                }
-
-                // Insert right run after original
-                run.InsertAfterSelf(rightRun);
-                return rightRun;
-            }
-            pos += len;
+            if (ReferenceEquals(child, splitText)) { afterSplit = true; continue; }
+            if (afterSplit && child is not RunProperties) toMove.Add(child);
         }
-        // charOffset is at boundary — shouldn't normally be called, return run itself
-        return run;
+
+        rightRun.AppendChild(new Text(full[charOffset..]) { Space = SpaceProcessingModeValues.Preserve });
+        foreach (var el in toMove)
+        {
+            el.Remove();
+            rightRun.AppendChild(el);
+        }
+
+        run.InsertAfterSelf(rightRun);
+        return rightRun;
     }
 
     /// <summary>
@@ -246,7 +245,7 @@ public partial class WordHandler
             if (charEnd > rt.Start && charEnd < rt.End)
             {
                 var localOffset = charEnd - rt.Start;
-                SplitRunAtOffset(rt.Run, localOffset);
+                SplitRunAtOffset(rt.Run, rt.TextElement, localOffset);
                 break;
             }
         }
@@ -258,7 +257,7 @@ public partial class WordHandler
             if (charStart > rt.Start && charStart < rt.End)
             {
                 var localOffset = charStart - rt.Start;
-                SplitRunAtOffset(rt.Run, localOffset);
+                SplitRunAtOffset(rt.Run, rt.TextElement, localOffset);
                 break;
             }
         }
@@ -1022,7 +1021,7 @@ public partial class WordHandler
                 {
                     // Split the run at the offset
                     var localOffset = splitPoint - rt.Start;
-                    SplitRunAtOffset(rt.Run, localOffset);
+                    SplitRunAtOffset(rt.Run, rt.TextElement, localOffset);
                     insertAfterRun = rt.Run; // insert after the left portion
                 }
                 break;
@@ -1098,7 +1097,7 @@ public partial class WordHandler
             if (splitPoint > rt.Start && splitPoint < rt.End)
             {
                 var localOffset = splitPoint - rt.Start;
-                SplitRunAtOffset(rt.Run, localOffset);
+                SplitRunAtOffset(rt.Run, rt.TextElement, localOffset);
                 break;
             }
         }

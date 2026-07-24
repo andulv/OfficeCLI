@@ -33,9 +33,21 @@ internal partial class FormulaEvaluator
         Enumerable.Range(0, rd.Rows).SelectMany(r =>
             Enumerable.Range(0, rd.Cols).Select(c => rd.Cells[r, c] ?? FormulaResult.Number(0)));
 
+    // Functions exempt from automatic scalar-error propagation: they classify
+    // errors, trap them, take lazy branches, or count/ignore them.
+    private static readonly HashSet<string> ErrorTransparentFns = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "IF", "IFS", "IFERROR", "IFNA", "CHOOSE", "SWITCH",
+        "ISERROR", "ISERR", "ISNA", "ISBLANK", "ISNUMBER", "ISTEXT",
+        "ISLOGICAL", "ISNONTEXT", "ISREF", "ISFORMULA",
+        "ERROR_TYPE", "TYPE", "ISOMITTED", "NA",
+        "COUNT", "COUNTA", "COUNTBLANK", "AGGREGATE", "SUBTOTAL",
+    };
+
     private static List<FormulaResult> AllArgs(List<object> args) =>
         args.SelectMany(a => a is RangeData rd ? ExpandRange(rd)
             : a is FormulaResult { IsRange: true } fr ? ExpandRange(fr.RangeValue!)
+            : a is FormulaResult { IsArray: true } fa ? fa.ArrayValue!.Select(FormulaResult.Number)
             : a is double[] arr ? arr.Select(v => FormulaResult.Number(v))
             : a is FormulaResult r ? [r] : Enumerable.Empty<FormulaResult>()).ToList();
 
@@ -115,10 +127,30 @@ internal partial class FormulaEvaluator
     // ==================== Math utilities ====================
 
     // Excel wildcard pattern -> unanchored .NET regex: * -> .*, ? -> ., with
-    // ~*/~? as the literal characters. Shared by SEARCH.
+    // ~*/~? as the literal characters. Shared by SEARCH. The ~ sentinels are
+    // swapped out before Regex.Escape — Escape leaves ~ alone, so a
+    // post-escape \~\* pattern never matches anything.
     private static string WildcardToRegex(string p) =>
-        Regex.Escape(p).Replace(@"\~\*", "\x01").Replace(@"\~\?", "\x02")
+        Regex.Escape(p.Replace("~*", "\x01").Replace("~?", "\x02"))
             .Replace(@"\*", ".*").Replace(@"\?", ".").Replace("\x01", @"\*").Replace("\x02", @"\?");
+
+    // Excel PROPER capitalizes a letter after ANY non-letter (apostrophes and
+    // digits included: o'brien -> O'Brien), unlike ToTitleCase's word breaks.
+    private static string ProperCase(string s)
+    {
+        var chars = s.ToLowerInvariant().ToCharArray();
+        bool boundary = true;
+        for (int i = 0; i < chars.Length; i++)
+        {
+            if (char.IsLetter(chars[i]))
+            {
+                if (boundary) chars[i] = char.ToUpperInvariant(chars[i]);
+                boundary = false;
+            }
+            else boundary = true;
+        }
+        return new string(chars);
+    }
 
     private static double RoundUp(double v, int d) { var f = Math.Pow(10, d); return Math.Ceiling(Math.Abs(v) * f) / f * Math.Sign(v); }
     private static double RoundDown(double v, int d) { var f = Math.Pow(10, d); return Math.Floor(Math.Abs(v) * f) / f * Math.Sign(v); }
@@ -154,9 +186,22 @@ internal partial class FormulaEvaluator
     }
     private static double EvenF(double v) { var c = (int)Math.Ceiling(Math.Abs(v)); return (c % 2 == 0 ? c : c + 1) * Math.Sign(v); }
     private static double OddF(double v) { if (v == 0) return 1; var c = (int)Math.Ceiling(Math.Abs(v)); return (c % 2 == 1 ? c : c + 1) * Math.Sign(v); }
-    private static double Factorial(double n) { double r = 1; for (int i = 2; i <= (int)n; i++) r *= i; return r; }
-    private static double Combin(int n, int k) => k < 0 || k > n ? 0 : Factorial(n) / (Factorial(k) * Factorial(n - k));
-    private static double Permut(int n, int k) => k < 0 || k > n ? 0 : Factorial(n) / Factorial(n - k);
+    // n! overflows double past 170 and stays +Infinity forever after, so a huge
+    // argument spins the loop billions of times only to return the same Infinity.
+    // Bail the instant the product goes infinite: identical result, bounded work
+    // (a crafted FACT(2e9) otherwise pins a CPU / holds the shared eval lock).
+    private static double Factorial(double n) { double r = 1; for (int i = 2; i <= (int)n; i++) { r *= i; if (double.IsInfinity(r)) return r; } return r; }
+    // n! overflows double past 170, so large arguments go through log-gamma:
+    // C(n,k) = exp(lnΓ(n+1) − lnΓ(k+1) − lnΓ(n−k+1)); small ones keep the exact
+    // factorial ratio (integer-precise, matches Excel digit-for-digit).
+    private static double Combin(int n, int k) =>
+        k < 0 || k > n ? 0 :
+        n <= 170 ? Factorial(n) / (Factorial(k) * Factorial(n - k)) :
+        Math.Exp(GammaLn(n + 1.0) - GammaLn(k + 1.0) - GammaLn(n - k + 1.0));
+    private static double Permut(int n, int k) =>
+        k < 0 || k > n ? 0 :
+        n <= 170 ? Factorial(n) / Factorial(n - k) :
+        Math.Exp(GammaLn(n + 1.0) - GammaLn(n - k + 1.0));
     private static long Gcd(long a, long b) { a = Math.Abs(a); b = Math.Abs(b); while (b != 0) { var t = b; b = a % b; a = t; } return a; }
     private static long Lcm(long a, long b) => a == 0 || b == 0 ? 0 : Math.Abs(a / Gcd(a, b) * b);
 
@@ -209,15 +254,44 @@ internal partial class FormulaEvaluator
         return FormulaResult.Error("#VALUE!");
     }
 
-    // BIN2DEC/OCT2DEC/HEX2DEC: the top bit of the fixed field width (10 binary /
-    // 30 octal / 40 hex bits) is a sign bit — read the two's complement.
-    private static double FromBaseSigned(string s, int radix)
+    // BIN2DEC/OCT2DEC/HEX2DEC: at most 10 digits; the top bit of the fixed field
+    // width (10 binary / 30 octal / 40 hex bits) is a sign bit (two's complement).
+    // An over-long string or an invalid digit is #NUM!.
+    private static FormulaResult FromBase2Dec(string s, int radix)
     {
         s = s.Trim();
-        long val = Convert.ToInt64(s, radix);
+        if (s.Length == 0 || s.Length > 10) return FormulaResult.Error("#NUM!");
+        long val;
+        try { val = Convert.ToInt64(s, radix); }
+        catch { return FormulaResult.Error("#NUM!"); }
         long field = radix == 2 ? (1L << 10) : radix == 8 ? (1L << 30) : (1L << 40);
         if (val >= field / 2) val -= field;
-        return val;
+        return FR(val);
+    }
+
+    // For AGGREGATE ignore-error options: reduce a range/array arg to its
+    // non-error numeric values so the delegated aggregate never sees an error.
+    private static object StripErrorCells(object a)
+    {
+        if (a is FormulaResult { IsRange: true } fr)
+            return fr.RangeValue!.ToFlatResults().Where(c => c is { IsError: false, IsNumeric: true }).Select(c => c!.AsNumber()).ToArray();
+        if (a is RangeData rd)
+            return rd.ToFlatResults().Where(c => c is { IsError: false, IsNumeric: true }).Select(c => c!.AsNumber()).ToArray();
+        return a;
+    }
+
+    private static FormulaResult? EvalModeMult(double[] v)
+    {
+        if (v.Length == 0) return null;
+        int maxCount = v.GroupBy(x => x).Max(g => g.Count());
+        if (maxCount <= 1) return FormulaResult.Error("#N/A");
+        var tied = v.GroupBy(x => x).Where(g => g.Count() == maxCount).Select(g => g.Key).ToHashSet();
+        var seen = new HashSet<double>();
+        var ordered = new List<double>();
+        foreach (var x in v) if (tied.Contains(x) && seen.Add(x)) ordered.Add(x);
+        var col = new FormulaResult?[ordered.Count, 1];
+        for (int i = 0; i < ordered.Count; i++) col[i, 0] = FormulaResult.Number(ordered[i]);
+        return MakeArea(col);
     }
 
     private const string BaseDigits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -301,7 +375,7 @@ internal partial class FormulaEvaluator
     {
         int n = (int)nd;
         if (n < -1) return FormulaResult.Error("#NUM!");
-        double r = 1; for (int i = n; i > 1; i -= 2) r *= i; return FR(r);
+        double r = 1; for (int i = n; i > 1; i -= 2) { r *= i; if (double.IsInfinity(r)) break; } return FR(r);
     }
 
     // MULTINOMIAL: (Σaᵢ)! / (a₁!·a₂!·…).
@@ -618,6 +692,21 @@ internal partial class FormulaEvaluator
         // time (base second)
         ["sec"] = ("t", 1), ["min"] = ("t", 60), ["mn"] = ("t", 60), ["hr"] = ("t", 3600),
         ["day"] = ("t", 86400), ["yr"] = ("t", 31557600),
+        // pressure (base pascal)
+        ["Pa"] = ("pr", 1), ["p"] = ("pr", 1), ["atm"] = ("pr", 101325), ["at"] = ("pr", 101325),
+        ["mmHg"] = ("pr", 133.322), ["psi"] = ("pr", 6894.75729), ["Torr"] = ("pr", 133.322),
+        // force (base newton)
+        ["N"] = ("F", 1), ["dyn"] = ("F", 1e-5), ["dy"] = ("F", 1e-5), ["lbf"] = ("F", 4.4482216152605), ["pond"] = ("F", 9.80665e-3),
+        // energy (base joule)
+        ["J"] = ("e", 1), ["e"] = ("e", 1e-7), ["cal"] = ("e", 4.1868), ["c"] = ("e", 4.184),
+        ["eV"] = ("e", 1.602176634e-19), ["ev"] = ("e", 1.602176634e-19), ["Wh"] = ("e", 3600), ["wh"] = ("e", 3600),
+        ["BTU"] = ("e", 1055.05585262), ["btu"] = ("e", 1055.05585262), ["HPh"] = ("e", 2684519.537696),
+        // power (base watt)
+        ["W"] = ("pw", 1), ["w"] = ("pw", 1), ["HP"] = ("pw", 745.69987158227), ["h"] = ("pw", 745.69987158227), ["PS"] = ("pw", 735.49875),
+        // volume (base litre)
+        ["l"] = ("v", 1), ["L"] = ("v", 1), ["ml"] = ("v", 0.001), ["m3"] = ("v", 1000),
+        ["gal"] = ("v", 3.785411784), ["qt"] = ("v", 0.946352946), ["pt"] = ("v", 0.473176473), ["us_pt"] = ("v", 0.473176473),
+        ["cup"] = ("v", 0.2365882365), ["oz"] = ("v", 0.0295735295625), ["tsp"] = ("v", 0.00492892159375), ["tbs"] = ("v", 0.01478676478125),
     };
 
     private static FormulaResult EvalConvert(double value, string from, string to)

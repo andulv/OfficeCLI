@@ -455,7 +455,12 @@ internal static class OutputFormatter
         // to leak a raw LINQ "Sequence contains no elements".)
         if (msg.StartsWith("diagram requires ", StringComparison.Ordinal)
             || msg.StartsWith("diagram has no nodes", StringComparison.Ordinal)
-            || msg.StartsWith("sequence diagram has no ", StringComparison.Ordinal))
+            || msg.StartsWith("sequence diagram has no ", StringComparison.Ordinal)
+            // markdown input-validation mirrors diagram: no inline text and no
+            // readable src file is a bad-input value the caller can fix, not a
+            // handler crash. Align its code with diagram's (was leaking
+            // internal_error because no pattern matched the message).
+            || msg.StartsWith("markdown requires ", StringComparison.Ordinal))
         {
             result.Code = "invalid_value";
             return;

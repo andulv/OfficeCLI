@@ -103,6 +103,11 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
     // Backing FileStream when we open via stream (shared-read mode). null
     // when the package owns its own file handle via PresentationDocument.Open(path).
     private FileStream? _backingStream;
+    // Editable sessions open _doc over this in-memory copy of the package so
+    // saves swap the file atomically (temp + File.Replace) instead of rewriting
+    // it in place. Null for read-only sessions (they never write). See
+    // AtomicWriteBack / OfficeCli.Core.AtomicPackageWriter.
+    private MemoryStream? _packageStream;
 
     public PowerPointHandler(string filePath, bool editable)
     {
@@ -110,14 +115,33 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
         // Open via a shared FileStream so external readers (e.g. test harness
         // ZipFile.OpenRead while the handler is alive) don't hit the macOS
         // flock exclusive lock that PresentationDocument.Open(path, editable)
-        // would acquire. The package writes through to the stream; we call
-        // _doc.Save() in Dispose() to flush before closing the stream.
+        // would acquire. Editable sessions work against an in-memory copy so the
+        // on-disk file is only ever swapped atomically (temp + File.Replace via
+        // AtomicWriteBack), never rewritten in place — a process death mid-write
+        // otherwise truncates the original with no fallback.
         var share = editable ? FileShare.Read : FileShare.ReadWrite;
         var access = editable ? FileAccess.ReadWrite : FileAccess.Read;
         _backingStream = new FileStream(filePath, FileMode.Open, access, share);
-        _doc = PresentationDocument.Open(_backingStream, editable);
-        if (editable)
-            InitShapeIdCounter();
+        try
+        {
+            if (editable)
+            {
+                _backingStream.Position = 0;
+                _packageStream = new MemoryStream();
+                _backingStream.CopyTo(_packageStream);
+                _packageStream.Position = 0;
+            }
+            _doc = PresentationDocument.Open((Stream?)_packageStream ?? _backingStream, editable);
+            if (editable)
+                InitShapeIdCounter();
+        }
+        catch
+        {
+            _doc?.Dispose();
+            _packageStream?.Dispose();
+            _backingStream.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -2311,7 +2335,20 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
             catch { /* best-effort audit trail */ }
         }
         _doc.Save();
-        _backingStream?.Flush();
+        if (_packageStream != null) AtomicWriteBack();
+        else _backingStream?.Flush();
+    }
+
+    // Crash-atomic flush of the in-memory package to disk (temp + File.Replace).
+    // No-op for read-only sessions (_packageStream == null), which never write.
+    // See OfficeCli.Core.AtomicPackageWriter.
+    private void AtomicWriteBack()
+    {
+        if (_packageStream == null || _backingStream == null) return;
+        OfficeCli.Core.AtomicPackageWriter.Flush(
+            _packageStream, _filePath,
+            releaseLock: () => { _backingStream!.Dispose(); _backingStream = null; },
+            reopenLock: () => { _backingStream = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read); });
     }
 
     /// <summary>See <see cref="OfficeCli.Handlers.WordHandler.DiscardOnDispose"/> —
@@ -2329,13 +2366,10 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
             _backingStream?.Dispose();
             _backingStream = null;
             try { _doc.Dispose(); } catch { /* autosave hit the closed stream — intended */ }
+            _packageStream?.Dispose();
+            _packageStream = null;
             return;
         }
-        // Save through the package (flush in-memory edits to the underlying
-        // stream) before disposing. When we own the backing FileStream, the
-        // package would otherwise leave the on-disk file in whatever state
-        // the last auto-flush left it — for the stream-Open path this can
-        // truncate to zero bytes and look like a corrupted zip on reopen.
         if (Modified)
         {
             try { ReconcileSlideMasterIds(); }
@@ -2344,9 +2378,24 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
             catch { /* best-effort audit trail */ }
         }
         try { _doc.Save(); } catch { /* read-only or already disposed */ }
-        _doc.Dispose();
-        _backingStream?.Dispose();
-        _backingStream = null;
+        if (_packageStream != null)
+        {
+            // Editable: read the in-memory package into the atomic temp BEFORE
+            // _doc.Dispose() (the SDK may close the stream it was opened over on
+            // dispose), then swap it over the original in one File.Replace.
+            try { AtomicWriteBack(); } catch { /* best-effort: original left intact */ }
+            _doc.Dispose();
+            _packageStream.Dispose();
+            _packageStream = null;
+            _backingStream?.Dispose();
+            _backingStream = null;
+        }
+        else
+        {
+            _doc.Dispose();
+            _backingStream?.Dispose();
+            _backingStream = null;
+        }
     }
 
     // Canonical, RELOAD-STABLE ordering for masters and layouts.

@@ -216,6 +216,11 @@ public partial class ExcelHandler
             if (ReferenceEquals(afterAnchor, sheetEl) || ReferenceEquals(beforeAnchor, sheetEl))
                 return $"/{sheetName}";
 
+            // localSheetId on <definedName> is a 0-based position into
+            // <sheets>; capture the pre-move order so scoped names can be
+            // remapped to the sheets' new positions after the reorder.
+            var preMoveOrder = sheets.Elements<Sheet>().ToList();
+
             sheetEl.Remove();
 
             if (afterAnchor != null)
@@ -235,6 +240,24 @@ public partial class ExcelHandler
                 else
                     sheets.AppendChild(sheetEl);
             }
+
+            // Remap sheet-scoped defined names (printArea, print titles,
+            // scoped named ranges) from old positions to new ones — an
+            // unremapped localSheetId silently rebinds the name to whatever
+            // sheet now occupies the old position.
+            var postMoveOrder = sheets.Elements<Sheet>().ToList();
+            var definedNames = workbook.GetFirstChild<DefinedNames>();
+            if (definedNames != null)
+            {
+                foreach (var dn in definedNames.Elements<DefinedName>())
+                {
+                    var lid = dn.LocalSheetId?.Value;
+                    if (lid == null || lid >= preMoveOrder.Count) continue;
+                    var newIdx = postMoveOrder.IndexOf(preMoveOrder[(int)lid.Value]);
+                    if (newIdx >= 0 && newIdx != lid.Value) dn.LocalSheetId = (uint)newIdx;
+                }
+            }
+
             workbook.Save();
             return $"/{sheetName}";
         }

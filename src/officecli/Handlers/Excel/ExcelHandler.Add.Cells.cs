@@ -104,6 +104,22 @@ public partial class ExcelHandler
         {
             var refSheet = sheets.Elements<Sheet>().ElementAt(pos);
             sheets.InsertBefore(newSheet, refSheet);
+
+            // localSheetId on <definedName> is a 0-based position into
+            // <sheets>; inserting mid-list shifts every sheet at/after the
+            // insert point up by one, so scoped names (printArea, print
+            // titles, scoped named ranges) must shift with them or they
+            // silently rebind to the sheet now occupying the old position.
+            var definedNames = GetWorkbook().GetFirstChild<DefinedNames>();
+            if (definedNames != null)
+            {
+                foreach (var dn in definedNames.Elements<DefinedName>())
+                {
+                    var lid = dn.LocalSheetId?.Value;
+                    if (lid.HasValue && lid.Value >= (uint)pos)
+                        dn.LocalSheetId = lid.Value + 1;
+                }
+            }
         }
         else
         {
@@ -865,6 +881,21 @@ public partial class ExcelHandler
                 if (!string.IsNullOrEmpty(hlDisplay)) hl.Display = hlDisplay;
                 hyperlinksEl.AppendChild(hl);
             }
+        }
+
+        // In-cell image ("Place in Cell" richValue) during Add — parity with
+        // the Set cell `image=` case (ExcelHandler.Set.Cells.cs).
+        if (properties.TryGetValue("image", out var inCellImg) && !string.IsNullOrEmpty(inCellImg)
+            && !inCellImg.Equals("none", StringComparison.OrdinalIgnoreCase))
+        {
+            // CONSISTENCY(picture-alt): same alt aliases as the picture element.
+            var inCellAlt = properties.GetValueOrDefault("alt")
+                ?? properties.GetValueOrDefault("altText")
+                ?? properties.GetValueOrDefault("alttext")
+                ?? properties.GetValueOrDefault("description")
+                ?? properties.GetValueOrDefault("image.alt");
+            if (inCellAlt != null) Core.ParseHelpers.ValidateXmlText(inCellAlt, "alt");
+            SetInCellImage(cell, inCellImg, inCellAlt);
         }
 
         // CONSISTENCY(cell-prop-hints): mirror Set's CellPropHints check

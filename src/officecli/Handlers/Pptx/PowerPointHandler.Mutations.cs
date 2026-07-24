@@ -445,6 +445,26 @@ public partial class PowerPointHandler
             var slideId = slideIds[PathIndex.ToArrayIndex(slideIdx)];
             var relId = slideId.RelationshipId?.Value;
             slideId.Remove();
+
+            // Custom shows reference slides by relationship id; prune entries
+            // for the slide being removed or they dangle once the part (and
+            // its relationship) is deleted — PowerPoint refuses to open the
+            // file (0x80070570). A show that becomes empty is dropped, as is
+            // an empty <p:custShowLst>.
+            var custShowList = presentation.GetFirstChild<CustomShowList>();
+            if (relId != null && custShowList != null)
+            {
+                foreach (var show in custShowList.Elements<CustomShow>().ToList())
+                {
+                    var entries = show.SlideList?.Elements<SlideListEntry>()
+                        .Where(e => e.Id?.Value == relId).ToList();
+                    if (entries == null) continue;
+                    foreach (var e in entries) e.Remove();
+                    if (show.SlideList!.HasChildren == false) show.Remove();
+                }
+                if (!custShowList.HasChildren) custShowList.Remove();
+            }
+
             if (relId != null)
                 presentationPart.DeletePart(presentationPart.GetPartById(relId));
             presentation.Save();

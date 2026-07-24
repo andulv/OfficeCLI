@@ -399,6 +399,24 @@ public class ResidentServer : IDisposable
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(idleCts.Token, token);
                 await Task.Delay(currentTimeout, linked.Token);
 
+                // The clock says idle — but "time since the last command
+                // boundary" is not the same as "nothing is running now". A single
+                // command that runs longer than the idle window (e.g. a large
+                // batch) produces no boundary event for its whole duration, so the
+                // countdown armed when it started expires while it is still in
+                // flight. Level-check the in-flight count before committing to
+                // shutdown: a command waiting on or holding the command lock keeps
+                // _pendingClients > 0 for its entire duration, so re-arm and wait
+                // again instead of tearing the resident down mid-command. Shutting
+                // down here would cancel the command's in-progress reply (the
+                // client then reports "not delivered") while the exit-time flush
+                // still writes the applied result to disk — a false failure over a
+                // silently persisted change. When the command finishes it resets
+                // the timer, so the next expiry counts a full window from
+                // completion and shuts down cleanly only when truly idle.
+                if (Volatile.Read(ref _pendingClients) > 0)
+                    continue;
+
                 // Reached here = idle timeout elapsed without reset.
                 // Kick off the ordered shutdown path instead of raw-
                 // cancelling _mainCts / _pingCts, so the "ping liveness ⇔
@@ -637,9 +655,9 @@ public class ResidentServer : IDisposable
                         $"save failed during shutdown — data may be lost: {_filePath}");
                 else if (_shutdownFileVanishedAfterDispose)
                     response = MakeResponse(0, "Closing resident.",
-                        $"WARNING: backing file is missing at the original path: {_filePath}. " +
-                        "If you renamed/moved it, your changes were saved to the new location. " +
-                        "If you deleted it, your changes are lost.");
+                        $"WARNING: the backing file was missing at its original path during save: {_filePath}. " +
+                        "It was deleted or moved externally; your changes were rebuilt at that path. " +
+                        "If you renamed/moved it, a separate copy also exists at the new location.");
                 else
                     response = MakeResponse(0, "Closing resident.", "");
                 // ShutdownAsync cancelled the ping token; write on a
@@ -2736,6 +2754,13 @@ public class ResidentServer : IDisposable
         //    disk and closes the file handle). The ping pipe is still
         //    live right now, so any TryResident caller will correctly
         //    conclude "resident still owns the file".
+        // Capture whether the backing file was already gone BEFORE the flush.
+        // The atomic writer now recreates a missing target (File.Move fallback,
+        // so a delete/rename mid-session no longer loses the edits), which means
+        // the post-dispose File.Exists check below can no longer see the
+        // vanish — the file is back. Sample it here instead so the close still
+        // reports that the file had been removed and was rebuilt.
+        bool backingMissingBeforeFlush = !File.Exists(_filePath);
         bool disposeFailed = false;
         try { _handler.Dispose(); }
         catch (Exception ex)
@@ -2758,24 +2783,21 @@ public class ResidentServer : IDisposable
             _shutdownFileMissing = true;
             LogStderr($"ERROR: save failed during shutdown — data may be lost: {_filePath}");
         }
-        // BUG-INTERVIEW-EDIT-R10-B: even when Dispose succeeds, an unlinked
-        // backing file (rm/Trash, no rename target) means the bytes the SDK
-        // just wrote went to a now-orphaned inode and disappear when the FD
-        // closes. We can't reliably distinguish rename (data safe at new
-        // path) from unlink (data lost) without P/Invoke fstat — so the
-        // warning carefully lists both possibilities rather than claiming
-        // certain data loss. This preserves the false-positive fix above
-        // while still alerting the user when the file vanished from its
-        // original path. Goes to stderr only — no _shutdownFileMissing flag,
-        // so exit code stays 0 and existing rename-then-close flows are
-        // unchanged.
-        else if (!File.Exists(_filePath))
+        // BUG-INTERVIEW-EDIT-R10-B: the backing file was removed from its
+        // original path during the session (rm/Trash, or an external
+        // rename/mv). The atomic writer's move-fallback has now recreated it
+        // at that path with the in-memory edits, so the bytes are NOT lost —
+        // but the removal is still worth surfacing: the user deleted or moved
+        // the file and we brought it back, which is surprising if unannounced,
+        // and in the rename case a stale copy also exists at the new path.
+        // stderr only — no _shutdownFileMissing flag, so the exit code stays 0.
+        else if (backingMissingBeforeFlush)
         {
             _shutdownFileVanishedAfterDispose = true;
             LogStderr(
-                $"WARNING: backing file is missing at the original path: {_filePath}. " +
-                "If you renamed/moved it, your changes were saved to the new location. " +
-                "If you deleted it, your changes are lost.");
+                $"WARNING: the backing file was missing at its original path during save: {_filePath}. " +
+                "It was deleted or moved externally; your changes were rebuilt at that path. " +
+                "If you renamed/moved it, a separate copy also exists at the new location.");
         }
 
         // 5. NOW cancel ping + idle. Clients observing the ping pipe from

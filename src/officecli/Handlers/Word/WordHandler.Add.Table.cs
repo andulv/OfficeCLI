@@ -807,6 +807,7 @@ public partial class WordHandler
         // required trailing empty paragraph here so Word can open the doc.
         if (parent is TableCell && parent.LastChild is Table)
             parent.AppendChild(new Paragraph());
+        _lastAddedTable = table;
         var tbls = parent.Elements<Table>().ToList();
         var idx = tbls.FindIndex(t => ReferenceEquals(t, table));
         return $"{parentPath}/tbl[{(idx >= 0 ? idx + 1 : tbls.Count)}]";

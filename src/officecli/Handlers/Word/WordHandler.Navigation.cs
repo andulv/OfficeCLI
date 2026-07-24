@@ -21,6 +21,13 @@ public partial class WordHandler
     private OpenXmlElement? _lastBodyParagraph;
     private int _bodyParaCount = -1;
 
+    // The Table element created by the most recent AddTable call. Lets the
+    // markdown expander populate cells on the element directly instead of
+    // re-navigating "/body/tbl[N]" (which rebuilds the body child-index, O(body),
+    // per table — O(M²) over an M-table interleave). Written only by AddTable and
+    // consumed immediately after; not a cache (no invalidation semantics).
+    private Table? _lastAddedTable;
+
     private void InvalidateBodyParaCache() { _lastBodyParagraph = null; _bodyParaCount = -1; ClearBodyChildIndex(); }
 
     // using-scope that invalidates the append/child caches when the enclosing
@@ -32,7 +39,9 @@ public partial class WordHandler
     {
         private readonly WordHandler _h;
         public BodyCacheGuard(WordHandler h) => _h = h;
-        public void Dispose() => _h.InvalidateBodyParaCache();
+        // Null-safe so `default(BodyCacheGuard)` is a no-op: Add() arms the
+        // guard conditionally (only for --after/--before body-level adds).
+        public void Dispose() => _h?.InvalidateBodyParaCache();
     }
 
     // ==================== Navigation ====================
@@ -646,12 +655,34 @@ public partial class WordHandler
         // reseeds the cache for the next run.
         if (parent is Body fastBody && _bodyParaCount >= 0
             && _lastBodyParagraph is Paragraph anchor
-            && ReferenceEquals(anchor.Parent, fastBody)
-            && anchor.NextSibling() is SectionProperties)
+            && ReferenceEquals(anchor.Parent, fastBody))
         {
-            anchor.InsertAfterSelf(para);
-            _lastBodyParagraph = para;
-            return ++_bodyParaCount;
+            // The insertion point is "immediately before the trailing sectPr".
+            // Usually that is right after the cached last paragraph, but a
+            // non-paragraph block appended since (most commonly a table, in a
+            // heading/paragraph/list/TABLE interleave) now sits between it and
+            // the sectPr, so anchor.NextSibling() is no longer the sectPr. Walk
+            // forward over those few intervening blocks to the last child before
+            // the sectPr and InsertAfterSelf there — still O(1) amortized (the
+            // hop count is the non-paragraph blocks added since the last
+            // paragraph, ~1 per table). This replaces the old cold path that
+            // fell back to InsertBefore + Elements<Paragraph>().Count(), both
+            // O(N): one such recount per interleaved table made an N-block mixed
+            // document O(N²). _bodyParaCount stays valid because a table append
+            // does not change the body-direct paragraph count.
+            OpenXmlElement tail = anchor;
+            var next = tail.NextSibling();
+            while (next != null && next is not SectionProperties)
+            {
+                tail = next;
+                next = tail.NextSibling();
+            }
+            if (next is SectionProperties)
+            {
+                tail.InsertAfterSelf(para);
+                _lastBodyParagraph = para;
+                return ++_bodyParaCount;
+            }
         }
         AppendToParent(parent, para);
         if (parent is Body coldBody)

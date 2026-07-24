@@ -681,6 +681,9 @@ public partial class PowerPointHandler
                     xfrm.Rotation = (int)(ParseHelpers.SafeParseRotationDegrees(value, "rotation") * 60000);
                     break;
                 }
+                case "keepaspect":
+                    // Consumed by the post-loop resize step below.
+                    break;
                 case "fill":
                 {
                     // OOXML CT_GroupShapeProperties (p:grpSpPr) does NOT allow
@@ -697,7 +700,7 @@ public partial class PowerPointHandler
                     if (!GenericXmlQuery.SetGenericAttribute(grp, key, value))
                     {
                         if (unsupported.Count == 0)
-                            unsupported.Add($"{key} (valid group props: x, y, width, height, rotation, name, link, tooltip, ungroup)");
+                            unsupported.Add($"{key} (valid group props: x, y, width, height, keepAspect, rotation, name, link, tooltip, ungroup)");
                         else
                             unsupported.Add(key);
                     }
@@ -709,19 +712,23 @@ public partial class PowerPointHandler
         {
             bool hasW = properties.Keys.Any(k => k.Equals("width", StringComparison.OrdinalIgnoreCase));
             bool hasH = properties.Keys.Any(k => k.Equals("height", StringComparison.OrdinalIgnoreCase));
-            // Single dimension given → scale the OTHER proportionally so the
-            // diagram stays aspect-correct. A lone width/height would leave the
-            // other extent untouched and visibly squash the group (boxes become
-            // slivers). Both given → exact box (the caller's explicit choice).
-            if (hasW && !hasH) postExt.Cy = (long)Math.Round(preCy * ((postExt.Cx ?? preCx) / (double)preCx));
-            else if (hasH && !hasW) postExt.Cx = (long)Math.Round(preCx * ((postExt.Cy ?? preCy) / (double)preCy));
+            // keepAspect=true + a single dimension → scale the OTHER
+            // proportionally so a diagram group stays aspect-correct (a lone
+            // width/height stretch squashes a flowchart into slivers). Default
+            // honors exactly the axes the caller passed, matching `set width`
+            // on a plain shape (GitHub #237 — the lock must be opt-in).
+            bool keepAspect = properties.Any(kv =>
+                kv.Key.Equals("keepAspect", StringComparison.OrdinalIgnoreCase) && IsTruthy(kv.Value));
+            if (keepAspect && hasW && !hasH) postExt.Cy = (long)Math.Round(preCy * ((postExt.Cx ?? preCx) / (double)preCx));
+            else if (keepAspect && hasH && !hasW) postExt.Cx = (long)Math.Round(preCx * ((postExt.Cy ?? preCy) / (double)preCy));
 
             if ((postExt.Cx ?? 0) <= 0 || (postExt.Cy ?? 0) <= 0)
                 throw new ArgumentException("Invalid group size: width and height must be positive.");
 
             // Re-bake child font sizes to match the net resize. fontRatio =
-            // min(width-ratio, height-ratio); with aspect preserved above the two
-            // ratios agree, so text stays exactly proportional to the geometry.
+            // min(width-ratio, height-ratio): a uniform (or keepAspect) resize
+            // keeps text exactly proportional; a single-axis shrink still scales
+            // text down so it keeps fitting, and a single-axis grow leaves it.
             double fontRatio = Math.Min((postExt.Cx ?? preCx) / (double)preCx,
                                         (postExt.Cy ?? preCy) / (double)preCy);
             if (Math.Abs(fontRatio - 1.0) > 1e-6)

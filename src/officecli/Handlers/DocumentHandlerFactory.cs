@@ -183,6 +183,58 @@ public static class DocumentHandlerFactory
                     Code = "decompression_bomb",
                     Suggestion = "Verify the file is a genuine .docx/.xlsx/.pptx and not a crafted archive."
                 };
+
+            GuardElementExplosion(filePath, archive);
+        }
+    }
+
+    /// <summary>
+    /// CONSISTENCY(dos-hardening): the byte/ratio guards above do not bound the
+    /// in-memory DOM cost. A crafted part packed with millions of tiny elements
+    /// (e.g. a worksheet of &lt;c&gt;&lt;v&gt;0&lt;/v&gt;&lt;/c&gt; cells) stays well under every
+    /// byte/ratio/entry limit yet materializes into multiple GiB of managed heap
+    /// and OOM-kills the resident/watch server on any read that walks the tree.
+    /// Stream-count elements (XmlReader, no DOM) in the large parts and reject
+    /// before the SDK materializes them. Only parts over
+    /// <see cref="DocumentLimits.ElementScanPartThreshold"/> are scanned, so a
+    /// normal document pays nothing.
+    /// </summary>
+    private static void GuardElementExplosion(string filePath, ZipArchive archive)
+    {
+        long total = 0;
+        foreach (var entry in archive.Entries)
+        {
+            if (entry.Length <= DocumentLimits.ElementScanPartThreshold) continue;
+            if (!entry.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) continue;
+
+            try
+            {
+                using var stream = entry.Open();
+                using var reader = System.Xml.XmlReader.Create(stream, new System.Xml.XmlReaderSettings
+                {
+                    DtdProcessing = System.Xml.DtdProcessing.Prohibit,
+                    XmlResolver = null,
+                    CloseInput = true,
+                });
+                while (reader.Read())
+                {
+                    if (reader.NodeType != System.Xml.XmlNodeType.Element) continue;
+                    if (++total > DocumentLimits.MaxDomElements)
+                        throw new CliException(
+                            $"Cannot open {Path.GetFileName(filePath)}: document has more than " +
+                            $"{DocumentLimits.MaxDomElements:N0} XML elements; rejected to avoid exhausting memory.")
+                        {
+                            Code = "decompression_bomb",
+                            Suggestion = "Verify the file is a genuine .docx/.xlsx/.pptx and not a crafted archive; " +
+                                "set OFFICECLI_MAX_DOM_ELEMENTS to raise the limit for an unusually large workbook."
+                        };
+                }
+            }
+            catch (System.Xml.XmlException)
+            {
+                // Malformed XML — let the normal open path surface corrupt_file.
+                return;
+            }
         }
     }
 

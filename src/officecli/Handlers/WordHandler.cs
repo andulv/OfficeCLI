@@ -86,6 +86,11 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
     // (issue #114). The package writes through the stream; the on-disk
     // bytes lag _doc until _doc.Save() runs.
     private FileStream? _backingStream;
+    // Editable sessions open _doc over this in-memory copy of the package so
+    // saves swap the file atomically (temp + File.Replace) instead of rewriting
+    // it in place. Null for read-only sessions (they never write). See
+    // AtomicWriteBack / OfficeCli.Core.AtomicPackageWriter.
+    private MemoryStream? _packageStream;
 
     // Whole-part payloads (docProps/core|app|custom.xml) staged by
     // RawReplaceWholePart and written straight into the saved zip after the
@@ -339,7 +344,20 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
         _backingStream = new FileStream(filePath, FileMode.Open, access, share);
         try
         {
-            _doc = WordprocessingDocument.Open(_backingStream, editable);
+            if (editable)
+            {
+                // Crash-atomic saves: work against an in-memory copy of the
+                // package so the on-disk file is only ever swapped atomically
+                // (temp + File.Replace via AtomicWriteBack), never rewritten in
+                // place — a process death mid-write otherwise truncates the
+                // original with no fallback. Read-only sessions keep streaming
+                // from the FileStream: they never write.
+                _backingStream.Position = 0;
+                _packageStream = new MemoryStream();
+                _backingStream.CopyTo(_packageStream);
+                _packageStream.Position = 0;
+            }
+            _doc = WordprocessingDocument.Open((Stream?)_packageStream ?? _backingStream, editable);
             WordStrictAttributeSanitizer.Sanitize(_doc);
             if (editable)
             {
@@ -356,6 +374,7 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
             // StripDanglingPackageRels) reopen the file for in-place fixes
             // and would hit "file is being used by another process".
             _doc?.Dispose();
+            _packageStream?.Dispose();
             _backingStream.Dispose();
             throw;
         }
@@ -2202,15 +2221,15 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
         Modified = true;
     }
 
-    private void FlushPendingWholeParts()
+    private void FlushPendingWholeParts(string path)
     {
         if (_pendingWholeParts == null || _pendingWholeParts.Count == 0) return;
         var pending = _pendingWholeParts;
         _pendingWholeParts = null;
-        if (!System.IO.File.Exists(_filePath)) return;
+        if (!System.IO.File.Exists(path)) return;
         try
         {
-            using var fs = new System.IO.FileStream(_filePath, System.IO.FileMode.Open, System.IO.FileAccess.ReadWrite);
+            using var fs = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.ReadWrite);
             using var za = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Update, leaveOpen: false);
             foreach (var (entryName, content) in pending)
             {
@@ -2419,7 +2438,21 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
             catch { /* best-effort audit trail */ }
         }
         _doc.Save();
-        _backingStream?.Flush();
+        if (_packageStream != null) AtomicWriteBack();
+        else _backingStream?.Flush();
+    }
+
+    // Crash-atomic flush of the in-memory package to disk (temp + File.Replace).
+    // No-op for read-only sessions (_packageStream == null), which never write.
+    // See OfficeCli.Core.AtomicPackageWriter.
+    private void AtomicWriteBack(Action<string>? postProcessTemp = null)
+    {
+        if (_packageStream == null || _backingStream == null) return;
+        OfficeCli.Core.AtomicPackageWriter.Flush(
+            _packageStream, _filePath,
+            releaseLock: () => { _backingStream!.Dispose(); _backingStream = null; },
+            reopenLock: () => { _backingStream = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read); },
+            postProcessTemp: postProcessTemp);
     }
 
     public void Dispose()
@@ -2433,12 +2466,10 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
             _backingStream?.Dispose();
             _backingStream = null;
             try { _doc.Dispose(); } catch { /* autosave hit the closed stream — intended */ }
+            _packageStream?.Dispose();
+            _packageStream = null;
             return;
         }
-        // Mirror the PPT pattern: when we own the backing FileStream the
-        // package would otherwise leave the on-disk file in whatever state
-        // the last auto-flush left it (potentially truncated for the
-        // stream-Open path). Save first, then dispose.
         if (DeferSave) FinalizeDeferredIds();
         if (Modified)
         {
@@ -2446,22 +2477,42 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
             catch { /* best-effort audit trail */ }
         }
         try { _doc.Save(); } catch { /* read-only or already disposed */ }
-        _doc.Dispose();
-        _backingStream?.Dispose();
-        _backingStream = null;
-        // docProps whole-part round-trip: the SDK won't persist mid-session
-        // docProps edits on a stream-opened package, so rewrite the staged
-        // entries directly in the closed zip. Must run after _doc.Dispose()
-        // releases the file. See RawReplaceWholePart / FlushPendingWholeParts.
-        try { FlushPendingWholeParts(); } catch { /* best-effort */ }
-        // CONSISTENCY(word-self-close): the OpenXml SDK serializes empty
-        // elements with a space before the self-close (`<w:br />`). Several
-        // downstream consumers (and test regexes) look for the canonical
-        // `<w:br/>` / `<w:tab/>` form. Normalize the persisted document.xml
-        // in place so the saved package matches the canonical short form.
-        // Only applied to word/document.xml; styles/settings/numbering are
-        // left untouched since the space form is schema-equivalent.
-        try { NormalizeSelfClosingInDocx(_filePath); } catch { /* best-effort */ }
+        if (_packageStream != null)
+        {
+            // Editable: read the in-memory package into the atomic temp BEFORE
+            // _doc.Dispose() (the SDK may close the stream it was opened over on
+            // dispose), applying the post-close in-place rewrites to the TEMP so
+            // the whole result lands in one atomic File.Replace. The rewrites:
+            //  - FlushPendingWholeParts: docProps whole-part edits the SDK won't
+            //    persist on a stream-opened package (see RawReplaceWholePart).
+            //  - NormalizeSelfClosingInDocx: canonicalize `<w:br />` -> `<w:br/>`
+            //    (schema-equivalent; several consumers/tests want the short form).
+            try
+            {
+                AtomicWriteBack(tmp =>
+                {
+                    FlushPendingWholeParts(tmp);
+                    NormalizeSelfClosingInDocx(tmp);
+                });
+            }
+            catch { /* best-effort: the original file is left intact */ }
+            _doc.Dispose();
+            _packageStream.Dispose();
+            _packageStream = null;
+            _backingStream?.Dispose();
+            _backingStream = null;
+        }
+        else
+        {
+            // Read-only: we wrote nothing. Preserve the legacy post-close
+            // normalization against the file itself (a tiny in-place rewrite;
+            // FlushPendingWholeParts is a no-op with no staged parts).
+            _doc.Dispose();
+            _backingStream?.Dispose();
+            _backingStream = null;
+            try { FlushPendingWholeParts(_filePath); } catch { /* best-effort */ }
+            try { NormalizeSelfClosingInDocx(_filePath); } catch { /* best-effort */ }
+        }
     }
 
     private static void NormalizeSelfClosingInDocx(string path)
