@@ -2978,6 +2978,10 @@ public static partial class WordBatchEmitter
     internal static readonly string[] SdtTypedEmitKeys =
     {
         "type", "alias", "tag", "items", "format", "lock",
+        // checkbox checked state — a bare-glyph checkbox now round-trips through
+        // the typed path (see HasSpecialSdtTypeMarker); without this the state
+        // would silently reset to unchecked on a dump->batch cycle.
+        "checked",
         "placeholder", "placeholderText",
         "date.fullDate", "date.calendar", "date.lid", "date.storeMappedDataAs",
         "comboBox.lastValue", "dropDown.lastValue",
@@ -2986,6 +2990,17 @@ public static partial class WordBatchEmitter
         // round-trip. AddSdt rebuilds <w:dataBinding> from the three keys.
         "dataBinding.xpath", "dataBinding.storeItemID", "dataBinding.prefixMappings",
     };
+
+    /// <summary>Stringify a Get-canonical sdt Format value for typed emit,
+    /// lowercasing C# bool ToString() ("True"/"False" → "true"/"false"). Boolean
+    /// props (checked / placeholder) surface as CLR bools from Get; emitting the
+    /// capitalized form would split one concept into two vocabulary tokens for a
+    /// consumer that reads the dump as text. AddSdt's IsTruthy accepts either.</summary>
+    internal static string NormalizeSdtEmitValue(object v)
+    {
+        var s = v.ToString() ?? "";
+        return s is "True" or "False" ? s.ToLowerInvariant() : s;
+    }
 
     private static void EmitSdtTyped(WordHandler word, string sourcePath, string parentPath,
                                      List<BatchItem> items)
@@ -3009,7 +3024,7 @@ public static partial class WordBatchEmitter
         {
             if (sdt.Format.TryGetValue(key, out var v) && v != null)
             {
-                var s = v.ToString() ?? "";
+                var s = NormalizeSdtEmitValue(v);
                 if (s.Length > 0) props[key] = s;
             }
         }
@@ -3045,14 +3060,16 @@ public static partial class WordBatchEmitter
         => System.Text.RegularExpressions.Regex.IsMatch(
                sdtXml, @"<[A-Za-z0-9]+:repeatingSection(Item)?[ />]")
         || System.Text.RegularExpressions.Regex.IsMatch(
-               sdtXml, @"<w:docPartObj[ />]")
-        // BUG-DUMP-SDT-CHECKBOX: a <w14:checkbox> content control's sdtPr type
-        // marker (+ its checked / checkedState / uncheckedState) is not expressible
-        // through the typed `add sdt text=` path, so without recognising it here the
-        // checkbox SDT round-tripped as a plain rich-text SDT — losing the checkbox
-        // type and its checked state. Match any namespace prefix (w14/w15/…).
-        || System.Text.RegularExpressions.Regex.IsMatch(
-               sdtXml, @"<[A-Za-z0-9]+:checkbox[ />]");
+               sdtXml, @"<w:docPartObj[ />]");
+    // A <w14:checkbox> content control is no longer forced to raw-set here: the
+    // typed `add sdt --prop type=checkbox --prop checked=X` path now rebuilds the
+    // sdtPr marker (BuildSdtCheckBox) AND the box glyph, and `checked` rides the
+    // typed-emit whitelist (SdtTypedEmitKeys), so a checkbox whose content is the
+    // bare glyph round-trips through the typed path. A checkbox carrying richer
+    // content (a formatted glyph run with <w:rPr>, extra runs, nested markers,
+    // …) still returns rich from the general IsRich*Sdt checks below and stays
+    // raw-set for fidelity. (Historically checkbox short-circuited to raw here
+    // because the typed add could not reproduce the type or checked state.)
 
     private static bool IsRichBlockSdt(string sdtXml)
     {
@@ -3679,13 +3696,26 @@ public static partial class WordBatchEmitter
     {
         if (string.IsNullOrEmpty(styleXml) || !styleXml.StartsWith("<")) return null;
         System.Xml.Linq.XElement styleEl;
+        DocumentFormat.OpenXml.Wordprocessing.Style sdkStyle;
         try { styleEl = System.Xml.Linq.XElement.Parse(styleXml); }
+        catch { return null; }
+        // Parse the same <w:style> through the SDK so each child carries its
+        // schema-typed identity: a child the style context can't hold parses as
+        // OpenXmlUnknownElement, which TryEmitElementAdd treats as residue. Any
+        // parse failure → whole-part raw-set (the existing safety net).
+        try { sdkStyle = new DocumentFormat.OpenXml.Wordprocessing.Style(styleXml); }
         catch { return null; }
         var wNs = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         var ops = new List<BatchItem>();
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var child in styleEl.Elements())
+        var xChildren = styleEl.Elements().ToList();
+        var sdkChildren = sdkStyle.Elements().ToList();
+        if (xChildren.Count != sdkChildren.Count) return null;
+        for (int i = 0; i < xChildren.Count; i++)
         {
+            var child = xChildren[i];
+            var sdkChild = sdkChildren[i];
+            if (child.Name.LocalName != sdkChild.LocalName) return null;
             // <w:name> is created by the shell `add style` (from the name prop);
             // skip it so it isn't added twice. Its localName is unique, so the
             // ordinals of the other children are unaffected.
@@ -3694,7 +3724,7 @@ public static partial class WordBatchEmitter
             counts.TryGetValue(child.Name.LocalName, out var c);
             counts[child.Name.LocalName] = c + 1;
             var childPath = $"{stylePath}/{child.Name.LocalName}[{c + 1}]";
-            if (!TryEmitElementAdd(child, stylePath, childPath, ops, 0))
+            if (!TryEmitElementAdd(child, sdkChild, stylePath, childPath, ops, 0))
                 return null;
         }
         return ops;
@@ -3724,16 +3754,25 @@ public static partial class WordBatchEmitter
     {
         if (string.IsNullOrEmpty(numberingXml) || !numberingXml.StartsWith("<")) return null;
         System.Xml.Linq.XElement numEl;
+        DocumentFormat.OpenXml.Wordprocessing.Numbering sdkNum;
         try { numEl = System.Xml.Linq.XElement.Parse(numberingXml); }
+        catch { return null; }
+        try { sdkNum = new DocumentFormat.OpenXml.Wordprocessing.Numbering(numberingXml); }
         catch { return null; }
         var ops = new List<BatchItem>();
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var child in numEl.Elements())
+        var xChildren = numEl.Elements().ToList();
+        var sdkChildren = sdkNum.Elements().ToList();
+        if (xChildren.Count != sdkChildren.Count) return null;
+        for (int i = 0; i < xChildren.Count; i++)
         {
+            var child = xChildren[i];
+            var sdkChild = sdkChildren[i];
+            if (child.Name.LocalName != sdkChild.LocalName) return null;
             counts.TryGetValue(child.Name.LocalName, out var c);
             counts[child.Name.LocalName] = c + 1;
             var childPath = $"/numbering/{child.Name.LocalName}[{c + 1}]";
-            if (!TryEmitElementAdd(child, "/numbering", childPath, ops, 0))
+            if (!TryEmitElementAdd(child, sdkChild, "/numbering", childPath, ops, 0))
                 return null;
         }
         return ops.Count > 0 ? ops : null;
@@ -3744,12 +3783,35 @@ public static partial class WordBatchEmitter
     // el's own resolved path (for addressing its children). Returns false on
     // residue.
     private static bool TryEmitElementAdd(
-        System.Xml.Linq.XElement el, string parentPath, string elPath,
-        List<BatchItem> ops, int depth)
+        System.Xml.Linq.XElement el, DocumentFormat.OpenXml.OpenXmlElement sdkEl,
+        string parentPath, string elPath, List<BatchItem> ops, int depth)
     {
         if (depth > StyleDecompMaxDepth) return false;
         if (!s_nsToPrefix.TryGetValue(el.Name.NamespaceName, out var prefix))
             return false; // unknown element namespace → residue
+        // BUG-DUMP-STYLE-TCPR (generalized): an element is only decomposable into
+        // a typed `add` if the generic add can REBUILD it in this parent context.
+        // The authority on that is the SDK schema itself: TryCreateTypedElement
+        // (the generic-add builder) returns null exactly when the element resolves
+        // to an OpenXmlUnknownElement under the reconstructed parent, replaying as
+        // "Unknown element type 'w:X'". We get the same verdict for free: `sdkEl`
+        // is the SAME element as `el`, parsed by the SDK under its real (typed)
+        // parent — a style-context <w:tcPr> is StyleTableCellProperties, a
+        // style-context <w:rPr> is StyleRunProperties, and each rejects the
+        // children the flat-XML tree carries (w:tcBorders under the former,
+        // w:rtl under the latter) by parsing them as OpenXmlUnknownElement.
+        // Treat any such element as residue → the recursion unwinds to
+        // TryDecomposeStyleChildren returning null → the caller ships the whole
+        // <w:style> verbatim via raw-set. This replaces the former per-element
+        // (w:tcBorders-only) block: instead of listing each unreconstructable
+        // element as it is discovered (w:tcBorders, then w:rtl, then the next
+        // RTL/CJK style child), the SDK's own type table draws the line once, so
+        // no future style child of this class silently breaks replay. Everything
+        // the generic add CAN rebuild in a style context (tblPr/tblCellMar,
+        // tblStylePr/rPr, pPr, …) parses as a typed element and still decomposes
+        // — verified by RecursiveStyleDecompTests + StyleDecompUnknownProbeTests.
+        if (sdkEl is DocumentFormat.OpenXml.OpenXmlUnknownElement)
+            return false;
         // Direct (non-whitespace) text content has no typed `add` representation.
         foreach (var node in el.Nodes())
             if (node is System.Xml.Linq.XText t && !string.IsNullOrWhiteSpace(t.Value))
@@ -3782,13 +3844,26 @@ public static partial class WordBatchEmitter
             Type = $"{prefix}:{el.Name.LocalName}",
             Props = props
         });
+        // Walk the flat-XML children in lockstep with the SDK-parsed children so
+        // each recursion carries the SDK's schema verdict for that node. Both
+        // enumerations exclude text/whitespace and preserve source order (unknown
+        // elements included), so they align 1:1. Any desync — different length or
+        // a mismatched localName at the same slot — means the SDK parsed the
+        // subtree differently than the flat XML implies; treat that as residue
+        // (whole-part raw-set) rather than emit a possibly-wrong add.
+        var xChildren = el.Elements().ToList();
+        var sdkChildren = sdkEl.Elements().ToList();
+        if (xChildren.Count != sdkChildren.Count) return false;
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var child in el.Elements())
+        for (int i = 0; i < xChildren.Count; i++)
         {
+            var child = xChildren[i];
+            var sdkChild = sdkChildren[i];
+            if (child.Name.LocalName != sdkChild.LocalName) return false;
             counts.TryGetValue(child.Name.LocalName, out var c);
             counts[child.Name.LocalName] = c + 1;
             var childPath = $"{elPath}/{child.Name.LocalName}[{c + 1}]";
-            if (!TryEmitElementAdd(child, elPath, childPath, ops, depth + 1))
+            if (!TryEmitElementAdd(child, sdkChild, elPath, childPath, ops, depth + 1))
                 return false;
         }
         return true;

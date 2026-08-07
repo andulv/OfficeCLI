@@ -512,14 +512,73 @@ internal partial class FormulaEvaluator
     private FormulaResult? EvalSubtotal(List<object> args)
     {
         if (args.Count < 2 || args[0] is not FormulaResult fn) return null;
-        var code = (int)fn.AsNumber() % 100; // 101-111 -> 1-11 (ignore-hidden simplification)
+        var raw = (int)fn.AsNumber(); // 1-11, or 101-111 which also ignores manually-hidden rows
+        var code = raw % 100;         // collapse 101-111 -> 1-11 for the aggregate-name switch
         var name = code switch
         {
             1 => "AVERAGE", 2 => "COUNT", 3 => "COUNTA", 4 => "MAX", 5 => "MIN",
             6 => "PRODUCT", 7 => "STDEV", 8 => "STDEVP", 9 => "SUM", 10 => "VAR", 11 => "VARP",
             _ => null
         };
-        return name == null ? null : EvalFunction(name, args.Skip(1).ToList());
+        // Excel ignores any cell in the range whose own formula is a nested
+        // SUBTOTAL/AGGREGATE (all codes 1-11 and 101-111), so a grand total over a
+        // column of section subtotals doesn't double-count them; it also drops rows
+        // hidden by an AutoFilter (codes 1-11) or any hidden row (codes 101-111).
+        return name == null ? null
+            : EvalFunction(name, args.Skip(1).Select(a => ExcludeNestedSubtotalCells(a, raw)).ToList());
+    }
+
+    /// <summary>
+    /// Blank out cells the enclosing SUBTOTAL must skip: cells whose own formula
+    /// contains a nested SUBTOTAL/AGGREGATE call (Excel's nested-subtotal exclusion,
+    /// all codes), and — when <paramref name="subtotalCode"/> asks for it — cells on
+    /// hidden rows (codes 101-111 always; codes 1-11 when the sheet has an AutoFilter,
+    /// since OOXML can't distinguish a filter-hidden row from a manually-hidden one).
+    /// Only same-sheet ranges with a reference origin (BaseRow &gt; 0) can be probed —
+    /// FindCell (as used by ISFORMULA) is current-sheet only; anything else passes
+    /// through unchanged. Pass <paramref name="subtotalCode"/> 0 (e.g. from AGGREGATE)
+    /// to skip the hidden-row rule.
+    /// </summary>
+    private object ExcludeNestedSubtotalCells(object arg, int subtotalCode = 0)
+    {
+        // Range args reach SUBTOTAL either as a bare RangeData or wrapped in
+        // a FormulaResult area; scalars (e.g. AGGREGATE's k) pass through.
+        var rd = arg switch
+        {
+            RangeData bare => bare,
+            FormulaResult { IsRange: true } fr => fr.RangeValue,
+            _ => null,
+        };
+        if (rd == null || rd.BaseRow <= 0 || !string.IsNullOrEmpty(rd.BaseSheet)) return arg;
+
+        var dropHidden = subtotalCode >= 101 || (subtotalCode is >= 1 and <= 11 && HasAutoFilter);
+        FormulaResult?[,]? filtered = null;
+        for (int r = 0; r < rd.Rows; r++)
+        {
+            var rowHidden = dropHidden && IsRowHidden(rd.BaseRow + r);
+            for (int c = 0; c < rd.Cols; c++)
+            {
+                if (rowHidden)
+                {
+                    filtered ??= (FormulaResult?[,])rd.Cells.Clone();
+                    filtered[r, c] = null; // hidden row — excluded per SUBTOTAL's ignore-hidden rule
+                    continue;
+                }
+                var formula = FindCell($"{IndexToCol(rd.BaseCol + c)}{rd.BaseRow + r}")?.CellFormula?.Text;
+                if (formula == null) continue;
+                if (formula.IndexOf("SUBTOTAL", StringComparison.OrdinalIgnoreCase) < 0
+                    && formula.IndexOf("AGGREGATE", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+                filtered ??= (FormulaResult?[,])rd.Cells.Clone();
+                filtered[r, c] = null; // blank — skipped by every aggregate
+            }
+        }
+        if (filtered == null) return arg;
+        var filteredRange = new RangeData(filtered)
+        {
+            BaseRow = rd.BaseRow, BaseCol = rd.BaseCol, BaseSheet = rd.BaseSheet,
+        };
+        return arg is RangeData ? filteredRange : FormulaResult.Area(filteredRange);
     }
 
     // AGGREGATE(function_num, options, ref1, ...): function_num 1-19; common ones mapped, the
@@ -542,6 +601,11 @@ internal partial class FormulaEvaluator
         var rest = args.Skip(2).ToList();
         if (options is 2 or 3 or 6 or 7)
             rest = rest.Select(StripErrorCells).ToList();
+        // AGGREGATE always ignores nested SUBTOTAL/AGGREGATE results in its
+        // range, regardless of the options value (same rule as SUBTOTAL).
+        // LARGE/SMALL (14/15) take a scalar k as the trailing arg — the
+        // exclusion helper passes non-range args through untouched.
+        rest = rest.Select(a => ExcludeNestedSubtotalCells(a)).ToList();
         return EvalFunction(name, rest);
     }
 

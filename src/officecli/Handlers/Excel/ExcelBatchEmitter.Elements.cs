@@ -29,7 +29,7 @@ public static partial class ExcelBatchEmitter
         EmitSparklines(xl, sheetPath, counts.Sparklines, items, warnings);
         var drawingCounts = xl.GetDumpDrawingCounts(sheetName);
         EmitPictures(xl, sheetName, sheetPath, drawingCounts.Pictures, items, warnings);
-        EmitShapes(xl, sheetPath, drawingCounts.Shapes, items, warnings);
+        EmitShapes(xl, sheetName, sheetPath, items, warnings);
         EmitOles(xl, sheetName, sheetPath, items, warnings);
         EmitAutoFilterCriteria(xl, sheetPath, items, warnings);
     }
@@ -603,15 +603,37 @@ public static partial class ExcelBatchEmitter
 
     // ==================== Shapes ====================
 
-    private static void EmitShapes(ExcelHandler xl, string sheetPath, int count,
+    private static void EmitShapes(ExcelHandler xl, string sheetName, string sheetPath,
         List<BatchItem> items, List<UnsupportedWarning> warnings)
     {
         // Skip mc:Fallback placeholder shapes (slicer down-level rectangles):
         // the owning feature regenerates them on replay; re-adding them as
         // real shapes duplicates content and breaks dump idempotency.
         var fallbackFlags = xl.GetDumpShapeFallbackFlags(sheetPath.TrimStart('/'));
-        for (int i = 1; i <= count; i++)
+        var replayItems = xl.GetDumpShapeReplayItems(sheetName);
+        foreach (var replay in replayItems)
         {
+            if (replay.GroupAnchorXml != null)
+            {
+                var groupProps = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["anchor-xml"] = replay.GroupAnchorXml,
+                    ["hyperlinks"] = ExcelHandler.EncodeDumpDrawingHyperlinks(replay.GroupHyperlinks),
+                };
+                items.Add(new BatchItem
+                {
+                    Command = "add-part",
+                    Parent = sheetPath,
+                    Type = "drawing-group",
+                    Props = groupProps,
+                });
+                continue;
+            }
+
+            if (!replay.ShapeIndex.HasValue) continue;
+            var i = replay.ShapeIndex.Value;
+            if (!string.IsNullOrEmpty(replay.Warning))
+                warnings.Add(new UnsupportedWarning("group", $"{sheetPath}/shape[{i}]", replay.Warning));
             if (i - 1 < fallbackFlags.Count && fallbackFlags[i - 1]) continue;
             DocumentNode shp;
             try { shp = xl.Get($"{sheetPath}/shape[{i}]"); }
@@ -641,6 +663,7 @@ public static partial class ExcelBatchEmitter
             CopyValue(shp, "rotation", props, "rotation");
             CopyString(shp, "flip", props, "flip");
             CopyString(shp, "line", props, "line");
+            CopyString(shp, "hyperlink", props, "hyperlink");
             // Effect + text-inset props. Get surfaces them (shadow=#000000,
             // glow=#4472C4-8, softEdge=5pt, margin=7.2pt) and Add re-consumes
             // those exact forms, but the copy-list omitted them so dump dropped

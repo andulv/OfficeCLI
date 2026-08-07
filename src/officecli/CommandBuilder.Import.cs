@@ -62,7 +62,12 @@ static partial class CommandBuilder
             string csvContent;
             if (useStdin)
             {
-                csvContent = Console.In.ReadToEnd();
+                // StripBom for the same reason batch does it: File.ReadAllText
+                // (the --file branch below) drops a UTF-8 BOM implicitly, the
+                // stdin reader hands it through. Without this, `import --stdin`
+                // fed a BOM'd CSV put a stray U+FEFF inside the first header
+                // cell while `import --file` on the same bytes did not.
+                csvContent = StripBom(StdIn.ReadToEnd());
             }
             else if (source != null)
             {

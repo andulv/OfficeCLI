@@ -51,6 +51,12 @@ public static class BlankDocCreator
             ArgumentList = { "create", System.IO.Path.GetFullPath(path) },
             UseShellExecute = false,
             RedirectStandardError = true,
+            // CONSISTENCY(child-stream-encoding): pin UTF-8 on every redirected
+            // child stream. Unset, .NET decodes with the console's code page,
+            // which is the host's default (CP936/CP437) — officecli no longer
+            // switches the console to 65001 for redirected runs, so a plugin's
+            // non-ASCII diagnostics would decode wrong.
+            StandardErrorEncoding = System.Text.Encoding.UTF8,
             CreateNoWindow = true,
         };
         using var proc = System.Diagnostics.Process.Start(psi);

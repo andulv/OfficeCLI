@@ -18,6 +18,19 @@ internal partial class FormulaEvaluator
 
     private static int CompareValues(FormulaResult a, FormulaResult b)
     {
+        // An empty cell takes Excel's empty-value semantics against the other operand's type: it is
+        // 0 vs a number, "" vs text, and FALSE vs a boolean. Without this, a blank falls through to
+        // the Rank() default (1) and rank-collides with every string, so blank="X" wrongly compares
+        // equal. Normalise blanks here, then recurse into the type-matched paths below.
+        if (a.IsBlank || b.IsBlank)
+        {
+            if (a.IsBlank && b.IsBlank) return 0;
+            var other = a.IsBlank ? b : a;
+            FormulaResult asEmpty = other.IsNumeric ? FormulaResult.Number(0)
+                                  : other.IsBool ? FormulaResult.Bool(false)
+                                  : FormulaResult.Str("");
+            return CompareValues(a.IsBlank ? asEmpty : a, a.IsBlank ? b : asEmpty);
+        }
         if (a.IsNumeric && b.IsNumeric) return a.NumericValue!.Value.CompareTo(b.NumericValue!.Value);
         if (a.IsString && b.IsString) return string.Compare(a.StringValue, b.StringValue, StringComparison.OrdinalIgnoreCase);
         if (a.IsBool && b.IsBool) return (a.BoolValue!.Value ? 1 : 0).CompareTo(b.BoolValue!.Value ? 1 : 0);

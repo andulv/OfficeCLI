@@ -485,6 +485,21 @@ public partial class ExcelHandler : IDocumentHandler, Rendering.IRenderModelHost
             _filteredPackageStream = null;
             return;
         }
+        if (!Modified)
+        {
+            // A read-only inspection must be byte-preserving even when a caller
+            // accidentally opened the handler in editable mode. Open XML SDK
+            // serializes package relationships during Save/Dispose, which can
+            // discard DrawingML hyperlink relationships it cannot round-trip.
+            // Close the backing stream first so any dispose-time autosave has
+            // nowhere to write, then discard the in-memory package.
+            _backingStream?.Dispose();
+            _backingStream = null;
+            try { _doc.Dispose(); } catch { /* autosave hit the closed stream — intended */ }
+            _filteredPackageStream?.Dispose();
+            _filteredPackageStream = null;
+            return;
+        }
         try { FlushDirtyParts(); } catch { /* best-effort */ }
         // Mirror the PPT/Word pattern: when we own the backing FileStream the
         // package would otherwise leave the on-disk file in whatever state

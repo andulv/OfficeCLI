@@ -65,7 +65,7 @@ public partial class PowerPointHandler
                 // Add content text if provided
                 if (properties.TryGetValue("text", out var contentText))
                 {
-                    XmlTextValidator.ValidateOrThrow(contentText, "text");
+                    XmlTextValidator.ValidateOrThrow(contentText, "text", allowSoftBreakChar: true);
                     // Symmetry with the title path above: title carries
                     // <p:ph type="title"/>, so content carries
                     // <p:ph type="body" idx="1"/> — both bind to layout

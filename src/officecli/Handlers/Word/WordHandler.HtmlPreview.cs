@@ -3655,13 +3655,19 @@ public partial class WordHandler
             var part = _doc.MainDocumentPart?.GetPartById(rId)
                        as AlternativeFormatImportPart;
             if (part == null) return;
-            using var stream = part.GetStream();
-            using var reader = new StreamReader(stream);
-            var content = reader.ReadToEnd();
             var contentType = (part.ContentType ?? "").ToLowerInvariant();
             // Strip media-type parameters (e.g. "text/html; charset=utf-8")
             // before comparison: Pandoc/non-Word authors commonly emit them.
             var mediaType = contentType.Split(';', 2)[0].Trim();
+            // An altChunk stores the source bytes verbatim, so the payload is
+            // whatever the authoring tool wrote — windows-1252 and friends are
+            // routine, which is why the content type carries a charset at all.
+            // Decoding everything as UTF-8 turned `café` and em-dashes into
+            // U+FFFD in the preview; honour the declaration (and any BOM or
+            // <meta charset> inside the payload) instead.
+            using var stream = part.GetStream();
+            var content = OfficeCli.Core.CharsetDecoder.Decode(
+                stream, OfficeCli.Core.CharsetDecoder.ParseCharset(contentType));
 
             if (mediaType is "text/html" or "application/xhtml+xml"
                 || mediaType.EndsWith("+xml") && mediaType.Contains("xhtml"))
@@ -3692,7 +3698,7 @@ public partial class WordHandler
                 // RTF etc.: strip control words and braces, emit as plain-text block.
                 var plain = Regex.Replace(content, @"\\[a-zA-Z]+-?\d*\s?|[{}]", " ");
                 plain = Regex.Replace(plain, @"\s+", " ").Trim();
-                if (plain.Length > 1000) plain = plain[..1000] + "…";
+                plain = OfficeCli.Core.DisplayText.Truncate(plain, 1000);
                 sb.AppendLine(
                     $"<div class=\"alt-chunk-fallback\" " +
                     $"style=\"border:1px dashed #bbb;padding:4px;font-style:italic;color:#555\">" +

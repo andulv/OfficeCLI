@@ -420,6 +420,9 @@ internal static class UpdateChecker
                 // doesn't touch the console stream at all.
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                // CONSISTENCY(child-stream-encoding): see BlankDocCreator.
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8,
                 RedirectStandardInput = true
             };
 
@@ -737,6 +740,9 @@ internal static class UpdateChecker
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                // CONSISTENCY(child-stream-encoding): see BlankDocCreator.
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8,
                 CreateNoWindow = true,
                 Environment = { ["OFFICECLI_SKIP_UPDATE"] = "1" }
             });

@@ -1205,6 +1205,9 @@ public class ResidentServer : IDisposable
 
         var items = System.Text.Json.JsonSerializer.Deserialize<List<BatchItem>>(
             batchJson, BatchJsonContext.Default.ListBatchItem) ?? new();
+        // NEWLINE-SEMANTICS-V2: strip meta items; rewrite legacy (\n = soft
+        // break) docx dumps to the v2 encoding before execution.
+        OfficeCli.Core.BatchCompat.PrepareForReplay(items, _filePath);
 
         // BUG-R40-B11: parity with the non-resident path —
         // CommandBuilder.Batch.cs already rejects null entries, but
@@ -2024,6 +2027,8 @@ public class ResidentServer : IDisposable
             throw new CliException("dump currently supports .docx, .pptx and .xlsx only")
                 { Code = "unsupported_format" };
         }
+        // NEWLINE-SEMANTICS-V2: same version stamp as the non-resident dump.
+        items.Insert(0, OfficeCli.Core.BatchCompat.MetaItem());
         var output = System.Text.Json.JsonSerializer.Serialize(items, BatchJsonContext.Default.ListBatchItem);
 
         if (outPath == "-") outPath = null;

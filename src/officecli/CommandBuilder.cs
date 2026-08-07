@@ -287,7 +287,10 @@ static partial class CommandBuilder
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
-                RedirectStandardError = true
+                RedirectStandardError = true,
+                // CONSISTENCY(child-stream-encoding): see BlankDocCreator.
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8
             };
             if (idleSeconds.HasValue)
                 startInfo.Environment["OFFICECLI_RESIDENT_IDLE_SECONDS"] = idleSeconds.Value.ToString();
@@ -927,6 +930,11 @@ static partial class CommandBuilder
 
         switch (item.Command.ToLowerInvariant())
         {
+            // NEWLINE-SEMANTICS-V2: version-stamp items are normally stripped
+            // by BatchCompat.PrepareForReplay; tolerate one that reaches the
+            // executor (plugin NDJSON lines bypass the list-level prepare).
+            case "meta":
+                return "meta";
             case "get":
             {
                 var path = item.Path ?? "/";
@@ -1282,17 +1290,47 @@ static partial class CommandBuilder
                 // shortcuts (so `--prop c1='a\nb'` breaks the line exactly like
                 // `--prop text=` does); other props (colors, paths, numbers)
                 // are passed through untouched.
-                if (key.Equals("text", StringComparison.OrdinalIgnoreCase)
-                    || key.Equals("value", StringComparison.OrdinalIgnoreCase)
-                    || IsCellTextShortcutKey(key))
+                if (KeyTakesCEscapes(key))
                 {
                     value = OfficeCli.Core.TextEscape.Resolve(value);
                 }
                 dict[key] = value;
             }
         }
+
+        // NEWLINE-SEMANTICS-V2 + CONSISTENCY(text-escape-boundary): find /
+        // replace get the same C-escape convenience as text= (`--find '\v'
+        // --replace '\n'` works without shell $'..' quoting) — EXCEPT when
+        // the find is a regex (r"..." prefix or regex=true): regex has its
+        // own escape language (\\., \b, \d) that C-escape resolution would
+        // corrupt, so regex invocations are passed through verbatim, same
+        // stance as Word's wildcard mode. Post-pass here (not in the per-key
+        // loop) because the decision needs the regex key's value.
+        bool findIsRegex =
+            (dict.TryGetValue("regex", out var rxFlag) && OfficeCli.Core.ParseHelpers.IsTruthySafe(rxFlag))
+            || (dict.TryGetValue("find", out var fv)
+                && (fv.StartsWith("r\"", StringComparison.Ordinal) || fv.StartsWith("r'", StringComparison.Ordinal)));
+        if (!findIsRegex)
+        {
+            if (dict.TryGetValue("find", out var findVal))
+                dict["find"] = OfficeCli.Core.TextEscape.Resolve(findVal);
+            if (dict.TryGetValue("replace", out var replVal))
+                dict["replace"] = OfficeCli.Core.TextEscape.Resolve(replVal);
+        }
         return dict;
     }
+
+    /// <summary>
+    /// CONSISTENCY(text-escape-boundary): the --prop keys whose values go
+    /// through TextEscape.Resolve on the way in. Anything that builds argv from
+    /// a payload where escapes are ALREADY literal — a JSON body, a batch item —
+    /// must run those same values through TextEscape.Protect first, or the
+    /// resolution happens a second time and eats the user's backslashes.
+    /// </summary>
+    internal static bool KeyTakesCEscapes(string key)
+        => key.Equals("text", StringComparison.OrdinalIgnoreCase)
+           || key.Equals("value", StringComparison.OrdinalIgnoreCase)
+           || IsCellTextShortcutKey(key);
 
     // Row-level cell-text shortcut key: `c` followed by digits (c1, c2, …, cN).
     // These carry table-cell text, so they take the same `\n`/`\t` escape

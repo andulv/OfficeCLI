@@ -470,6 +470,151 @@ public partial class ExcelHandler
         }
     }
 
+    internal sealed class DumpDrawingHyperlinkSpec
+    {
+        public string Id { get; set; } = "";
+        public string Target { get; set; } = "";
+        public bool IsExternal { get; set; }
+    }
+
+    internal sealed class DumpShapeReplayItem
+    {
+        // Exactly one of ShapeIndex / GroupAnchorXml is populated.
+        public int? ShapeIndex { get; set; }
+        public string? GroupAnchorXml { get; set; }
+        public List<DumpDrawingHyperlinkSpec> GroupHyperlinks { get; set; } = [];
+        public string? Warning { get; set; }
+    }
+
+    // Compact, trimming-safe carrier used inside the dump JSON string value:
+    // base64(id),base64(target),0|1 entries separated by '|'. Base64 never
+    // contains ',' or '|', so no reflection-based JSON serializer is needed
+    // inside the single-file published executable.
+    internal static string EncodeDumpDrawingHyperlinks(
+        IEnumerable<DumpDrawingHyperlinkSpec> hyperlinks)
+    {
+        static string B64(string value) => Convert.ToBase64String(
+            System.Text.Encoding.UTF8.GetBytes(value));
+        return string.Join("|", hyperlinks.Select(h =>
+            $"{B64(h.Id)},{B64(h.Target)},{(h.IsExternal ? "1" : "0")}"));
+    }
+
+    internal static List<DumpDrawingHyperlinkSpec> DecodeDumpDrawingHyperlinks(
+        string encoded)
+    {
+        static string FromB64(string value) => System.Text.Encoding.UTF8.GetString(
+            Convert.FromBase64String(value));
+        var result = new List<DumpDrawingHyperlinkSpec>();
+        if (string.IsNullOrEmpty(encoded)) return result;
+        foreach (var entry in encoded.Split('|', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var fields = entry.Split(',');
+            if (fields.Length != 3 || (fields[2] != "0" && fields[2] != "1"))
+                throw new FormatException(
+                    "Expected base64(id),base64(target),0|1 entries separated by '|'.");
+            result.Add(new DumpDrawingHyperlinkSpec
+            {
+                Id = FromB64(fields[0]),
+                Target = FromB64(fields[1]),
+                IsExternal = fields[2] == "1",
+            });
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Build the dump replay sequence for worksheet shapes without destroying
+    /// real DrawingML groups. A grouped TwoCellAnchor is carried verbatim when
+    /// every relationship referenced inside it is a hyperlink relationship;
+    /// those lightweight relationships can be recreated safely on replay.
+    ///
+    /// Groups that reference package parts (pictures/charts/etc.) fall back to
+    /// the existing leaf-shape path with an explicit warning. Copying those
+    /// parts requires a recursive part-graph carrier and raw XML alone would
+    /// leave dangling r:embed/r:id values.
+    /// </summary>
+    internal List<DumpShapeReplayItem> GetDumpShapeReplayItems(string sheetName)
+    {
+        var result = new List<DumpShapeReplayItem>();
+        var worksheet = FindWorksheet(sheetName);
+        var drawingsPart = worksheet?.DrawingsPart;
+        var wsDrawing = drawingsPart?.WorksheetDrawing;
+        if (drawingsPart == null || wsDrawing == null) return result;
+
+        const string relNs =
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        int leafIndex = 0;
+
+        foreach (var anchor in wsDrawing.Elements<XDR.TwoCellAnchor>())
+        {
+            var leaves = anchor.Descendants<XDR.Shape>().ToList();
+            var firstLeafIndex = leafIndex + 1;
+            leafIndex += leaves.Count;
+
+            var group = anchor.GetFirstChild<XDR.GroupShape>();
+            if (group == null)
+            {
+                for (int i = 0; i < leaves.Count; i++)
+                    result.Add(new DumpShapeReplayItem { ShapeIndex = firstLeafIndex + i });
+                continue;
+            }
+
+            var referencedIds = anchor
+                .Descendants()
+                .Prepend(anchor)
+                .SelectMany(e => e.GetAttributes())
+                .Where(a => a.NamespaceUri == relNs
+                    && (a.LocalName == "id" || a.LocalName == "embed" || a.LocalName == "link")
+                    && !string.IsNullOrEmpty(a.Value))
+                .Select(a => a.Value!)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            var hyperlinks = new List<DumpDrawingHyperlinkSpec>();
+            var unsupportedIds = new List<string>();
+            foreach (var rid in referencedIds)
+            {
+                var hyperlink = drawingsPart.HyperlinkRelationships
+                    .FirstOrDefault(r => r.Id == rid);
+                if (hyperlink == null)
+                {
+                    unsupportedIds.Add(rid);
+                    continue;
+                }
+                hyperlinks.Add(new DumpDrawingHyperlinkSpec
+                {
+                    Id = hyperlink.Id ?? rid,
+                    Target = hyperlink.Uri.ToString(),
+                    IsExternal = hyperlink.IsExternal,
+                });
+            }
+
+            if (unsupportedIds.Count == 0)
+            {
+                result.Add(new DumpShapeReplayItem
+                {
+                    GroupAnchorXml = anchor.OuterXml,
+                    GroupHyperlinks = hyperlinks,
+                });
+                continue;
+            }
+
+            var warning =
+                $"grouped drawing references non-hyperlink relationship(s) {string.Join(", ", unsupportedIds)}; "
+                + "the group was flattened because its dependent package parts cannot yet be carried safely";
+            for (int i = 0; i < leaves.Count; i++)
+            {
+                result.Add(new DumpShapeReplayItem
+                {
+                    ShapeIndex = firstLeafIndex + i,
+                    Warning = i == 0 ? warning : null,
+                });
+            }
+        }
+
+        return result;
+    }
+
     private DocumentNode? GetShapeNode(string sheetName, WorksheetPart worksheetPart, int index, string path)
     {
         var drawingsPart = worksheetPart.DrawingsPart;
@@ -490,6 +635,28 @@ public partial class ExcelHandler
         var nvProps = shape.NonVisualShapeProperties?.GetFirstChild<XDR.NonVisualDrawingProperties>();
         if (nvProps?.Name?.Value != null)
             node.Format["name"] = nvProps.Name.Value;
+
+        // Shape hyperlinks live under <xdr:cNvPr><a:hlinkClick>. Group shapes
+        // are flattened to leaf shapes for Get/dump, so preserve each leaf link.
+        if (nvProps != null)
+        {
+            var shapeHlink = nvProps.GetFirstChild<Drawing.HyperlinkOnClick>();
+            if (shapeHlink != null)
+            {
+                if (!string.IsNullOrEmpty(shapeHlink.Id?.Value))
+                {
+                    var rel = drawingsPart.HyperlinkRelationships
+                        .FirstOrDefault(r => r.Id == shapeHlink.Id.Value);
+                    if (rel != null) node.Format["hyperlink"] = rel.Uri.ToString();
+                }
+                else
+                {
+                    var loc = shapeHlink.GetAttributes()
+                        .FirstOrDefault(a => a.LocalName == "location").Value;
+                    if (!string.IsNullOrEmpty(loc)) node.Format["hyperlink"] = "#" + loc;
+                }
+            }
+        }
 
         // Text — shape TextBody has one <a:p> per paragraph, each with
         // zero-or-more <a:r>/<a:t> runs. Concatenate runs within a

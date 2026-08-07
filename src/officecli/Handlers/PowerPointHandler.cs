@@ -133,7 +133,10 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
             }
             _doc = PresentationDocument.Open((Stream?)_packageStream ?? _backingStream, editable);
             if (editable)
-                InitShapeIdCounter();
+                // fromRawStreams: don't materialize every slide's DOM just to
+                // index shape ids — that would make a later Save re-serialize
+                // untouched slides (#267). Read ids from the raw part streams.
+                InitShapeIdCounter(fromRawStreams: true);
         }
         catch
         {
@@ -1429,9 +1432,12 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
                         // demand so the ImagePart has a host to attach to.
                         // CONSISTENCY(grow-on-rawset): mirrors slideMaster/layout
                         // auto-grow above and /notesMaster on-demand creation.
+                        // EnsureNotesSlidePart (not a bare AddNewPart) so the
+                        // created part gets a NotesSlide root and its
+                        // notesMaster relationship; the following raw-set
+                        // replaces the root but keeps the relationships.
                         var hostSlide = sldParts[nsIdx - 1];
-                        imageHost = hostSlide.NotesSlidePart
-                            ?? hostSlide.AddNewPart<NotesSlidePart>();
+                        imageHost = EnsureNotesSlidePart(hostSlide);
                     }
                     else
                         throw new ArgumentException(
@@ -1572,7 +1578,7 @@ public partial class PowerPointHandler : IDocumentHandler, Rendering.IRenderMode
                     var parts = GetSlideParts().ToList();
                     if (i < 1 || i > parts.Count) throw new ArgumentException($"noteSlide index {i} out of range");
                     var hostSlide = parts[i - 1];
-                    hlHost = hostSlide.NotesSlidePart ?? hostSlide.AddNewPart<NotesSlidePart>();
+                    hlHost = EnsureNotesSlidePart(hostSlide);
                 }
                 else
                     throw new ArgumentException(

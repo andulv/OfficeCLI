@@ -329,7 +329,7 @@ public partial class PowerPointHandler
                 }
                 case "text":
                 {
-                    XmlTextValidator.ValidateOrThrow(value, "text");
+                    XmlTextValidator.ValidateOrThrow(value, "text", allowSoftBreakChar: true);
                     // CONSISTENCY(text-escape-boundary): \n / \t resolution at
                     // CLI --prop parse; here value has real newlines/tabs.
                     var textLines = value.Split('\n');
@@ -2735,7 +2735,7 @@ public partial class PowerPointHandler
                 }
                 case "text":
                 {
-                    XmlTextValidator.ValidateOrThrow(value, "text");
+                    XmlTextValidator.ValidateOrThrow(value, "text", allowSoftBreakChar: true);
                     var textBody = cell.TextBody;
                     // CONSISTENCY(text-escape-boundary): see CommandBuilder.
                     var lines = value.Split('\n');

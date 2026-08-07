@@ -44,6 +44,23 @@ public partial class WordHandler
         public void Dispose() => _h?.InvalidateBodyParaCache();
     }
 
+    // Clears ONLY the run/row/cell nav child-index caches on exit. Set() arms
+    // this when a mutation might rewrite a container's child set — most notably
+    // `set text`, which replaces ALL runs of a paragraph/cell (3 runs → 1),
+    // and revision accept/reject, which can delete inserted runs. Exit-timing
+    // (not entry) so a set that navigates through the mutated segment mid-op —
+    // repopulating the very cache it invalidates — still ends clean. Property-
+    // only sets whose keys are all in NavCacheSafeSetKeys leave the guard
+    // disarmed, so a per-run attribute-set batch keeps hitting the cache
+    // (arming it there would rebuild O(R) per set → O(R²)). Null-safe so
+    // `default(NavCacheClearGuard)` is a no-op.
+    private readonly struct NavCacheClearGuard : System.IDisposable
+    {
+        private readonly WordHandler _h;
+        public NavCacheClearGuard(WordHandler h) => _h = h;
+        public void Dispose() => _h?.ClearNavChildCaches();
+    }
+
     // ==================== Navigation ====================
 
     /// <summary>
@@ -881,6 +898,30 @@ public partial class WordHandler
     // Get(/body/p[@paraId]) per paragraph, so that scan made dump O(n²).
     private Dictionary<OpenXmlElement, Dictionary<string, Paragraph>>? _bodyParaByIdCache;
 
+    // Per-scope-root bookmark w:id → BookmarkStart, built lazily by
+    // FindBookmarkStartById. ResolveBookmarkEndName / IsContentSpanBookmark(end)
+    // resolved a standalone <w:bookmarkEnd> to its paired start via
+    // body.Descendants<BookmarkStart>().FirstOrDefault(id) — O(bookmarks) per
+    // call. dump emits one such lookup per bookmarkEnd, so a document with N
+    // bookmarks cost O(N²) (a 6940-bookmark FedRAMP SSP spent tens of seconds
+    // here alone). Keyed by scope root (Body) so the map is built once.
+    private Dictionary<OpenXmlElement, Dictionary<string, BookmarkStart>>? _bookmarkStartByIdCache;
+
+    // Per-container child-index caches for the SAME O(n²) shape the body caches
+    // above fix, but one level down: resolving /<para>/r[K], /<tbl>/tr[K] and
+    // /<tr>/tc[K] for K=1..M re-materialized the (filtered/flattened) child list
+    // on EVERY navigation. dump emits one Get/GetElementXml per run/row/cell, so
+    // a run-dense paragraph (thousands of char-level runs from a PDF conversion)
+    // or a large table cost O(M²). Key = the container element (paragraph/table/
+    // row); value = the same List the uncached path produced, so ElementAt is
+    // O(1) and the `as List` reuse at the navigation tail avoids a per-call copy.
+    // Invalidation piggybacks on ClearBodyChildIndex (coarse: any structural
+    // mutation drops all three — dump is read-only and hit-heavy, mutations rare;
+    // "clear too much" is safe, "clear too little" is the only correctness bug).
+    private readonly Dictionary<OpenXmlElement, List<OpenXmlElement>> _navRunIndexCache = new();
+    private readonly Dictionary<OpenXmlElement, List<OpenXmlElement>> _navRowIndexCache = new();
+    private readonly Dictionary<OpenXmlElement, List<OpenXmlElement>> _navCellIndexCache = new();
+
     // Drop the body child-index + owning-section + paraId caches after a
     // structural mutation. Called from Add() (body-level) and InvalidateBodyParaCache.
     private void ClearBodyChildIndex()
@@ -888,6 +929,83 @@ public partial class WordHandler
         _bodyChildIndexCache.Clear();
         _owningSectionCache = null;
         _bodyParaByIdCache = null;
+        _bookmarkStartByIdCache = null;
+        ClearNavChildCaches();
+    }
+
+    // Drop the run / row / cell child-index caches. Split out from
+    // ClearBodyChildIndex because these must invalidate on a WIDER set of
+    // mutations than the body-direct caches: adding/removing a run under a
+    // PARAGRAPH (parent != Body) leaves the body child-index valid but makes a
+    // cached /<para>/r[K] list stale. Add() therefore calls this unconditionally
+    // at entry (not gated on `parent is Body`), while body-direct mutations reach
+    // it via ClearBodyChildIndex. A bare Dictionary.Clear() is O(1)-ish and dump
+    // (the hit-heavy path) never mutates, so over-clearing costs nothing.
+    private void ClearNavChildCaches()
+    {
+        _navRunIndexCache.Clear();
+        _navRowIndexCache.Clear();
+        _navCellIndexCache.Clear();
+    }
+
+    // Cached, filtered run list for /<container>/r[K] resolution. The filter is
+    // byte-identical to the inline `"r" =>` switch arm it replaces (skip runs
+    // inside SdtRun / SimpleField / a nested textbox / an mc:AlternateContent
+    // wrapper, and comment-reference runs) so the run set NodeBuilder surfaces
+    // stays aligned. Key = `container` (the element the r[K] index is relative
+    // to) because the textbox/AlternateContent skips are expressed relative to it.
+    private List<OpenXmlElement> GetNavRunIndex(OpenXmlElement container)
+    {
+        if (_navRunIndexCache.TryGetValue(container, out var cached))
+            return cached;
+        var runs = container.Descendants<Run>()
+            .Where(r => r.GetFirstChild<CommentReference>() == null)
+            .Where(r => r.Ancestors<SdtRun>().FirstOrDefault() == null)
+            .Where(r => r.Ancestors<SimpleField>().FirstOrDefault() == null)
+            .Where(r =>
+            {
+                var tbc = r.Ancestors<TextBoxContent>().FirstOrDefault();
+                if (tbc == null) return true;
+                foreach (var anc in tbc.Ancestors())
+                {
+                    if (ReferenceEquals(anc, container)) return false;
+                }
+                return true;
+            })
+            .Where(r =>
+            {
+                foreach (var anc in r.Ancestors())
+                {
+                    if (ReferenceEquals(anc, container)) break;
+                    if (anc.LocalName == "AlternateContent"
+                        || anc.LocalName == "Choice"
+                        || anc.LocalName == "Fallback")
+                        return false;
+                }
+                return true;
+            })
+            .Cast<OpenXmlElement>()
+            .ToList();
+        _navRunIndexCache[container] = runs;
+        return runs;
+    }
+
+    private List<OpenXmlElement> GetNavRowIndex(Table table)
+    {
+        if (_navRowIndexCache.TryGetValue(table, out var cached))
+            return cached;
+        var rows = GetTableRowsFlattened(table).Cast<OpenXmlElement>().ToList();
+        _navRowIndexCache[table] = rows;
+        return rows;
+    }
+
+    private List<OpenXmlElement> GetNavCellIndex(TableRow row)
+    {
+        if (_navCellIndexCache.TryGetValue(row, out var cached))
+            return cached;
+        var cells = GetRowCellsFlattened(row).Cast<OpenXmlElement>().ToList();
+        _navCellIndexCache[row] = cells;
+        return cells;
     }
 
     // O(1) /body/p[@paraId=X] over body-direct (incl. customXml) paragraphs.
@@ -1200,12 +1318,24 @@ public partial class WordHandler
             }
         }
 
+        // Resolve the 0-based part index for a positional header/footer segment.
+        // last() must map to the LAST part by enumeration (creation) order, the
+        // same as /body/p[last()] — without this it fell through to
+        // (Index ?? 1) - 1 = 0 and silently resolved /header[last()] to the
+        // FIRST header, so a `set /header[last()]` wrote into the wrong header
+        // (content loss when several headers of different types exist).
+        int PartIndex(int count) => first.StringIndex == "last()" ? count - 1 : (first.Index ?? 1) - 1;
+
         OpenXmlElement? current = first.Name.ToLowerInvariant() switch
         {
             "body" => _doc.MainDocumentPart?.Document?.Body,
             "styles" => _doc.MainDocumentPart?.StyleDefinitionsPart?.Styles,
-            "header" => _doc.MainDocumentPart?.HeaderParts.ElementAtOrDefault((first.Index ?? 1) - 1)?.Header,
-            "footer" => _doc.MainDocumentPart?.FooterParts.ElementAtOrDefault((first.Index ?? 1) - 1)?.Footer,
+            "header" => _doc.MainDocumentPart?.HeaderParts is { } hps
+                ? hps.ToList() is var hl && hl.Count > 0 ? hl.ElementAtOrDefault(PartIndex(hl.Count))?.Header : null
+                : null,
+            "footer" => _doc.MainDocumentPart?.FooterParts is { } fps
+                ? fps.ToList() is var fl && fl.Count > 0 ? fl.ElementAtOrDefault(PartIndex(fl.Count))?.Footer : null
+                : null,
             "numbering" => _doc.MainDocumentPart?.NumberingDefinitionsPart?.Numbering,
             "settings" => _doc.MainDocumentPart?.DocumentSettingsPart?.Settings,
             "comments" => _doc.MainDocumentPart?.WordprocessingCommentsPart?.Comments,
@@ -1376,44 +1506,18 @@ public partial class WordHandler
                     // Mirrors GetAllRuns in WordHandler.Helpers (also skips
                     // SimpleField/SdtRun-nested runs for the same path-
                     // stability reason).
-                    "r" => current.Descendants<Run>()
-                        .Where(r => r.GetFirstChild<CommentReference>() == null)
-                        .Where(r => r.Ancestors<SdtRun>().FirstOrDefault() == null)
-                        .Where(r => r.Ancestors<SimpleField>().FirstOrDefault() == null)
-                        .Where(r =>
-                        {
-                            var tbc = r.Ancestors<TextBoxContent>().FirstOrDefault();
-                            if (tbc == null) return true;
-                            foreach (var anc in tbc.Ancestors())
-                            {
-                                if (ReferenceEquals(anc, current)) return false;
-                            }
-                            return true;
-                        })
-                        // BUG-DUMP-ALTCONTENT-DOUBLE: mirror GetAllRuns — skip runs
-                        // inside an <mc:AlternateContent> wrapper (round-tripped
-                        // verbatim via raw-set; the SDK parses it as unknown so the
-                        // typed TextBoxContent skip misses it). Keeps /…/r[K] path
-                        // indices aligned with the runs NodeBuilder surfaces.
-                        .Where(r =>
-                        {
-                            foreach (var anc in r.Ancestors())
-                            {
-                                if (ReferenceEquals(anc, current)) break;
-                                if (anc.LocalName == "AlternateContent"
-                                    || anc.LocalName == "Choice"
-                                    || anc.LocalName == "Fallback")
-                                    return false;
-                            }
-                            return true;
-                        })
-                        .Cast<OpenXmlElement>(),
+                    // PERF(nav-child-cache): the filter body lives in
+                    // GetNavRunIndex, which memoizes the resulting List per
+                    // container so resolving r[K] for K=1..R is O(R) total, not
+                    // O(R²). Returning the cached List (not a Cast wrapper) lets
+                    // the `as List` reuse at the navigation tail skip a re-copy.
+                    "r" => GetNavRunIndex(current),
                     "tbl" => current.Elements<Table>().Cast<OpenXmlElement>(),
                     "tr" => current is Table trHostTable
-                        ? GetTableRowsFlattened(trHostTable).Cast<OpenXmlElement>()
+                        ? GetNavRowIndex(trHostTable)
                         : current.Elements<TableRow>().Cast<OpenXmlElement>(),
                     "tc" => current is TableRow tcHostRow
-                        ? GetRowCellsFlattened(tcHostRow).Cast<OpenXmlElement>()
+                        ? GetNavCellIndex(tcHostRow)
                         : current.Elements<TableCell>().Cast<OpenXmlElement>(),
                     "sdt" => current.ChildElements
                         .Where(e => e is SdtBlock || e is SdtRun).Cast<OpenXmlElement>(),
@@ -1623,8 +1727,11 @@ public partial class WordHandler
             // re-navigable; without this, descendant Get calls on children
             // like /<host>/textbox[N]/tbl[K]/tr[J] fail with
             // "No txbxContent found at /body".
+            // Keep seg.Name verbatim (no lowercasing): path matching for the
+            // literal "txbxContent" is case-sensitive, so lowercasing broke
+            // round-trip when the user supplied the literal form (issue #258).
             if (canonName == "txbxContent" || canonName == "wsp")
-                canonName = seg.Name.ToLowerInvariant();
+                canonName = seg.Name;
             if (next is Paragraph navPara && !string.IsNullOrEmpty(navPara.ParagraphId?.Value))
             {
                 parentPath += "/" + canonName + $"[@paraId={navPara.ParagraphId.Value}]";

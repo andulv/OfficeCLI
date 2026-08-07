@@ -411,7 +411,7 @@ public static partial class WordBatchEmitter
             {
                 if (sdt.Format.TryGetValue(key, out var v) && v != null)
                 {
-                    var s = v.ToString() ?? "";
+                    var s = NormalizeSdtEmitValue(v);
                     if (s.Length > 0) sdtProps[key] = s;
                 }
             }

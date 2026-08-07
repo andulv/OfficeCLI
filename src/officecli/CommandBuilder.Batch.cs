@@ -28,7 +28,19 @@ static partial class CommandBuilder
         + "  {\"command\":\"add\",\"parent\":\"/slide[1]\",\"type\":\"shape\",\"props\":{\"text\":\"Hi\",\"x\":\"1cm\",\"y\":\"2cm\"}},\n"
         + "  {\"command\":\"set\",\"path\":\"/slide[1]/shape[1]\",\"props\":{\"bold\":\"true\"}},\n"
         + "  {\"command\":\"remove\",\"path\":\"/slide[2]/shape[3]\"}\n"
-        + "]";
+        + "]\n\n"
+        + "Text values follow the same rules as --prop on a single command: \\n starts a new "
+        + "paragraph, \\v is a line break within one. A .docx dump taken before that split "
+        + "encoded line breaks as \\n; replay one by putting "
+        + "{\"command\":\"meta\",\"dumpVersion\":1} first and its \\n are read as line breaks again.\n\n"
+        + "Clean-slate replay (dump->batch into a fresh target): `create` refuses to overwrite an "
+        + "existing file (exit 1, code file_exists) and refuses one a live resident still holds "
+        + "(exit 1, code file_locked). A script that ignores create's exit code then replays onto "
+        + "the PREVIOUS run's document, so add style / add bookmark items fail with 'already exists'. "
+        + "Reliable idiom: close -> rm -> create -> batch -> close. rm BEFORE create matters: with the "
+        + "on-disk file gone, create auto-closes a resident still pinning that path; the leading close "
+        + "just covers the handle-release window. (`create --force` overwrites an existing file but "
+        + "does NOT release a resident lock — close first when a resident is up.)";
 
     /// <summary>
     /// Apply a batch of commands against an already-open handler. This is the
@@ -188,7 +200,7 @@ static partial class CommandBuilder
                 {
                     var stdinPeek = System.Threading.Tasks.Task.Run(() =>
                     {
-                        try { return Console.In.Peek() != -1; }
+                        try { return StdIn.Peek() != -1; }
                         catch { return false; }
                     });
                     stdinHasInput = stdinPeek.Wait(TimeSpan.FromMilliseconds(50)) && stdinPeek.Result;
@@ -225,7 +237,7 @@ static partial class CommandBuilder
                 // skipped on purpose — '-' is not a path.)
                 if (inputFile.Name == "-")
                 {
-                    jsonText = StripBom(Console.In.ReadToEnd());
+                    jsonText = StripBom(StdIn.ReadToEnd());
                 }
                 else
                 {
@@ -244,7 +256,7 @@ static partial class CommandBuilder
                 // System.Text.Json.Parse with "'﻿' is an invalid start of
                 // a value" while `batch --input utf8bom.json` succeeded —
                 // splitting the contract on the input source.
-                jsonText = StripBom(Console.In.ReadToEnd());
+                jsonText = StripBom(StdIn.ReadToEnd());
             }
 
             // Pre-validate: check for unknown JSON fields before deserializing
@@ -301,6 +313,9 @@ static partial class CommandBuilder
             }
 
             var items = System.Text.Json.JsonSerializer.Deserialize<List<BatchItem>>(jsonText, BatchJsonContext.Default.ListBatchItem) ?? new();
+            // NEWLINE-SEMANTICS-V2: strip meta items; rewrite legacy (\n = soft
+            // break) docx dumps to the v2 encoding before execution.
+            OfficeCli.Core.BatchCompat.PrepareForReplay(items, file.FullName);
             // BUG-R40-B11: explicit null entries (e.g. `[null]`) deserialize
             // to a List<BatchItem> with a null slot and trip a NRE deeper in
             // ExecuteBatchItem. Reject up-front with a recognizable error
@@ -637,9 +652,47 @@ static partial class CommandBuilder
     }
 
     // UTF-8 BOM trim. File.ReadAllText handles this implicitly via
-    // StreamReader's detect-encoding; Console.In feeds raw chars.
+    // StreamReader's detect-encoding; the stdin reader feeds raw chars.
     private static string StripBom(string s)
         => !string.IsNullOrEmpty(s) && s[0] == '﻿' ? s.Substring(1) : s;
+
+    /// <summary>
+    /// UTF-8 view of the process's stdin, used everywhere this CLI reads piped
+    /// input (batch JSON, import CSV/TSV).
+    ///
+    /// Console.In would decode with Console.InputEncoding, which on Windows is
+    /// the console's input code page (CP437 on en-US, CP936 on zh-CN) and never
+    /// UTF-8 — piped payloads arrived mojibaked. Setting Console.InputEncoding
+    /// fixes the decode but calls SetConsoleCP on the console object, which is
+    /// shared with the parent shell and outlives this process: every officecli
+    /// run would leave the user's terminal pinned to CP 65001, breaking
+    /// non-ASCII keyboard input for legacy console programs run afterwards.
+    /// Gating that mutation on Console.IsInputRedirected does not help — a piped
+    /// run has a console attached too, so it leaks in exactly the case the decode
+    /// fix is for. Reading through our own StreamReader gets correct UTF-8 with no
+    /// global console mutation. Same approach McpServer already uses.
+    ///
+    /// The reader itself IS gated on IsInputRedirected, for the opposite reason:
+    /// with no redirect the stream sits on the console, which hands back bytes in
+    /// its own input code page, so a UTF-8 reader would mojibake anything
+    /// non-ASCII typed at the prompt. Console.In decodes that case correctly and
+    /// there is nothing to fix there — the bug is redirected input only.
+    ///
+    /// One shared instance, because the batch path Peeks before it Reads and a
+    /// second reader would swallow whatever the first one buffered. Wrapped in
+    /// TextReader.Synchronized to match Console.In's thread-safety — the Peek
+    /// runs on a worker thread that may be abandoned on timeout.
+    /// </summary>
+    private static readonly Lazy<TextReader> LazyStdIn = new(() =>
+        Console.IsInputRedirected
+            ? TextReader.Synchronized(new StreamReader(
+                Console.OpenStandardInput(),
+                new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                // StripBom owns BOM handling; don't let detection also switch encodings.
+                detectEncodingFromByteOrderMarks: false))
+            : Console.In);
+
+    internal static TextReader StdIn => LazyStdIn.Value;
 
     /// <summary>
     /// The atomic temp name adds ~45 bytes of affixes around the document's

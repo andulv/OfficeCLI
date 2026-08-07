@@ -135,6 +135,20 @@ public partial class WordHandler
         // whole index).
         if (parent is Body) ClearBodyChildIndex();
 
+        // PERF(nav-child-cache): a run/cell add under a paragraph (parent != Body)
+        // does NOT change the body-direct index above, but it DOES change the
+        // paragraph's run set — so a cached /<para>/r[K] (or /<row>/tc[K]) list
+        // must be dropped or a later resolve returns stale runs. This must fire
+        // on EXIT, not here at entry: an --after/--before add navigates to its
+        // anchor (e.g. /body/tbl[1]/tr[2]) DURING the add, which repopulates the
+        // very row/cell cache from the PRE-insert tree; an entry-only clear would
+        // then be overwritten and leave the positional insert resolving against a
+        // stale index (symptom: `add row --before tr[2]` lands at the wrong slot).
+        // Always-armed (cheap Dictionary.Clear; build-time nav caches are empty,
+        // so the append fast-path is untouched). Mirrors the _anchorCacheGuard
+        // exit-timing rationale below.
+        using var _navChildCacheGuard = new NavCacheClearGuard(this);
+
         // --after/--before poisons the cache mid-Add: ResolveAnchorPosition
         // navigates to the anchor, which REBUILDS the child-index cache from
         // the pre-mutation tree; the positional insert then leaves it stale
@@ -219,6 +233,7 @@ public partial class WordHandler
                 => AddInlinedPartsRun(parent, parentPath, properties, "inlinedparts"),
             "comment" => AddComment(parent, parentPath, index, properties),
             "bookmark" => AddBookmark(parent, parentPath, index, properties),
+            "bookmarkend" => AddBookmarkEnd(parent, parentPath, index, properties),
             "permstart" or "permend" => AddPerm(parent, parentPath, index, properties, type),
             "hyperlink" or "link" => AddHyperlink(parent, parentPath, index, properties),
             "section" or "sectionbreak" => AddSection(parent, parentPath, index, properties),
@@ -462,6 +477,7 @@ public partial class WordHandler
                 // (auto-creating one if needed) so the resulting XML stays
                 // schema-valid (cell only accepts block-level children).
                 case "bookmark":
+                case "bookmarkend":
                     break;
                 case "cell":
                 case "tc":

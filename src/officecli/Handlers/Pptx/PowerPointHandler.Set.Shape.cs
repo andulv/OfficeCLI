@@ -1351,7 +1351,7 @@ public partial class PowerPointHandler
                 // with a fresh single-paragraph single-run label.
                 case "text":
                 {
-                    Core.XmlTextValidator.ValidateOrThrow(value, "text");
+                    Core.XmlTextValidator.ValidateOrThrow(value, "text", allowSoftBreakChar: true);
                     cxn.RemoveAllChildren<DocumentFormat.OpenXml.Presentation.TextBody>();
                     foreach (var unk in cxn.ChildElements.OfType<OpenXmlUnknownElement>()
                                  .Where(e => e.LocalName == "txBody").ToList())
